@@ -19,3 +19,12 @@
 
 # Go workspace file
 go.work
+
+# Compiled binaries
+bin/*
+
+# VSCode
+.vscode
+
+#? Assets for now
+assets/*
