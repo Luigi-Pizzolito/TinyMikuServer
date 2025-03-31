@@ -76,6 +76,8 @@ import (
  * - The audio frame length is fixed and depends on the audio sample rate, channels, and bits per sample.
  * - The audio frame length is calculated as (AudioSampleRate/FPS)*AudioChannels*AudioBitsPerSample/8.
  * - The video frame length is variable and depends on the video frame size and compression ratio.
+ * - ZLib's DEFLATE implementation is used, not libdeflate or other compression libraries.
+ * todo: add compression for raw audio samples too
  * - All fields are saved in LittleEndian byte order.
  * - The reserved bytes in the header are used for future expansion.
  * - The magic number "MikV" is used to identify the file format.
