@@ -32,6 +32,15 @@ clean:
 
 convert-assets:
 	@echo "Converting assets..."
-	./bin/mikv-converter -i ./assets/mp4 -o ./assets/mikv
+	@for file in ./assets/mp4/*; do \
+		basefile=$$(basename "$$file" .mp4); \
+		output_file=./assets/mikv/$$basefile.mikv; \
+		output_dir=./assets/mikv; \
+		if [ ! -f "$$output_file" ]; then \
+			echo "Converting $$file to $$output_file..."; \
+			./bin/mikv-converter -i "$$file" -o "$$output_dir"; \
+		fi; \
+	done
+	@echo "All assets converted."
 
 .PHONY: convert-assets
