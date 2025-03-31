@@ -241,7 +241,6 @@ func (m *MikVFormat) Stream(frameChan chan<- MikVFrame, stopChan <-chan struct{}
 
 		case <-ticker.C: // Send the frame at the correct time
 			frameChan <- frame
-
 		}
 	}
 
@@ -332,6 +331,7 @@ func (m *MikVFormat) LoadFromMP4(filename string) error {
 	for video.Read() {
 		// 2. Convert the frames to RGB565 format
 		rgb565buf := make([]uint16, m.Width*m.Height)
+
 		for y := 0; y < int(m.Height); y++ {
 			for x := 0; x < int(m.Width); x++ {
 				r, g, b, _ := vbuffer.At(x, y).RGBA()
@@ -352,6 +352,7 @@ func (m *MikVFormat) LoadFromMP4(filename string) error {
 		}
 
 		imageBytes[currentFrameI] = rawImage
+		// imageBytes = append(imageBytes, rawImage)
 		currentFrameI++
 	}
 
@@ -418,6 +419,10 @@ func (m *MikVFormat) LoadFromMP4(filename string) error {
 		end := start + audioFrameLength
 		if end > len(audioBytes) {
 			end = len(audioBytes)
+		}
+		if start > len(audioBytes) {
+			fmt.Println("Audio data shorter than video, leaving tail as silence")
+			break
 		}
 
 		audioFrame := make([]byte, audioFrameLength)
