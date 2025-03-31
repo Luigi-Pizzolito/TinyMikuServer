@@ -14,7 +14,9 @@ func (hc *HoloCropper) readVideo() {
 
 	// Start reading and piping raw frames
 	for hc.video.Read() {
-		hc.procFrameQueue1 <- vbuffer
+		if hc.procFrameQueue1 != nil {
+			hc.procFrameQueue1 <- vbuffer
+		}
 	}
 
 	hc.video.Close()
@@ -34,7 +36,9 @@ func (hc *HoloCropper) grayscaleVideo() {
 			// Convert received frame to grayscale
 			maskFrame := hc.convertToMonochrome(img)
 			// Send to next pipe
-			hc.procFrameQueue2 <- &ImageGrayMask{Mask: maskFrame, Image: img}
+			if hc.procFrameQueue2 != nil {
+				hc.procFrameQueue2 <- &ImageGrayMask{Mask: maskFrame, Image: img}
+			}
 		}
 	}
 }
@@ -88,7 +92,9 @@ func (hc *HoloCropper) binaryVideo() {
 			// subjects_bbox = ExpandRectangle(subjects_bbox, mask.Image.Bounds().Dy()/20)
 
 			// Send to next pipe
-			hc.procFrameQueue3 <- &ImageGrayBoundMask{Mask: binaryImg, Image: mask.Image, Bbox: subjects_bbox, Subj: len(subjects)}
+			if hc.procFrameQueue3 != nil {
+				hc.procFrameQueue3 <- &ImageGrayBoundMask{Mask: binaryImg, Image: mask.Image, Bbox: subjects_bbox, Subj: len(subjects)}
+			}
 		}
 	}
 }
@@ -147,8 +153,9 @@ func (hc *HoloCropper) calcVideo() {
 			}
 
 			// Send to next pipe
-			hc.procFrameQueue4 <- &ImageCropMask{CBox: cropRect, Image: mask.Image, zoom: hc.zoom}
-
+			if hc.procFrameQueue4 != nil {
+				hc.procFrameQueue4 <- &ImageCropMask{CBox: cropRect, Image: mask.Image, zoom: hc.zoom}
+			}
 		}
 	}
 }
@@ -173,7 +180,9 @@ func (hc *HoloCropper) cropVideo() {
 			}
 
 			// Send to next pipe
-			hc.procFrameQueue5 <- croppedImg
+			if hc.procFrameQueue5 != nil {
+				hc.procFrameQueue5 <- croppedImg
+			}
 		}
 	}
 }

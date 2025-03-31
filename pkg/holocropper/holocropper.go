@@ -108,3 +108,22 @@ func (hc *HoloCropper) Done() bool {
 	}
 	return hc.currentFrame == hc.totalFrames
 }
+
+func (hc *HoloCropper) Cancel() {
+	if hc.procFrameQueue1 != nil {
+		close(hc.procFrameQueue1)
+	}
+	if hc.procFrameQueue2 != nil {
+		close(hc.procFrameQueue2)
+	}
+	if hc.procFrameQueue3 != nil {
+		close(hc.procFrameQueue3)
+	}
+	if hc.procFrameQueue4 != nil {
+		close(hc.procFrameQueue4)
+	}
+	if hc.procFrameQueue5 != nil {
+		close(hc.procFrameQueue5)
+	}
+	hc.rmTempDirs()
+}

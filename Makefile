@@ -3,6 +3,7 @@
 # Directories
 BIN_DIR := ./bin
 MIKV_CONVERTER_DIR := ./pkg/mikvformat/cmd/mikv-converter
+HOLOCROPPER_DIR := ./pkg/holocropper/cmd/holocropper
 
 # Go commands
 GO := go
@@ -18,6 +19,10 @@ build-server:
 build-mikv-converter:
 	@echo "Building mikv-converter..."
 	cd $(MIKV_CONVERTER_DIR) && $(GO_BUILD) -o ../../../../$(BIN_DIR)/mikv-converter
+
+build-holocropper:
+	#echo "Building holocropper..."
+	cd $(HOLOCROPPER_DIR) && $(GO_BUILD) -o ../../../../$(BIN_DIR)/holocropper
 
 clean:
 	@echo "Cleaning up binaries..."
