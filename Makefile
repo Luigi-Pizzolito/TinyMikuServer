@@ -10,7 +10,7 @@ GO := go
 GO_BUILD := $(GO) build
 
 # Targets
-all: build-server build-mikv-converter
+all: build-server build-mikv-converter build-holocropper
 
 build-server:
 	@echo "Building TinyMikuServer..."
@@ -21,7 +21,7 @@ build-mikv-converter:
 	cd $(MIKV_CONVERTER_DIR) && $(GO_BUILD) -o ../../../../$(BIN_DIR)/mikv-converter
 
 build-holocropper:
-	#echo "Building holocropper..."
+	@echo "Building holocropper..."
 	cd $(HOLOCROPPER_DIR) && $(GO_BUILD) -o ../../../../$(BIN_DIR)/holocropper
 
 clean:
