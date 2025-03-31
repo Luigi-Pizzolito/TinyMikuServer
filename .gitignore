@@ -28,3 +28,4 @@ bin/*
 
 #? Assets for now
 assets/*
+*.mp4
