@@ -11,7 +11,7 @@ func main() {
 	fmt.Println("Starting...")
 
 	mikv := mikvformat.NewMikVFormat()
-	mikv.Load("./assets/mikv/loveiswar.mikv")
+	mikv.Load("./assets/mikv/39.mikv")
 
 	fmt.Println("Loaded MikVFormat")
 

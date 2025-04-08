@@ -43,4 +43,20 @@ convert-assets:
 	done
 	@echo "All assets converted."
 
-.PHONY: convert-assets
+convert-full:
+	@echo "Converting full videos..."
+	@for file in ./assets/mp4-full/*; do \
+		basefile=$$(basename "$$file" .mp4); \
+		output_file=./assets/mp4/$$basefile.mp4; \
+		output_dir=./assets/mp4; \
+		if [ ! -f "$$output_file" ]; then \
+			echo "Converting $$file to $$output_file..."; \
+			./bin/holocropper -i "$$file" -o "$$output_dir"; \
+		fi; \
+		done
+	@echo "All full videos converted."
+
+.PHONY: convert-assets convert-full
+
+full-convert-assets: convert-full convert-assets
+
