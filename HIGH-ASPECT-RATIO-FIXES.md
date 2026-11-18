@@ -401,4 +401,18 @@ Landscape is ~2 s slower because its analysis frame grew 6× to remove the struc
 
 Golden bars from §8/§11: 1:1 subject ≈ 88% ± 2 pt — **met** (85.7–87.5% mean, 96.8–98.4% containment). Zero out-of-frame padding — **met by construction in every mode**. Worst jump ≤ single-digit px steady-state — **met** (median 0.25 px; all >3 px events are cuts/re-targets). Landscape top dead strip — **removed** (mean top pad 4.2–12.6 px out of 200, majority of frames exactly 0; previously a constant 150 px strip plus ≥292 px structural shortfall).
 
+### 12.6 Post-review tuning: crop-relative pan rates (2026-11-19)
+
+Visual review of the first re-render flagged a tracking fault: in portrait the crop is only ~160 analysis px wide (of 1152), but pan limits were absolute (2.0/1.5 px per frame), so a walking subject outran the crop — **subject center outside the crop on 4–16% of frames** (dissapearance 8.0%, sweetdevil 16.2%), max lag 353 px against an 80 px half-crop. The absolute caps were the wrong unit: pan speed must scale with the crop's own size, because tighter output ratios mean tighter crops.
+
+Changes (all in the pan loop; zoom policy untouched):
+
+1. `panRateLimit(cropDim) = clamp(0.05 x crop dimension, floor 2.0/1.5, cap 12 px/frame)` — ratio-awareness falls out of the geometry: a 160 px portrait slit pans at 8 px/frame, a 473 px square crop at the 12 px cap. No per-aspect table needed.
+2. Retarget threshold now 8% of the **crop span** (not frame), and in retarget mode the command switches to **proportional pursuit** (`retargetGain` 0.45, capped at 0.30 x crop per frame). Raising the clamp on the gentle PID output was not enough: with small gains the clamp never bound and the lag grew unbounded while the crop chased an empty stage.
+3. Faster subject state: bbox EMA α 0.2 -> 0.3; pan-target smoothing uses α 0.5 (instead of 0.2) when the target jumps >15% of the crop — noise damping preserved for small drifts, walking subjects followed quickly.
+
+Measured after the fix (same corpus, debug CSVs): out-of-frame frames 1.8 / 2.0 / 2.9 / 1.0% (dissapearance / retrynow / sweetdevil / tbaka portrait), max x-lag roughly halved (353 -> 132 px on sweetdevil); landscape out-of-frame 0–0.1%; 1:1 out-of-frame 0%. Steady-state motion stays sub-pixel in 1:1 (median 0.03–0.07 px out). Coverage/zoom unchanged by the tuning (portrait means 81–87%). Unit tests: +`TestPanRateIsCropRelative`, +`TestPanTracksWalkingSubjectPortrait` (13 total).
+
+Visual-review notes for future work: single-subject framing is stable while walking. Two geometric edge cases remain, both detection/policy rather than controller issues: (a) when a subject's twin-tails dominate the merged bbox, the crop centers on the hair mass and the torso clips at an edge (dissapearance ~91s); (b) three-dancer groups in a 200-wide portrait crop cannot fit (tbaka) — coverage 52% there is the aspect-ratio geometry, matching the §F8 analysis.
+
 These same scenarios (1:1 baseline, scene cut, dropout, big pose, wide pose) are promoted into the Go test suite in §8 as golden regression tests: every proposed change must reproduce "1:1 subject height ≈ 88% ± 2 pt, zero padding, worst jump ≤ 3 px" before the extreme-ratio work ships.
