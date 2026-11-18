@@ -25,6 +25,9 @@ func main() {
 	width := flag.Int("w", 240, "Width of the cropped video")
 	height := flag.Int("h", 240, "Height of the cropped video")
 	fps := flag.Float64("fps", 20, "Frames per second for the cropped video")
+	analysisHeight := flag.Int("analysis-height", 0, "Height of the internal analysis frame (0 = default 480; never below -h)")
+	zoomMargin := flag.Float64("zoom-margin", 0, "Subject bbox to crop padding factor (0 = default 1.12)")
+	maxZoom := flag.Float64("max-zoom", 0, "Maximum zoom-in factor (0 = default 2.0)")
 
 	flag.Parse()
 
@@ -71,6 +74,8 @@ func main() {
 	fmt.Printf("Crop Width: %d\n", *width)
 	fmt.Printf("Crop Height: %d\n", *height)
 	fmt.Printf("Frames Per Second: %.2f\n", *fps)
+	fmt.Printf("Analysis Height: %d (0 = auto)\n", *analysisHeight)
+	fmt.Printf("Zoom Margin: %.2f / Max Zoom: %.2f (0 = auto)\n", *zoomMargin, *maxZoom)
 
 	fmt.Println("Starting processing...")
 
@@ -85,6 +90,9 @@ func main() {
 			defer wg.Done()
 			// Create a new HoloCropper object
 			hc := holocropper.NewHoloCropper()
+			hc.AnalysisHeight = *analysisHeight
+			hc.ZoomMargin = *zoomMargin
+			hc.MaxZoom = *maxZoom
 
 			// Store the HoloCropper object in the map
 			mu.Lock()
