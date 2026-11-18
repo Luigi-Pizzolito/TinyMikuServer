@@ -313,6 +313,21 @@ Scenario (1920×1080 source): subject drifting ±160 px horizontally, crouch pos
 ¹ Landscape: a 0.26-aspect subject cannot fit a 3.24-aspect crop (§F8) — priority framing fills the frame height and lets legs overflow; area is the policy tradeoff, not a defect. Compare with the measured current landscape coverage of 11–55%.
 ² Different analysis-frame scales; jitter is comparable via the worst-jump column.
 
+### Current-vs-proposed at 200×648 (same synthetic scenario)
+
+| Metric | current algorithm (sim) | proposed (sim) |
+|---|---|---|
+| Subject height in output | 72.2% mean (46.4–88.0) | 88.7% mean (74.1–96.4) |
+| Subject area in output | 53.6% | 75.5% |
+| Fit scale `s` | mean 0.830, std 0.157, max Δ 0.486/frame | 1.005, std 0.005, max Δ 0.006/frame |
+| Zoom-out expansion δ | 0–107.6 px | — (crop clamped in-frame) |
+| Letterbox/black padding | 11.7% mean | 0% |
+| Worst single-frame framing jump | 182 px | 5.8 px |
+| Detection-dropout hard snaps | 3 | 0 |
+| Zoom-in vs source | never (≤ 1.0) | 1.00–1.03 typical; floors allow ≤ 1.67 |
+
+The sim's current-algorithm numbers sit inside the envelope of the measured 200×648 outputs (§3.1/§3.3: coverage dips 12.8–20.3%, bar maxima 176–372 px, 19–38 oscillatory reversals per 95 frames), so the proposed gains are calibrated against observed failure, not an idealized scene.
+
 Findings:
 
 1. **1:1 framing is preserved almost exactly** — subject height occupancy 88.1% → 88.8% (min/max bands unchanged), area +0.4 pt. The 1:1 look of the original survives; zoom only moves 1.00–1.04× for MMD-dominant subjects, so no surprising tightness.
