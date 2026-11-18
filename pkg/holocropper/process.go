@@ -118,20 +118,36 @@ const (
 	framingPanIntegral  = 250.0
 	framingZoomIntegral = 100.0
 
-	panRateLimitX  = 2.0  // px/frame, analysis frame px
+	panRateLimitX  = 2.0  // px/frame floors for pan rate limits
 	panRateLimitY  = 1.5
+	panCropFrac    = 0.05 // crop-relative pan rate: fraction of the crop's own dimension per frame
+	panAbsCap      = 12.0 // never pan faster than this many analysis px per frame
 	zoomRateOutMax = 4.0  // zoom-out (crop grows) is fast: safety
 	zoomRateInMax  = 0.5  // zoom-in (crop shrinks) is slow: prevents breathing
 
 	framingDeadband     = 1.5  // px, noise below this never moves the crop (real-corpus tuning: 1px-out hunting)
 	targetEveryFrames   = 6    // zoom/pan target recomputed from EMA every N frames
 	targetSmoothAlpha   = 0.2  // EMA factor applied to pan targets (bbox noise -> target noise attenuation)
-	emaBBoxAlpha        = 0.2
+	targetSnapFrac      = 0.15 // target jumps more than this fraction of the crop -> switch to fast smoothing
+	targetFastAlpha     = 0.5
+	emaBBoxAlpha        = 0.3
 	cutJumpFraction     = 0.25 // bbox jump > this fraction of frame => scene cut
-	retargetJumpFrac    = 0.08 // error > this fraction => allow fast retarget
-	retargetGain        = 0.35 // fraction of the gap covered per frame when retargeting fast
+	retargetJumpFrac    = 0.08 // error > this fraction of the crop span => allow fast retarget
+	retargetGain        = 0.45 // fraction of the gap covered per frame when retargeting fast
+	retargetCapFrac     = 0.30 // fast retarget never exceeds this fraction of the crop span per frame
 	subjectLostAreaFrac = 0.001
 )
+
+// panRateLimit scales the pan speed limit with the crop's own size rather than
+// the analysis frame. A 200:648 crop is only ~160 analysis px wide but moves
+// the same physical subject across the frame as a 854-wide square crop, so an
+// absolute px/frame limit pans far too slowly for tall outputs (measured: the
+// 2 px/frame floor let a walking subject reach 350 px lag against an 80 px
+// half-crop).
+// Ratio-awareness falls out of the geometry, so no per-aspect table is needed.
+func panRateLimit(cropDim, floor float64) float64 {
+	return clampF(panCropFrac*cropDim, floor, panAbsCap)
+}
 
 func (hc *HoloCropper) calcVideo() {
 	panX := NewPIDController(framingPanKp, framingPanKi, framingPanKd, framingPanIntegral)
@@ -232,8 +248,15 @@ func (hc *HoloCropper) calcVideo() {
 					snapTarget = false
 					haveTarget = true
 				} else {
-					tgtCx += targetSmoothAlpha * (cx - tgtCx)
-					tgtCy += targetSmoothAlpha * (cy - tgtCy)
+					// Small target drifts are noise -> damp hard. A jump of
+					// more than ~15% of the crop is real subject motion
+					// (walking, cut reframing) -> follow it quickly.
+					alpha := targetSmoothAlpha
+					if math.Abs(cx-tgtCx) > targetSnapFrac*(h*aspect) || math.Abs(cy-tgtCy) > targetSnapFrac*h {
+						alpha = targetFastAlpha
+					}
+					tgtCx += alpha * (cx - tgtCx)
+					tgtCy += alpha * (cy - tgtCy)
 				}
 			}
 			if lost {
@@ -242,17 +265,19 @@ func (hc *HoloCropper) calcVideo() {
 				tgtH = frameH
 			}
 
-			// Plant updates.
-			cropCx = hc.applyAxisPID(panX, cropCx, tgtCx, dt, panRateLimitX, frameW)
-			cropCy = hc.applyAxisPID(panY, cropCy, tgtCy, dt, panRateLimitY, frameH)
+			// Plant updates. Zoom first so pan spans see this frame's crop
+			// size; pan spans are the crop's own dimensions so the retarget
+			// threshold and speed scale with how tight the crop is.
 			cropH = hc.applyZoomPID(pidZ, cropH, tgtH, dt, frameH, cropFloor)
-
-			// Clamp plant to frame so the crop never leaves the frame
-			// (no out-of-frame transparent padding, HIGH-ASPECT-RATIO-FIXES.md F3/F4).
 			cropW := cropH * aspect
 			if cropW > frameW {
 				cropW = frameW
 			}
+			cropCx = hc.applyAxisPID(panX, cropCx, tgtCx, dt, panRateLimit(cropW, panRateLimitX), cropW)
+			cropCy = hc.applyAxisPID(panY, cropCy, tgtCy, dt, panRateLimit(cropH, panRateLimitY), cropH)
+
+			// Clamp plant to frame so the crop never leaves the frame
+			// (no out-of-frame transparent padding, HIGH-ASPECT-RATIO-FIXES.md F3/F4).
 			cropCx = clampF(cropCx, cropW/2, frameW-cropW/2)
 			cropCy = clampF(cropCy, cropH/2, frameH-cropH/2)
 
@@ -268,18 +293,26 @@ func (hc *HoloCropper) calcVideo() {
 
 // applyAxisPID moves pos toward target with a rate limit; large errors (scene
 // cuts, framing loss) get a fast retarget allowance so the crop recovers in a
-// few frames instead of several seconds.
-func (hc *HoloCropper) applyAxisPID(p *PIDController, pos, target, dt, rateLimit, frameSpan float64) float64 {
+// few frames instead of several seconds. span is the crop's own extent on this
+// axis: the threshold and the fast-retarget cap scale with crop tightness.
+func (hc *HoloCropper) applyAxisPID(p *PIDController, pos, target, dt, rateLimit, span float64) float64 {
 	error := target - pos
 	if math.Abs(error) < framingDeadband {
 		return pos
 	}
 	u := p.Step(pos, target, dt)
 	limit := rateLimit
-	if math.Abs(error) > retargetJumpFrac*frameSpan {
-		limit = math.Max(rateLimit, retargetGain*math.Abs(error))
+	cmd := clampF(u, -limit, limit)
+	if math.Abs(error) > retargetJumpFrac*span {
+		// Retarget mode: switch the command itself to proportional pursuit
+		// (capped at retargetCapFrac of the crop per frame). Clamping the
+		// gentle PID output higher is not enough - a walking subject outruns
+		// the gains and the lag grows unbounded until the crop chases an
+		// empty part of the stage.
+		limit = math.Max(limit, math.Min(retargetGain*math.Abs(error), retargetCapFrac*span))
+		cmd = clampF(retargetGain*error, -limit, limit)
 	}
-	return pos + clampF(u, -limit, limit)
+	return pos + cmd
 }
 
 // applyZoomPID drives crop height toward the target with asymmetric rate

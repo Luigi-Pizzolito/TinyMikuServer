@@ -212,6 +212,46 @@ func TestAspectLockedTargetPortraitClipsWideSubjectInsteadOfBloating(t *testing.
 	}
 }
 
+/* pan rate scaling tests (crop-relative, ratio-aware) */
+
+func TestPanRateIsCropRelative(t *testing.T) {
+	if got := panRateLimit(160, panRateLimitX); got != 8 {
+		t.Fatalf("portrait 160px crop pan rate %.1f != 8 (0.05 x crop width)", got)
+	}
+	if got := panRateLimit(473, panRateLimitX); got != panAbsCap {
+		t.Fatalf("square 473px crop pan rate %.1f != absolute cap %.1f", got, panAbsCap)
+	}
+	if got := panRateLimit(30, panRateLimitX); got != panRateLimitX {
+		t.Fatalf("tiny crop pan rate %.1f != floor %.1f", got, panRateLimitX)
+	}
+	// landscape y: 264px tall crop pans faster than portrait x is slow
+	if got := panRateLimit(264, panRateLimitY); got != panAbsCap {
+		t.Fatalf("landscape 264px crop pan rate %.1f != cap %.1f", got, panAbsCap)
+	}
+}
+
+func TestPanTracksWalkingSubjectPortrait(t *testing.T) {
+	hc := &HoloCropper{}
+	p := NewPIDController(framingPanKp, framingPanKi, framingPanKd, framingPanIntegral)
+	const cropW = 160.0 // 200:648 crop in a 1152-wide analysis frame
+	const walk = 16.0   // px/frame subject x-speed (p99 measured on sweetdevil)
+	pos, target, maxLag := 0.0, 0.0, 0.0
+	for i := 0; i < 300; i++ {
+		if i > 30 {
+			target += walk
+		}
+		pos = hc.applyAxisPID(p, pos, target, 1.0/24, panRateLimit(cropW, panRateLimitX), cropW)
+		if i > 80 {
+			if lag := math.Abs(pos - target); lag > maxLag {
+				maxLag = lag
+			}
+		}
+	}
+	if maxLag >= cropW/2 {
+		t.Fatalf("steady tracking lag %.0f px >= half crop %.0f px: subject leaves frame", maxLag, cropW/2)
+	}
+}
+
 /* framing state -> crop rect tests */
 
 func TestCropRectAlwaysInsideFrame(t *testing.T) {
