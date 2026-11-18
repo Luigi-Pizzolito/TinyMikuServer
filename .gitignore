@@ -29,3 +29,8 @@ bin/*
 #? Assets for now
 assets/*
 *.mp4
+
+# Test video folders
+vids/
+vids-cropped/
+vids-cropped2/
