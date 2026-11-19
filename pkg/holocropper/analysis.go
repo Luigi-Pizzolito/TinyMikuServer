@@ -77,6 +77,11 @@ type streamData struct {
 	srcW, srcH           int
 	fps                  float64 // analysis video frame rate (source timing preserved)
 	complete             bool
+
+	// videoPath is the canonical cached analysis video this stream was
+	// detected from ("" for synthetic streams). Set once the prepare pass
+	// renames the scratch encode into place; Snapshot/ContactSheet read it.
+	videoPath string
 }
 
 func newStreamData() *streamData { return &streamData{} }
@@ -96,6 +101,12 @@ func (d *streamData) append(s streamSample) {
 func (d *streamData) markComplete() {
 	d.mu.Lock()
 	d.complete = true
+	d.mu.Unlock()
+}
+
+func (d *streamData) setVideoPath(p string) {
+	d.mu.Lock()
+	d.videoPath = p
 	d.mu.Unlock()
 }
 
@@ -195,6 +206,18 @@ func (s DetectionStream) FPS() float64 {
 	s.data.mu.RLock()
 	defer s.data.mu.RUnlock()
 	return s.data.fps
+}
+
+// AnalysisVideoPath is the cached analysis video file these frames were
+// detected from ("" for synthetic streams). Snapshot/ContactSheet on Plans
+// replayed from this stream composite their frames from it.
+func (s DetectionStream) AnalysisVideoPath() string {
+	if s.data == nil {
+		return ""
+	}
+	s.data.mu.RLock()
+	defer s.data.mu.RUnlock()
+	return s.data.videoPath
 }
 
 // ---------------------------------------------------------------------------
@@ -617,6 +640,9 @@ func analyzeWork(ctx context.Context, entry *analysisEntry, task *AnalysisTask, 
 	if err := os.Rename(tmpVideo, videoPath); err != nil {
 		return nil, fmt.Errorf("holocropper: analysis video finalize: %w", err)
 	}
+	// From here on the stream knows which video file its frames came from,
+	// so Snapshot/ContactSheet on Plans built from PartialStream work too.
+	sd.setVideoPath(videoPath)
 
 	// Detect: stream the analysis video through the exact pipeline
 	// detection stages (detectFrame mirrors binaryVideo frame-for-frame).
@@ -829,6 +855,7 @@ func loadAnalysis(ra resolvedAnalyze) (*Analysis, error) {
 	sd.analysisW, sd.analysisH = meta.AnalysisW, meta.AnalysisH
 	sd.srcW, sd.srcH = meta.SourceW, meta.SourceH
 	sd.fps, sd.complete = meta.FPS, true
+	sd.videoPath = filepath.Join(ra.dir, analysisVideoName)
 
 	return &Analysis{
 		key:     ra.key,

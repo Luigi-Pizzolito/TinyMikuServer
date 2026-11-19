@@ -29,6 +29,10 @@ type Plan struct {
 	walk         WalkSummary
 	dropouts     []IntRange
 	settingsHash string
+
+	// videoPath is the cached analysis video the source stream was detected
+	// from ("" for synthetic streams); Snapshot/ContactSheet composite from it.
+	videoPath string
 }
 
 // Records returns the full per-frame replay, in stream order. Frame 1 is
@@ -102,7 +106,7 @@ func NewPlan(stream DetectionStream, s Settings) (*Plan, error) {
 	samples, aw, ah, srcW, srcH, _, _ := stream.data.snapshot()
 	if aw == 0 || ah == 0 {
 		// Analysis geometry not probed yet - a valid empty replay.
-		return &Plan{settings: s, settingsHash: planSettingsHash(s, false)}, nil
+		return &Plan{settings: s, settingsHash: planSettingsHash(s, false), videoPath: stream.AnalysisVideoPath()}, nil
 	}
 	if srcW <= 0 || srcH <= 0 {
 		srcW, srcH = aw, ah // meta without source dims: fall back to the analysis frame
@@ -256,6 +260,7 @@ func NewPlan(stream DetectionStream, s Settings) (*Plan, error) {
 		walk:         walk,
 		dropouts:     dropouts,
 		settingsHash: planSettingsHash(s, flip),
+		videoPath:    stream.AnalysisVideoPath(),
 	}, nil
 }
 
