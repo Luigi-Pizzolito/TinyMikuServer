@@ -245,14 +245,25 @@ func (hc *HoloCropper) totalBoundingBox(rectangles []image.Rectangle) image.Rect
 func (hc *HoloCropper) aspectLockedTarget(bbox image.Rectangle, frameW, frameH, aspect float64) (float64, float64, float64, float64) {
 	margin := hc.zoomMargin()
 
-	// Fit the dominant axis: the crop always covers the subject's full height,
-	// and at least widthCoverFrac(aspect) of its width. Tall output ratios
-	// (e.g. 200:648) clip trailing limbs instead of ballooning the crop to
-	// frame size, which is what produced 30-45% dead vertical padding on the
-	// real corpus (fit-full-width was width-dominant in ~100% of frames).
-	h := float64(bbox.Dy()) * margin
-	if hw := float64(bbox.Dx()) * widthCoverFrac(aspect) / aspect; hw > h {
-		h = hw
+	var h float64
+	if aspect < 0.5 {
+		// Tall outputs (e.g. 200:648): containment fit. The crop must contain
+		// the full padded subject bbox; containing the subject width can push
+		// crop height toward the frame cap. That is the accepted composition
+		// trade - the whole subject (feet included) in frame, with small
+		// stage padding on the sides, beats maximal subject coverage. The
+		// extra padding floor (sweep-tuned, §12.7) keeps headroom and side
+		// margin around the subject in the containment regime.
+		containMargin := math.Max(margin, portraitContainMargin)
+		h = math.Max(float64(bbox.Dy()), float64(bbox.Dx())/aspect) * containMargin
+	} else {
+		// Square/wide outputs: dominant-axis fit. Cover the subject height and
+		// at least widthCoverFrac of its width; trailing limbs clip rather
+		// than the crop ballooning.
+		h = float64(bbox.Dy()) * margin
+		if hw := float64(bbox.Dx()) * widthCoverFrac(aspect) / aspect; hw > h {
+			h = hw
+		}
 	}
 	w := h * aspect
 
@@ -285,7 +296,8 @@ func (hc *HoloCropper) aspectLockedTarget(bbox image.Rectangle, frameW, frameH, 
 
 	cx := float64(bbox.Min.X+bbox.Max.X) / 2
 	cy := float64(bbox.Min.Y+bbox.Max.Y) / 2
-	if aspect >= 2 {
+	switch {
+	case aspect >= 2:
 		// Top-aligned framing for extreme landscape: when the subject is
 		// taller than the crop its top edge sits at the crop top, so the
 		// output never carries an empty strip above the head (legs overflow
@@ -294,10 +306,23 @@ func (hc *HoloCropper) aspectLockedTarget(bbox image.Rectangle, frameW, frameH, 
 		// top edge (documented policy, HIGH-ASPECT-RATIO-FIXES.md Phase 4).
 		dy := float64(bbox.Dy())
 		cy = float64(bbox.Min.Y) + 0.5*math.Min(h, dy) + 0.25*math.Max(0, h-dy)
+	case aspect < 0.5:
+		// Feet-priority anchoring for tall outputs: the subject's feet sit a
+		// stable pad (feetPadFraction of the crop, ~5%) above the crop bottom
+		// and all remaining slack goes above the head. Dark footwear on dark
+		// stages is routinely under-masked by a few pixels; centering left the
+		// feet on or past the crop edge in 2-7% of corpus frames.
+		cy = float64(bbox.Max.Y) - h/2 + feetPadFraction*h
 	}
 
 	return w, h, cx, cy
 }
+
+// portraitContainMargin is the padding floor used only by the tall-output
+// containment branch of aspectLockedTarget (sweep-tuned on the real corpus,
+// HIGH-ASPECT-RATIO-FIXES.md §12.7). Landscape/square fits keep the user's
+// hc.zoomMargin.
+const portraitContainMargin = 1.18
 
 // widthCoverFrac is the minimum fraction of the subject bbox width the crop
 // must cover. Tall output ratios clip trailing limbs/props rather than

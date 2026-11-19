@@ -7,24 +7,26 @@ import (
 	"testing"
 )
 
-/* PID controller tests (HIGH-ASPECT-RATIO-FIXES.md Phase 2 / §8) */
+/* Framing controller tests (HIGH-ASPECT-RATIO-FIXES.md §12.7).
+
+The shipped controller is PI (Kd deliberately 0: derivative kicks on moving
+targets were a measured jitter source on the real corpus) with low-passed
+actuator commands and crop-relative rate caps. Tests exercise the real plant
+path (applyAxisPID / applyZoomPID), not the bare PIDController. */
 
 func newFramingZoom() *PIDController {
-	return NewPIDController(framingZoomKp, framingZoomKi, framingZoomKd, framingZoomIntegral)
+	return NewPIDController(framingZoomKp, framingZoomKi, 0, framingZoomIntegral)
 }
-
-// Tests exercise the real plant path (applyZoomPID: asymmetric rate limits +
-// deadband), not the bare controller, so limit cycles of the raw controller
-// cannot hide behind a test-only symmetric clamp.
 
 func TestPIDConvergence(t *testing.T) {
 	hc := &HoloCropper{}
 	p := newFramingZoom()
 	pos := 0.0
-	tol := framingDeadband + 0.5 // plant holds inside the deadband by design
+	cmd := 0.0
+	tol := framingDeadband + 1.0 // plant holds inside the deadband by design
 	for i := 0; i < 600; i++ {
-		pos = hc.applyZoomPID(p, pos, 100, 1.0/24, 10000, 0)
-		if i > 300 && math.Abs(pos-100) > tol {
+		pos = hc.applyZoomPID(p, &cmd, pos, 100, 1.0/24, 10000, 0)
+		if i > 500 && math.Abs(pos-100) > tol {
 			t.Fatalf("not converged by frame %d: pos=%.2f", i, pos)
 		}
 	}
@@ -37,24 +39,26 @@ func TestPIDAntiWindup(t *testing.T) {
 	hc := &HoloCropper{}
 	p := newFramingZoom()
 	pos := 0.0
-	// sustained large error for 1000 frames
+	cmd := 0.0
+	// large error for 1000 frames: the integrator must clamp, not wind up
 	for i := 0; i < 1000; i++ {
-		pos = hc.applyZoomPID(p, pos, 50, 1.0/24, 10000, -1000)
+		pos = hc.applyZoomPID(p, &cmd, pos, 50, 1.0/24, 10000, -1000)
 	}
 	if math.Abs(p.integral) > framingZoomIntegral+1 {
 		t.Fatalf("integral %.2f escaped anti-windup clamp %.2f", p.integral, framingZoomIntegral)
 	}
-	// flip target: recovery must be quick because the integrator did not wind up
+	// flip target: recovery is bounded by the rate limit, and quick because
+	// the integrator did not wind up beyond its clamp
 	recovered := -1
-	for i := 0; i < 400; i++ {
-		pos = hc.applyZoomPID(p, pos, -50, 1.0/24, 10000, -1000)
-		if math.Abs(pos+50) < framingDeadband+0.5 {
+	for i := 0; i < 600; i++ {
+		pos = hc.applyZoomPID(p, &cmd, pos, -50, 1.0/24, 10000, -1000)
+		if math.Abs(pos+50) < framingDeadband+1.0 {
 			recovered = i
 			break
 		}
 	}
 	if recovered < 0 {
-		t.Fatalf("no recovery within 400 frames after target flip (pos=%.2f)", pos)
+		t.Fatalf("no recovery within 600 frames after target flip (pos=%.2f)", pos)
 	}
 }
 
@@ -62,19 +66,21 @@ func TestPIDNoiseAttenuation(t *testing.T) {
 	hc := &HoloCropper{}
 	p := newFramingZoom()
 	pos := 400.0
+	cmd := 0.0
 	rng := rand.New(rand.NewSource(1))
 	var deltas []float64
 	prev := pos
 	for i := 0; i < 500; i++ {
 		target := 400 + rng.NormFloat64()*6 // noisy setpoint sigma=6
-		pos = hc.applyZoomPID(p, pos, target, 1.0/24, 100000, 0)
+		pos = hc.applyZoomPID(p, &cmd, pos, target, 1.0/24, 100000, 0)
 		deltas = append(deltas, pos-prev)
 		prev = pos
 	}
-	// applied motion must stay inside the actuator rate limits
+	// applied motion must stay inside the actuator rate limits (no retarget
+	// gap here: frameH is huge relative to the noise)
 	for _, d := range deltas {
-		if d > zoomRateOutMax+1e-3 || d < -zoomRateInMax-1e-3 {
-			t.Fatalf("per-frame motion %.2f exceeded rate limits [%v, %v]", d, -zoomRateInMax, zoomRateOutMax)
+		if d > zoomOutMax+1e-3 || d < -zoomInMax-1e-3 {
+			t.Fatalf("per-frame motion %.2f exceeded rate limits [%v, %v]", d, -zoomInMax, zoomOutMax)
 		}
 	}
 	// controller output must not amplify the input noise
@@ -108,7 +114,66 @@ func TestPIDDeterminism(t *testing.T) {
 	}
 }
 
-/* aspect-locked target geometry tests (Phase 1 / Phase 4) */
+// TestZoomDriftStaysSmooth: ordinary slow target drift (bbox breathing) must
+// never trigger the fast retarget allowance: every applied zoom step stays
+// inside the gentle zoomInMax cap.
+func TestZoomDriftStaysSmooth(t *testing.T) {
+	hc := &HoloCropper{}
+	p := newFramingZoom()
+	cropH, cmd := 400.0, 0.0
+	for i := 0; i < 200; i++ {
+		target := 400 + 0.2*float64(i) // 0.2 px/frame drift, well under any retarget gap
+		prev := cropH
+		cropH = hc.applyZoomPID(p, &cmd, cropH, target, 1.0/24, 10000, 0)
+		if d := math.Abs(cropH - prev); d > zoomInMax+1e-9 {
+			t.Fatalf("frame %d: drift step %.2f exceeded zoomInMax %.2f (retarget allowance leaked)", i, d, zoomInMax)
+		}
+	}
+	if cropH < 440-10 {
+		t.Fatalf("crop %.1f failed to track the drifting target (%.1f)", cropH, 440.0)
+	}
+}
+
+// TestZoomRetargetAllowanceGated: gaps larger than zoomRetargetJumpFrac of
+// the frame (reacquire after subject loss) DO get the fast allowance - faster
+// than the base cap, but still bounded by zoomRetOutMax/zoomRetInMax.
+func TestZoomRetargetAllowanceGated(t *testing.T) {
+	hc := &HoloCropper{}
+	// grow: gap 3000 > 0.25*10000
+	p := newFramingZoom()
+	cropH, cmd := 400.0, 0.0
+	start, target := 400.0, 3400.0
+	for i := 0; i < 30; i++ {
+		prev := cropH
+		cropH = hc.applyZoomPID(p, &cmd, cropH, target, 1.0/24, 10000, 0)
+		if d := cropH - prev; d > zoomRetOutMax+1e-9 {
+			t.Fatalf("frame %d: zoom-out step %.2f exceeded zoomRetOutMax %.2f", i, d, zoomRetOutMax)
+		}
+	}
+	if cropH-start < 150 {
+		t.Fatalf("retarget covered %.1f px in 30 frames: fast allowance not applied", cropH-start)
+	}
+	// shrink: same gap, allowance capped at zoomRetInMax (zoom-in stays gentle)
+	p = newFramingZoom()
+	cropH, cmd = 400.0, 0.0
+	maxD := 0.0
+	for i := 0; i < 30; i++ {
+		prev := cropH
+		cropH = hc.applyZoomPID(p, &cmd, cropH, -2600, 1.0/24, 10000, -6000)
+		d := math.Abs(cropH - prev)
+		if d > zoomRetInMax+1e-9 {
+			t.Fatalf("frame %d: zoom-in step %.2f exceeded zoomRetInMax %.2f", i, d, zoomRetInMax)
+		}
+		if d > maxD {
+			maxD = d
+		}
+	}
+	if maxD <= zoomInMax {
+		t.Fatalf("retarget zoom-in never exceeded the base cap %.2f (max %.2f)", zoomInMax, maxD)
+	}
+}
+
+/* aspect-locked target geometry tests (Phase 1 / Phase 4 / §12.7) */
 
 func TestAspectLockedTargetSquare1to1(t *testing.T) {
 	hc := &HoloCropper{Height: 240, Width: 240, srcH: 1080}
@@ -128,14 +193,15 @@ func TestAspectLockedTargetSquare1to1(t *testing.T) {
 
 func TestAspectLockedTargetPortrait(t *testing.T) {
 	hc := &HoloCropper{Height: 648, Width: 200, srcH: 1080}
-	// 200:648 output, 1152x648 analysis frame, subject bbox 150x570
+	// 200:648 output, 1152x648 analysis frame, subject bbox 150x570.
+	// Containment fit: 1.18 * 570 = 673 clamps to the frame height.
 	bbox := image.Rect(500, 39, 650, 609)
 	w, h, _, _ := hc.aspectLockedTarget(bbox, 1152, 648, 200.0/648)
-	if h < 636 || h > 641 {
-		t.Fatalf("portrait crop height %.1f not ~638 (1.12x of 570)", h)
+	if h < 647 || h > 649 {
+		t.Fatalf("portrait crop height %.1f not clamped to frame height 648", h)
 	}
-	if w < 195 || w > 199 {
-		t.Fatalf("portrait crop width %.1f not ~197 (aspect locked)", w)
+	if w < 199 || w > 201 {
+		t.Fatalf("portrait crop width %.1f not ~200 (aspect locked)", w)
 	}
 }
 
@@ -197,58 +263,101 @@ func TestAspectLockedTargetLandscapeShortSubjectSlackSplit(t *testing.T) {
 	}
 }
 
-func TestAspectLockedTargetPortraitClipsWideSubjectInsteadOfBloating(t *testing.T) {
+func TestAspectLockedTargetPortraitContainsWideSubject(t *testing.T) {
 	hc := &HoloCropper{Height: 648, Width: 200, srcH: 1080}
-	// 200x400 subject: full-width containment would balloon the crop to the
-	// 648 frame height (32% dead vertical padding). The height-dominant fit
-	// must keep crop height at ~1.12x subject height and clip the sides.
+	// 200x400 subject (twin-tails spread wide): the containment fit must keep
+	// the whole subject - feet included - in frame even though the crop then
+	// runs to the full analysis-frame height. Feat clipping (the old
+	// height-dominant fit) was rejected on vision review (§12.7).
 	bbox := image.Rect(480, 124, 680, 524) // 200x400
 	w, h, _, _ := hc.aspectLockedTarget(bbox, 1152, 648, 200.0/648)
-	if h < 445 || h > 452 {
-		t.Fatalf("portrait crop height %.1f not ~448 (height-dominant fit)", h)
+	if h < 647 || h > 648 {
+		t.Fatalf("portrait crop height %.1f not at frame height: subject not contained", h)
 	}
-	if w < 130 || w > 150 {
-		t.Fatalf("portrait crop width %.1f not within [0.65, 0.75]*bbox width", w)
+	if w < 199 || w > 201 {
+		t.Fatalf("portrait crop width %.1f not ~200 (aspect locked)", w)
+	}
+	if float64(bbox.Dx()) > w {
+		t.Fatalf("subject width %d exceeds crop width %.1f: sides clipped", bbox.Dx(), w)
 	}
 }
 
-/* pan rate scaling tests (crop-relative, ratio-aware) */
+func TestAspectLockedTargetPortraitFeetAnchor(t *testing.T) {
+	hc := &HoloCropper{Height: 648, Width: 200, srcH: 1080}
+	// feet-priority anchoring: subject 150x300 with feet at y=600; the crop
+	// bottom must sit feetPadFraction*h below the feet, all slack above the
+	// head. bbox width 150 -> width containment drives h: 486*1.18 = 573.5.
+	bbox := image.Rect(500, 300, 650, 600)
+	_, h, _, cy := hc.aspectLockedTarget(bbox, 1152, 648, 200.0/648)
+	if h < 571 || h > 575 {
+		t.Fatalf("portrait crop height %.1f not ~573 (containment fit)", h)
+	}
+	gap := (cy + h/2) - float64(bbox.Max.Y) // empty strip below the feet
+	if want := feetPadFraction * h; math.Abs(gap-want) > 0.5 {
+		t.Fatalf("feet gap %.1f != feetPadFraction*h %.1f", gap, want)
+	}
+	if cy+h/2 > 648 {
+		t.Fatalf("crop bottom %.1f leaves the frame", cy+h/2)
+	}
+}
 
-func TestPanRateIsCropRelative(t *testing.T) {
-	if got := panRateLimit(160, panRateLimitX); got != 8 {
-		t.Fatalf("portrait 160px crop pan rate %.1f != 8 (0.05 x crop width)", got)
-	}
-	if got := panRateLimit(473, panRateLimitX); got != panAbsCap {
-		t.Fatalf("square 473px crop pan rate %.1f != absolute cap %.1f", got, panAbsCap)
-	}
-	if got := panRateLimit(30, panRateLimitX); got != panRateLimitX {
-		t.Fatalf("tiny crop pan rate %.1f != floor %.1f", got, panRateLimitX)
-	}
-	// landscape y: 264px tall crop pans faster than portrait x is slow
-	if got := panRateLimit(264, panRateLimitY); got != panAbsCap {
-		t.Fatalf("landscape 264px crop pan rate %.1f != cap %.1f", got, panAbsCap)
+/* plant rate-limit tests: caps scale with the crop's own span (§12.7) */
+
+func TestPanRateLimitsAreCropRelative(t *testing.T) {
+	hc := &HoloCropper{}
+	for _, c := range []struct {
+		span, floor float64
+	}{{160, panFloorX}, {473, panFloorX}, {264, panFloorY}, {30, panFloorX}} {
+		p := NewPIDController(framingPanKp, framingPanKi, 0, framingPanIntegral)
+		cmd, pos, prev := 0.0, 0.0, 0.0
+		maxDelta := 0.0
+		for i := 0; i < 40; i++ {
+			pos = hc.applyAxisPID(p, &cmd, pos, 1000, 1.0/24, c.span, c.floor)
+			d := math.Abs(pos - prev)
+			prev = pos
+			if d > maxDelta {
+				maxDelta = d
+			}
+			if cap := math.Max(panCapFrac*c.span, c.floor); d > cap+1e-9 {
+				t.Fatalf("span %.0f: pan step %.2f exceeded cap %.2f", c.span, d, cap)
+			}
+		}
+		// the error allowance must raise the rate above the base crop fraction
+		if maxDelta <= panCropFrac*c.span {
+			t.Fatalf("span %.0f: allowance never raised the pan rate above base %.2f (max %.2f)",
+				c.span, panCropFrac*c.span, maxDelta)
+		}
 	}
 }
 
 func TestPanTracksWalkingSubjectPortrait(t *testing.T) {
 	hc := &HoloCropper{}
-	p := NewPIDController(framingPanKp, framingPanKi, framingPanKd, framingPanIntegral)
+	p := NewPIDController(framingPanKp, framingPanKi, 0, framingPanIntegral)
 	const cropW = 160.0 // 200:648 crop in a 1152-wide analysis frame
-	const walk = 16.0   // px/frame subject x-speed (p99 measured on sweetdevil)
-	pos, target, maxLag := 0.0, 0.0, 0.0
+	const walk = 8.0    // px/frame steady subject x-speed
+	cmd := 0.0
+	pos, subject, vx, prevSubject := 0.0, 0.0, 0.0, 0.0
+	maxLag := 0.0
 	for i := 0; i < 300; i++ {
 		if i > 30 {
-			target += walk
+			subject += walk
 		}
-		pos = hc.applyAxisPID(p, pos, target, 1.0/24, panRateLimit(cropW, panRateLimitX), cropW)
-		if i > 80 {
-			if lag := math.Abs(pos - target); lag > maxLag {
+		vx += velAlpha * ((subject - prevSubject) - vx)
+		prevSubject = subject
+		// the shipped loop applies the smoothed velocity lead to the target
+		pos = hc.applyAxisPID(p, &cmd, pos, subject+velLeadFrames*vx, 1.0/24, cropW, panFloorX)
+		if i > 120 {
+			if lag := math.Abs(pos - subject); lag > maxLag {
 				maxLag = lag
 			}
 		}
 	}
 	if maxLag >= cropW/2 {
 		t.Fatalf("steady tracking lag %.0f px >= half crop %.0f px: subject leaves frame", maxLag, cropW/2)
+	}
+	// the velocity lead keeps the proportional lag well inside the crop
+	if maxLag > 0.3*cropW {
+		t.Fatalf("tracking lag %.0f px exceeds 30%% of crop width: velocity lead not effective", maxLag)
 	}
 }
 
