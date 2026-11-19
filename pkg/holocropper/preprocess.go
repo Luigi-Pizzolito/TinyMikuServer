@@ -13,36 +13,60 @@ import (
 )
 
 func (hc *HoloCropper) initialResize() error {
-	// Get the resize dimensions
-	cropWidth, _ := hc.calculateCropWidthHeight()
+	// Read the actual source dimensions: the analysis frame preserves the
+	// source aspect ratio instead of assuming 16:9 (HIGH-ASPECT-RATIO-FIXES.md F1).
+	srcW, srcH, err := hc.sourceDimensions()
+	if err != nil {
+		return err
+	}
+	hc.srcW, hc.srcH = srcW, srcH
+
+	// Compute the analysis (tiny) frame size
+	cropWidth, cropHeight := hc.calculateAnalysisSize()
 
 	// Call resize function
-	if err := hc.resizeTiny(filepath.Join(hc.tempDirTinyVid, getBasenameWithoutExt(hc.inputVideo)+".mp4"), cropWidth, hc.Height); err != nil {
+	if err := hc.resizeTiny(filepath.Join(hc.tempDirTinyVid, getBasenameWithoutExt(hc.inputVideo)+".mp4"), cropWidth, cropHeight); err != nil {
 		return err
 	}
 	return nil
 }
 
-// CalculateWidthHeight calculates the width of a 16:9 video given the height in pixels,
-// ensuring both width and height are divisible by 2.
-func (hc *HoloCropper) calculateCropWidthHeight() (width, newHeight int) {
-	// Calculate width based on the 16:9 aspect ratio formula: width = (height * 16) / 9
-	width = (hc.Height * 16) / 9
+// sourceDimensions opens the input video just long enough to read its size.
+func (hc *HoloCropper) sourceDimensions() (int, int, error) {
+	video, err := vidio.NewVideo(hc.inputVideo)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer video.Close()
+	return video.Width(), video.Height(), nil
+}
 
-	// Ensure width is divisible by 2
+// calculateAnalysisSize returns the analysis frame size. The analysis height is
+// hc.AnalysisHeight (default 480) but never below the requested output height,
+// so a crop can always be scaled DOWN to the output (never upscaled). The
+// analysis width follows the true source aspect ratio. Both values are even.
+func (hc *HoloCropper) calculateAnalysisSize() (width, height int) {
+	height = hc.AnalysisHeight
+	if height <= 0 {
+		height = defaultAnalysisHeight
+	}
+	if height < hc.Height {
+		height = hc.Height
+	}
+
+	width = height * hc.srcW / hc.srcH
+	if width < 16 {
+		width = 16
+	}
+
 	if width%2 != 0 {
 		width++
 	}
-
-	// Ensure height is divisible by 2
-	if hc.Height%2 != 0 {
-		hc.Height++
-	}
-	if hc.Width%2 != 0 {
-		hc.Width++
+	if height%2 != 0 {
+		height++
 	}
 
-	return width, hc.Height
+	return width, height
 }
 
 // Resize to base tiny size with FFMPEG
@@ -51,9 +75,11 @@ func (hc *HoloCropper) resizeTiny(outputFile string, width, height int) error {
 		return fmt.Errorf("Error: Must specify FPS")
 	}
 
+	// No unsharp here: sharpening fragments the binary masks that drive
+	// subject detection and adds framing jitter (HIGH-ASPECT-RATIO-FIXES.md F6).
 	cmd := exec.Command("ffmpeg",
 		"-i", hc.inputVideo,
-		"-vf", "unsharp=5:5:1.0:5:5:0.0,scale="+strconv.Itoa(width)+":"+strconv.Itoa(height),
+		"-vf", "scale="+strconv.Itoa(width)+":"+strconv.Itoa(height),
 		"-sws_flags", "lanczos+accurate_rnd", // Use Lanczos resampling with accurate rounding
 		"-r", strconv.FormatFloat(hc.FPS, 'f', -1, 64),
 		outputFile,

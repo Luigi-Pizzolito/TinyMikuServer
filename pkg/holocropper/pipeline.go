@@ -60,12 +60,8 @@ func (hc *HoloCropper) startPipeline() error {
 
 func (hc *HoloCropper) checkPipelineDone() bool {
 	if hc.currentFrame == hc.totalFrames {
-		// Close pipeline channels
-		close(hc.procFrameQueue1)
-		close(hc.procFrameQueue2)
-		close(hc.procFrameQueue3)
-		close(hc.procFrameQueue4)
-		close(hc.procFrameQueue5)
+		// Close pipeline channels (once, guarded)
+		hc.closePipes()
 
 		return true
 	}
