@@ -221,12 +221,14 @@ func (hc *HoloCropper) calcVideo() {
 				cropFloor = math.Min(floor, frameH)
 				maxCropW, landscapePad = frameW, 0
 				if aspect >= 2 {
-					// Landscape containment fit (§12.8): the maxZoom policy cap
-					// yields to the full-subject fit, only the no-upscale floor
-					// stays absolute, and the crop may overflow the frame sides
-					// by up to landscapePadCapFrac per side as black padding.
-					landscapePad = landscapePadCapFrac * frameW
-					maxCropW = frameW + 2*landscapePad
+					// Landscape containment fit (§12.8/§12.9): the maxZoom policy
+					// cap yields to the full-subject fit, only the no-upscale
+					// floor stays absolute, and the crop may grow past the frame
+					// sides up to landscapeMaxCropW (full-frame-height fit) as
+					// black stage padding - vertical subject clipping is
+					// structurally impossible.
+					maxCropW = landscapeMaxCropW(frameW, frameH, aspect)
+					landscapePad = (maxCropW - frameW) / 2
 					cropFloor = 0
 					if hc.srcH > 0 {
 						cropFloor = math.Min(float64(hc.Height)*frameH/float64(hc.srcH), frameH)

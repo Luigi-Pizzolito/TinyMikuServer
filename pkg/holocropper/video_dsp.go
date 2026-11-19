@@ -240,9 +240,10 @@ func (hc *HoloCropper) totalBoundingBox(rectangles []image.Rectangle) image.Rect
 //     landscape outputs, where full-subject containment outranks it (§12.8)
 //  3. extreme portrait (aspect < 0.5) and landscape (aspect >= 2) use a
 //     containment fit: the crop must hold the whole padded subject. For
-//     landscape this can require limited black padding beyond the frame's
-//     left/right edges (landscapePadCapFrac), and the crop is anchored so
-//     the feet sit at the stage floor (frame bottom). Square outputs center.
+//     landscape this can require black padding beyond the frame's left/
+//     right edges (capped at landscapeMaxCropW, which guarantees the full
+//     frame height always fits, §12.9), and the crop is anchored so the
+//     feet sit at the stage floor (frame bottom). Square outputs center.
 // Returns (width, height, centerX, centerY) in analysis-frame pixels.
 func (hc *HoloCropper) aspectLockedTarget(bbox image.Rectangle, frameW, frameH, aspect float64) (float64, float64, float64, float64) {
 	margin := hc.zoomMargin()
@@ -280,14 +281,14 @@ func (hc *HoloCropper) aspectLockedTarget(bbox image.Rectangle, frameW, frameH, 
 
 	// Vertical is always inside the frame (no out-of-frame vertical padding).
 	// Width is inside the frame except for landscape, where the containment
-	// fit may overflow by up to landscapePadCapFrac of the frame per side.
+	// fit may overflow up to landscapeMaxCropW (§12.9).
 	if h > frameH {
 		h = frameH
 		w = h * aspect
 	}
-	maxW := frameW
+	maxW := float64(frameW)
 	if aspect >= 2 {
-		maxW = frameW * (1 + 2*landscapePadCapFrac)
+		maxW = landscapeMaxCropW(float64(frameW), float64(frameH), aspect)
 	}
 	if w > maxW {
 		w = maxW
@@ -336,11 +337,23 @@ func (hc *HoloCropper) aspectLockedTarget(bbox image.Rectangle, frameW, frameH, 
 // hc.zoomMargin.
 const portraitContainMargin = 1.18
 
-// landscapePadCapFrac caps how far the landscape containment fit may push the
-// crop past each side of the analysis frame as black stage padding (§12.8).
-// 0.17 of an 854-wide frame is ~145 px per side, enough for the corpus'
-// 275-300 px tall subjects under a 3.24:1 output aspect.
-const landscapePadCapFrac = 0.17
+// landscapePadCapFrac is the baseline side-padding allowance for the
+// landscape containment fit (§12.8/§12.9): 42% of the frame width per side
+// is exactly the padding of a full-frame-height crop under a 3.24:1 output
+// on a 16:9 analysis frame (1555 px crop in an 854 px frame).
+const landscapePadCapFrac = 0.42
+
+// landscapeMaxCropW is the widest legal landscape crop: the larger of the
+// padding-fraction allowance and the full-frame-height containment fit
+// (frameH * aspect). Because a subject bbox can never be taller than the
+// frame, this makes vertical subject clipping structurally impossible in
+// landscape: the crop can always grow to hold the whole frame height, at
+// the cost of black stage padding up to (frameH*aspect - frameW)/2 px per
+// side (~41% of frame width for 648x200 output on a 16:9 source; the dark
+// stage backgrounds hide it, §12.9).
+func landscapeMaxCropW(frameW, frameH, aspect float64) float64 {
+	return math.Max(frameW*(1+2*landscapePadCapFrac), frameH*aspect)
+}
 
 // widthCoverFrac is the minimum fraction of the subject bbox width the crop
 // must cover. Tall output ratios clip trailing limbs/props rather than

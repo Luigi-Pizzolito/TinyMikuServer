@@ -278,24 +278,33 @@ func TestAspectLockedTargetLandscapeFeetAnchor(t *testing.T) {
 	}
 }
 
-// TestAspectLockedTargetLandscapePadCap: a subject so tall that even the
-// padded-width cap fit must clip some margin: the crop caps at
-// frameW*(1+2*landscapePadCapFrac) and still contains the subject height.
-func TestAspectLockedTargetLandscapePadCap(t *testing.T) {
+// TestAspectLockedTargetLandscapeNoClipGuarantee: the §12.9 cap policy. A
+// dissapearance-style tall subject (bh 429 in a 480 frame) may not be cut
+// vertically: the crop grows to the full-frame-height fit (1555 px wide,
+// 350 px black stage padding per side) under the padded-width cap (1571)
+// and pins its bottom to the frame floor.
+func TestAspectLockedTargetLandscapeNoClipGuarantee(t *testing.T) {
 	hc := &HoloCropper{Height: 200, Width: 648, srcH: 1080}
-	bbox := image.Rect(327, 150, 527, 480) // 200x330, feet on the frame floor
+	bbox := image.Rect(212, 51, 412, 480) // 200x429, feet on the frame floor
 	w, h, _, cy := hc.aspectLockedTarget(bbox, 854, 480, 648.0/200)
-	if w > 854*(1+2*landscapePadCapFrac)+1 {
-		t.Fatalf("crop width %.1f exceeds padded cap %.1f", w, 854*(1+2*landscapePadCapFrac))
+	if h < float64(bbox.Dy()) {
+		t.Fatalf("crop height %.1f shorter than subject %d: head/feet would clip", h, bbox.Dy())
 	}
-	if h < 352 || h > 354 {
-		t.Fatalf("crop height %.1f not ~353 (cap fit)", h)
+	if h < 479 || h > 481 {
+		t.Fatalf("crop height %.1f not the full-frame fit 480", h)
 	}
-	if h < float64(bbox.Dy())-0.5 {
-		t.Fatalf("crop height %.1f shorter than subject %d: feet would clip", h, bbox.Dy())
+	if w < 1554 || w > 1556 {
+		t.Fatalf("crop width %.1f not aspect-locked full-frame fit ~1555", w)
+	}
+	pad := (w - 854) / 2
+	if pad > landscapePadCapFrac*854+1 {
+		t.Fatalf("side padding %.1f exceeds cap %.1f", pad, landscapePadCapFrac*854)
 	}
 	if math.Abs(cy+h/2-480) > 0.5 {
 		t.Fatalf("crop bottom %.1f not pinned to the frame floor 480", cy+h/2)
+	}
+	if top := cy - h/2; top > float64(bbox.Min.Y) {
+		t.Fatalf("crop top %.1f below subject top %d: head would clip", top, bbox.Min.Y)
 	}
 }
 
@@ -432,11 +441,16 @@ func TestCropRectLandscapePadding(t *testing.T) {
 	if r.Dx() != 1090 {
 		t.Fatalf("crop width %d not 1090: aspect lock broken by edge clamp", r.Dx())
 	}
-	if left := -r.Min.X; left < 0 || float64(left) > padAllow+1 {
-		t.Fatalf("left overflow %d outside [0, %.1f]", left, padAllow)
+	// each side's overflow is bounded by the allowance; a side may have none
+	// (the clamp window is wider than the frame when padAllow > 0)
+	if left := max(0, -r.Min.X); float64(left) > padAllow+1 {
+		t.Fatalf("left overflow %d exceeds allowance %.1f", left, padAllow)
 	}
-	if right := r.Max.X - 854; right < 0 || float64(right) > padAllow+1 {
-		t.Fatalf("right overflow %d outside [0, %.1f]", right, padAllow)
+	if left := max(0, -r.Min.X); float64(left) < 0.9*padAllow {
+		t.Fatalf("left overflow %d: edge-pinned subject did not get the allowance", left)
+	}
+	if right := max(0, r.Max.X-854); float64(right) > padAllow+1 {
+		t.Fatalf("right overflow %d exceeds allowance %.1f", right, padAllow)
 	}
 	if r.Min.X >= 0 && r.Max.X <= 854 {
 		t.Fatalf("crop %v never used the padding allowance it was given", r)
