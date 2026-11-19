@@ -304,6 +304,13 @@ func (hc *HoloCropper) calcVideo() {
 				}
 			}
 
+			// Grounded (landscape, §12.10): the EMA bbox bottom sits in the
+			// floor-proximity band, i.e. the subject stands on the stage
+			// floor even if the mask missed the feet (see ground snap in
+			// aspectLockedTarget). Used for the hard floor pin below.
+			grounded := aspect >= 2 && haveEMA &&
+				frameH-emaF[3] <= landscapeGroundSnapFrac*frameH
+
 			// Plant updates. Zoom first so pan spans see this frame's crop
 			// size; every plant is PI -> low-passed command -> crop-relative
 			// rate cap, so all crop motion is a smooth ramp (no bang-bang
@@ -316,7 +323,16 @@ func (hc *HoloCropper) calcVideo() {
 				cropH = cropW / aspect
 			}
 			cropCx = hc.applyAxisPID(panX, &cmdX, cropCx, tgtCx+velLeadFrames*vx, dt, cropW, panFloorX)
-			cropCy = hc.applyAxisPID(panY, &cmdY, cropCy, tgtCy+velLeadFrames*vy, dt, cropH, panFloorY)
+			if grounded {
+				// Hard floor pin: with the ground snap the feet rest on the
+				// frame floor, so pin the crop bottom there exactly instead
+				// of chasing a floor-derived target through the pan PID.
+				// The feet line cannot lag the zoom plant or target EMA.
+				cropCy = frameH - cropH/2
+				cmdY = 0
+			} else {
+				cropCy = hc.applyAxisPID(panY, &cmdY, cropCy, tgtCy+velLeadFrames*vy, dt, cropH, panFloorY)
+			}
 
 			// Clamp plant to frame: vertical always fully inside; horizontally
 			// the crop may extend past the frame edges by up to landscapePad

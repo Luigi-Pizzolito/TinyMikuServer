@@ -267,6 +267,18 @@ func (hc *HoloCropper) aspectLockedTarget(bbox image.Rectangle, frameW, frameH, 
 		// now grows past the frame's left/right edges (capped below) with
 		// black stage padding - the owner's accepted trade: fitting the full
 		// subject outranks maximal subject scale.
+		//
+		// Ground snap (§12.10): dark footwear on dark stages is often missed
+		// by the mask, leaving the bbox bottom (twin-tail tips) 10-70 px
+		// above the stage floor while the feet are actually on it. When the
+		// bbox bottom is near the frame floor, treat the subject as grounded
+		// and extend the bbox to the floor before fitting and anchoring: the
+		// crop then reaches the real feet instead of cutting them below the
+		// phantom bbox bottom. Over-snapping an airborne subject is harmless
+		// (the crop only grows); under-snapping clips feet.
+		if float64(frameH)-float64(bbox.Max.Y) <= landscapeGroundSnapFrac*float64(frameH) {
+			bbox.Max.Y = int(math.Round(frameH))
+		}
 		h = math.Max(float64(bbox.Dy()), float64(bbox.Dx())/aspect) * margin
 	} else {
 		// Square outputs: dominant-axis fit. Cover the subject height and
@@ -342,6 +354,13 @@ const portraitContainMargin = 1.18
 // is exactly the padding of a full-frame-height crop under a 3.24:1 output
 // on a 16:9 analysis frame (1555 px crop in an 854 px frame).
 const landscapePadCapFrac = 0.42
+
+// landscapeGroundSnapFrac is the floor-proximity band (§12.10): an EMA bbox
+// bottom within this fraction of the frame height of the frame bottom marks
+// a grounded subject, whose fit and anchor extend to the frame floor. 0.18
+// of 480 is 86 px - comfortably above the corpus' dark-boot mask misses
+// (10-70 px), below the airborne gaps at jumps/fades (90-220 px).
+const landscapeGroundSnapFrac = 0.18
 
 // landscapeMaxCropW is the widest legal landscape crop: the larger of the
 // padding-fraction allowance and the full-frame-height containment fit

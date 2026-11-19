@@ -221,21 +221,22 @@ func TestAspectLockedTargetPortraitSmallSubjectZoomsIn(t *testing.T) {
 }
 
 // TestAspectLockedTargetLandscapeContainment: the shipped landscape policy
-// (§12.8). A 350x300 subject needs a 336-tall crop for full containment;
-// the crop may overflow the frame's left/right edges (bounded padding) and
-// its bottom pins to the frame floor for a grounded subject.
+// (§12.8/§12.10). A 350x300 subject standing 2 px off the frame floor is
+// ground-snapped to 302, needing a 338-tall crop for full containment; the
+// crop may overflow the frame's left/right edges (bounded padding) and its
+// bottom pins to the frame floor.
 func TestAspectLockedTargetLandscapeContainment(t *testing.T) {
 	hc := &HoloCropper{Height: 200, Width: 648, srcH: 1080}
 	bbox := image.Rect(252, 178, 602, 478) // 350x300, feet on the frame floor
 	w, h, cx, cy := hc.aspectLockedTarget(bbox, 854, 480, 648.0/200)
-	if h < 335 || h > 337 {
-		t.Fatalf("landscape crop height %.1f not ~336 (1.12x containment of 300)", h)
+	if h < 337 || h > 339 {
+		t.Fatalf("landscape crop height %.1f not ~338 (1.12x containment of 302)", h)
 	}
 	if h < float64(bbox.Dy())-0.5 {
 		t.Fatalf("crop height %.1f shorter than subject %d: feet would clip", h, bbox.Dy())
 	}
-	if w < 1087 || w > 1090 {
-		t.Fatalf("landscape crop width %.1f not ~1089 (aspect locked)", w)
+	if w < 1094 || w > 1097 {
+		t.Fatalf("landscape crop width %.1f not ~1096 (aspect locked)", w)
 	}
 	pad := (w - 854) / 2
 	if pad > landscapePadCapFrac*854+1 {
@@ -305,6 +306,45 @@ func TestAspectLockedTargetLandscapeNoClipGuarantee(t *testing.T) {
 	}
 	if top := cy - h/2; top > float64(bbox.Min.Y) {
 		t.Fatalf("crop top %.1f below subject top %d: head would clip", top, bbox.Min.Y)
+	}
+}
+
+// TestAspectLockedTargetLandscapeGroundSnap: dissapearance 02:04 geometry
+// (§12.10). The mask misses her dark boots: the bbox (139x329) ends 53 px
+// above the frame floor although she stands on it. The snap extends fit and
+// anchor to the floor: full-frame-height fit, bottom pinned to 480, head
+// clear of the crop top.
+func TestAspectLockedTargetLandscapeGroundSnap(t *testing.T) {
+	hc := &HoloCropper{Height: 200, Width: 648, srcH: 1080}
+	bbox := image.Rect(341, 98, 480, 427) // 139x329, 53 px floor gap
+	w, h, _, cy := hc.aspectLockedTarget(bbox, 854, 480, 648.0/200)
+	if h < 426 || h > 429 {
+		t.Fatalf("crop height %.1f not the snapped fit 1.12*(480-98)~428", h)
+	}
+	if math.Abs(w-h*(648.0/200)) > 0.5 {
+		t.Fatalf("crop %.1fx%.1f not aspect locked", w, h)
+	}
+	if math.Abs(cy+h/2-480) > 0.5 {
+		t.Fatalf("crop bottom %.1f not pinned to the frame floor 480", cy+h/2)
+	}
+	if top := cy - h/2; top > float64(bbox.Min.Y) {
+		t.Fatalf("crop top %.1f below bbox top %d: head would clip", top, bbox.Min.Y)
+	}
+}
+
+// TestAspectLockedTargetLandscapeAirborneNoSnap: a bbox bottom 100 px above
+// the frame floor is outside the snap band (jump): no snap, the fit uses the
+// actual bbox height and the feet anchor stays at bbox bottom + feet pad.
+func TestAspectLockedTargetLandscapeAirborneNoSnap(t *testing.T) {
+	hc := &HoloCropper{Height: 200, Width: 648, srcH: 1080}
+	bbox := image.Rect(341, 100, 480, 380) // 139x280, 100 px floor gap
+	_, h, _, cy := hc.aspectLockedTarget(bbox, 854, 480, 648.0/200)
+	if h < 313 || h > 314 {
+		t.Fatalf("crop height %.1f not 1.12*280~313.6: snap fired on an airborne subject", h)
+	}
+	bot := cy + h/2
+	if want := float64(bbox.Max.Y) + feetPadFraction*h; math.Abs(bot-want) > 0.5 {
+		t.Fatalf("crop bottom %.1f not bbox bottom + feet pad %.1f", bot, want)
 	}
 }
 
