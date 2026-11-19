@@ -539,6 +539,17 @@ func sweepPreviews(dir string) ([]string, error) {
 
 // moveFile relocates a finished artifact into its published location, falling
 // back to copy+remove when scratch and destination are on different devices.
+// renderOutputName picks the final production file name: the API default
+// tags it with the output dimensions; req.OutputName (validated bare
+// .mp4) overrides with a fixed name, which is how the CLI keeps its legacy
+// <basename>.mp4 naming - renders onto the same name overwrite, as before.
+func renderOutputName(basename string, w, h int, override string) string {
+	if override != "" {
+		return override
+	}
+	return fmt.Sprintf("%s-%dx%d.mp4", basename, w, h)
+}
+
 func moveFile(src, dst string) error {
 	if err := os.Rename(src, dst); err == nil {
 		return nil
@@ -557,9 +568,12 @@ func moveFile(src, dst string) error {
 // RenderFinal (story B2)
 
 // RenderFinal starts the production render for p: the planned crops at the
-// Plan's output resolution, muxed with the source audio track, written to
-// req.OutputDir as <basename>-<WxH>.mp4 (dimension-tagged, so re-rendering at
-// another target never clobbers a previous production file).
+// RenderFinal starts the final render of p at the Plan's output resolution,
+// muxed with the source audio track, written to req.OutputDir. The final
+// file is <basename>-<WxH>.mp4 (dimension-tagged, so re-rendering at
+// another target never clobbers a previous production file) unless
+// req.OutputName overrides it with a fixed name - the CLI keeps its legacy
+// <basename>.mp4 naming that way, overwrite semantics included.
 //
 // It shares the Analysis render slot with RenderPreview: whichever starts
 // later supersedes the other.
@@ -640,7 +654,7 @@ func renderFinalWork(ctx context.Context, a *Analysis, task *RenderTask, p *Plan
 	}
 
 	basename := getBasenameWithoutExt(a.meta.Input)
-	outPath := filepath.Join(outDir, fmt.Sprintf("%s-%dx%d.mp4", basename, r.OutputW, r.OutputH))
+	outPath := filepath.Join(outDir, renderOutputName(basename, r.OutputW, r.OutputH, req.OutputName))
 	tmp := filepath.Join(task.scratch, "final.mp4")
 	if err := muxFrameSequence(ctx, req.FFmpegPath, framesDir, a.meta.Input, planFPS(p), tmp, PhaseRenderMux, tb, frames); err != nil {
 		return nil, err

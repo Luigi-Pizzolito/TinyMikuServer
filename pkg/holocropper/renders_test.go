@@ -434,6 +434,79 @@ func TestRenderCancelMidPreview(t *testing.T) {
 	}
 }
 
+// TestRenderRequestOutputNameValidation: OutputName must be a bare .mp4
+// file name - it never steers the write outside OutputDir.
+func TestRenderRequestOutputNameValidation(t *testing.T) {
+	good := RenderRequest{OutputDir: "o", TempDir: "t", OutputName: "video.mp4"}
+	if errs := good.Validate(); len(errs) != 0 {
+		t.Errorf("valid OutputName rejected: %v", errs)
+	}
+	for _, bad := range []string{"video.avi", "../escape.mp4", "sub/dir.mp4", "/abs.mp4", ".mp4"} {
+		r := RenderRequest{OutputDir: "o", TempDir: "t", OutputName: bad}
+		errs := r.Validate()
+		if len(errs) == 0 {
+			t.Errorf("OutputName %q accepted, want a validation error", bad)
+			continue
+		}
+		if errs[len(errs)-1].Field != "output_name" {
+			t.Errorf("OutputName %q error field = %q, want output_name", bad, errs[len(errs)-1].Field)
+		}
+	}
+}
+
+// TestRenderFinalLegacyOutputName: the CLI-compat naming channel. A fixed
+// OutputName lands exactly there and overwrites on the next render, like
+// the legacy Crop path; the default stays dimension-tagged.
+func TestRenderFinalLegacyOutputName(t *testing.T) {
+	ffmpeg := requireFFmpeg(t)
+	a, p := setupRenderFixture(t, ffmpeg, 240, 240)
+	outDir, tempDir := t.TempDir(), t.TempDir()
+
+	task, err := a.RenderFinal(context.Background(), p, RenderRequest{
+		OutputDir: outDir, TempDir: tempDir, FFmpegPath: ffmpeg,
+		OutputName: "fixture.mp4",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := task.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(outDir, "fixture.mp4")
+	if res.OutputPath != want {
+		t.Fatalf("output path %s, want %s", res.OutputPath, want)
+	}
+	if st, err := os.Stat(want); err != nil || st.Size() == 0 {
+		t.Fatalf("legacy-named output missing/empty: %v", err)
+	}
+
+	// Same name again (different target size): overwrite, no second file,
+	// exactly like the legacy CLI re-cropping the same input.
+	pWide, err := NewPlan(a.Stream(), Settings{Width: 320, Height: 320, FPS: fixtureFPS})
+	if err != nil {
+		t.Fatal(err)
+	}
+	task2, err := a.RenderFinal(context.Background(), pWide, RenderRequest{
+		OutputDir: outDir, TempDir: tempDir, FFmpegPath: ffmpeg,
+		OutputName: "fixture.mp4",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res2, err := task2.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res2.OutputPath != want {
+		t.Errorf("re-render path %s, want the same %s", res2.OutputPath, want)
+	}
+	files, _ := filepath.Glob(filepath.Join(outDir, "*.mp4"))
+	if len(files) != 1 {
+		t.Errorf("output dir has %v, want only the overwritten legacy file", files)
+	}
+}
+
 // TestRenderFinalOutputAndDeterminism is the story B2 acceptance run: the
 // dimension-tagged file, correct frame count and resolution, the source audio
 // track copied through, cleaned scratch, and frame determinism across runs.

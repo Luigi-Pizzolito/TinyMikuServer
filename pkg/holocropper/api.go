@@ -380,6 +380,7 @@ type RenderRequest struct {
 	OutputDir   string    `json:"output_dir"`  // required, must exist
 	TempDir     string    `json:"temp_dir"`    // required scratch parent
 	FFmpegPath  string    `json:"ffmpeg_path"` // "" = PATH
+	OutputName  string    `json:"output_name"` // final file name inside OutputDir; "" = <basename>-<WxH>.mp4
 	KeepWorkDir bool      `json:"keep_work_dir"`
 	Observer    *Observer `json:"-"`
 }
@@ -394,7 +395,16 @@ func (r RenderRequest) Validate() []ValidationError {
 	if r.TempDir == "" {
 		errs = append(errs, ValidationError{Field: "temp_dir", Reason: "a scratch parent directory is required"})
 	}
+	if r.OutputName != "" && !validOutputFileName(r.OutputName) {
+		errs = append(errs, ValidationError{Field: "output_name", Reason: "must be a plain .mp4 file name (no path separators)"})
+	}
 	return errs
+}
+
+// validOutputFileName accepts only a bare .mp4 file name: OutputName never
+// steers the write outside OutputDir.
+func validOutputFileName(name string) bool {
+	return name != ".mp4" && filepath.Base(name) == name && strings.HasSuffix(name, ".mp4")
 }
 
 // ---------------------------------------------------------------------------
