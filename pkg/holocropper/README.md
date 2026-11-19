@@ -38,45 +38,39 @@ Design and measured results: [HIGH-ASPECT-RATIO-FIXES.md](../../HIGH-ASPECT-RATI
 ```mermaid
 flowchart LR
   CLI["cmd/holocropper<br/>-w -h -fps flags"] --> CROP["HoloCropper.Crop"]
-  CROP --> ORIENT{"-auto-orient?"}
-  ORIENT -- yes --> PROBE["probe: up to 128 sampled frames<br/>master-bbox AR: keep or flip W x H"]
-  ORIENT -- no --> SCALE
-  PROBE --> SCALE["ffmpeg pre-scale<br/>analysis video, height 480 default"]
+  CROP --> ORIENT{"IF -auto-orient set?"}
+  ORIENT -- "yes: probe up to 128 frames,<br/>keep or flip W x H by subject AR" --> SCALE["ffmpeg pre-scale<br/>analysis video, height 480 default"]
+  ORIENT -- "no: use requested W x H" --> SCALE
   SCALE --> S1["STEP 1 readVideo<br/>raw RGBA frames"]
-  S1 --> S2["STEP 2 grayscaleVideo"]
-  S2 --> S3["STEP 3 binaryVideo<br/>Otsu with +/-10 hysteresis<br/>connected components<br/>20% area filter + combineBounds"]
-  S3 --> S4["STEP 4 calcVideo<br/>framing controller<br/>(diagram below)"]
-  S4 --> S5["STEP 5 crop frames"]
-  S5 --> S6["STEP 6 save JPEG frames"]
-  S6 --> MUX["ffmpeg mux<br/>frames + source audio<br/>output mp4"]
-  S4 -. HOLOCROPPER_DEBUG_BOXES .-> CSV["per-frame framing CSV"]
+  S1 -- "raw frames" --> S2["STEP 2 grayscaleVideo"]
+  S2 -- "gray frames" --> S3["STEP 3 binaryVideo<br/>Otsu with +/-10 hysteresis<br/>connected components<br/>20% area filter + combineBounds"]
+  S3 -- "subject bboxes" --> S4["STEP 4 calcVideo<br/>framing controller<br/>(diagram below)"]
+  S4 -- "crop rectangles" --> S5["STEP 5 crop frames"]
+  S5 -- "cropped frames" --> S6["STEP 6 save JPEG frames"]
+  S6 -- "JPEG sequence" --> MUX["ffmpeg mux<br/>frames + source audio<br/>output mp4"]
+  S4 -. "debug hook: HOLOCROPPER_DEBUG_BOXES" .-> CSV["per-frame framing CSV"]
 ```
 
 STEP 4 owns every per-frame framing decision: subject smoothing, the aspect-locked target geometry, and three plant controllers (pan X, pan Y, zoom):
 
 ```mermaid
 flowchart TD
-  BBOX["master bbox over all subjects"] --> CUT{"scene cut?<br/>bbox jump over 25% of frame"}
-  CUT -- yes --> RESET["hard reset:<br/>EMA bbox, PIDs, targets"]
-  CUT -- no --> EMA["EMA subject bbox, alpha 0.3"]
-  RESET --> EMA
-  EMA --> ALT["aspectLockedTarget geometry<br/>containment fit portrait and landscape<br/>dominant-axis fit square<br/>ground snap, zoom floors, width caps<br/>feet-priority anchor"]
-  ALT --> TEMA["smoothed targets<br/>x and y 0.7, height 0.15"]
-  EMA --> VEL["velocity EMA, alpha 0.5<br/>3-frame pan lead"]
-  TEMA --> WALK{"walk mode gate<br/>landscape output from landscape source<br/>aspect at least 0.90 of source aspect"}
-  VEL --> WALK
-  WALK -- leashed --> LEASH["deadzone leash<br/>freeze while slack, edge-chase after"]
-  WALK -- "no window: wide group, lost subject" --> CENTER["centered target + velocity lead"]
-  LEASH --> PX["pan X: applyAxisPID"]
-  CENTER --> PX
-  LEASH --> PY["pan Y: applyAxisPID"]
-  CENTER --> PY
-  TEMA --> ZP["zoom: applyZoomPID"]
-  PX --> PLANT["PI at frame time 1/FPS, no D term<br/>anti-windup, low-passed actuator<br/>crop-relative pan rate caps"]
-  PY --> PLANT
-  ZP --> ZPLANT["PI, low-passed actuator<br/>zoom-in 0.25 px/frame, zoom-out 4 px/frame"]
-  PLANT --> CLAMP["final clamps<br/>aspect lock cropW = cropH x aspect<br/>cx inside frame plus stage pad, cy inside frame<br/>grounded floor pin: crop bottom = stage floor"]
-  ZPLANT --> CLAMP
+  BBOX["master bbox over all subjects"] --> LOST{"IF subject area under 0.1% of the frame?"}
+  LOST -- "yes: subject lost - hold last crop,<br/>open zoom toward full frame at rate limits" --> ZOOM["zoom plant applyZoomPID<br/>PI at frame time 1/FPS, no D term<br/>low-passed actuator<br/>zoom-in 0.25 px/frame, zoom-out 4 px/frame"]
+  LOST -- "no" --> CUT{"IF scene cut?<br/>bbox jumped over 25% of the frame<br/>or subject count changed by 3+"}
+  CUT -- "no" --> EMA["update EMA subject bbox (alpha 0.3)<br/>and velocity EMA (alpha 0.5)"]
+  CUT -- "yes: hard reset first<br/>EMA bbox, PIDs, targets" --> EMA
+  EMA --> GEOM["aspectLockedTarget geometry<br/>containment fit: portrait and landscape<br/>dominant-axis fit: square<br/>ground snap, zoom floors, width caps<br/>feet-priority anchor"]
+  GEOM --> TGT["smoothed targets<br/>x and y 0.7, height 0.15"]
+  TGT -- "pan targets" --> GATE{"IF walk mode active?<br/>landscape output from landscape source<br/>AND aspect at least 0.90 of source aspect"}
+  TGT -- "zoom target" --> ZOOM
+  GATE -- "no: portrait, square or output<br/>narrower than the source aspect" --> CENTER["centered target<br/>+ 3-frame velocity lead"]
+  GATE -- "yes" --> LEASH{"IF leash window valid?<br/>subject + 2 leash margins narrower<br/>than the crop?"}
+  LEASH -- "no: subject or group too wide" --> CENTER
+  LEASH -- "yes: deadzone leash<br/>freeze while slack,<br/>edge-chase when slack runs out" --> PAN["pan plants applyAxisPID for X and Y<br/>PI at frame time 1/FPS, anti-windup<br/>low-passed actuator<br/>crop-relative pan rate caps"]
+  CENTER -- "pan targets" --> PAN
+  PAN -- "crop center x, y" --> CLAMP["final clamps<br/>aspect lock: cropW = cropH x aspect<br/>cx inside frame plus stage pad, cy inside frame<br/>grounded floor pin: crop bottom = stage floor"]
+  ZOOM -- "crop height" --> CLAMP
   CLAMP --> RECT["crop rectangle for this frame"]
 ```
 
