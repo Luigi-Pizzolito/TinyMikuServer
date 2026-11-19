@@ -524,3 +524,38 @@ Residual trueClips are airborne zoom-lag transients (worst 7.3 px) and the retry
 **Visual verification.** 3x contact sheets through 02:04 (f2955/2964/2976/2988/2995): both boots fully rendered on the bottom edge, ~21 output px headroom above the hair tips in every frame of the stand-up. Contact sheets for all four videos re-rendered at the exact frame sets of the §12.9-approved sheets: no regressions, and retrynow f301/f2068/f2896 - the §12.9 worst-clip frames - go from feet-amputated to fully framed. Group shots, kneeling poses and fade frames intact.
 
 Unit tests: 21 total (+`TestAspectLockedTargetLandscapeGroundSnap`: the dissapearance 02:04 geometry - a 139x329 box 53 px above the floor snaps to the 1.12 x (480-98) ≈ 428 fit, bottom pinned to 480, head clear of the crop top; +`TestAspectLockedTargetLandscapeAirborneNoSnap`: a 100 px floor gap gets no snap, keeping the bbox-based fit and feet-pad anchor; the containment test rewritten to the snapped fit).
+
+---
+
+## 13. Auto-orient: subject master-AR probe picks portrait vs landscape (2026-11-19)
+
+Owner request: given **any** requested output resolution (even extreme AR like 648x200), automatically pick the orientation that keeps the subjects best framed - measured on the average aspect ratio of the **master bounding box covering ALL detected subjects** per frame. Explicit opt-in flag `-auto-orient`; manual `-w/-h` behaviour is untouched so portrait+landscape pairs can still be rendered by hand.
+
+**Why master-bbox AR is the right signal.** The containment fit (§12.8/§12.9) sizes the crop as `max(bboxH, bboxW/aspect) x margin`. For a subject of aspect `s = bboxW/bboxH` in an output of aspect `a`, the fit wastes output area whenever `s != a`: the containment score `min(s/a, a/s)` is 1 when the subject's own aspect matches the crop and drops toward 0 as they diverge. Averaging it over frames is exactly "keeps the subjects mostly within the frame", and it is symmetric: comparing `a` vs `1/a` against the same AR samples decides portrait vs landscape with no magic thresholds.
+
+**Calibration (measured corpus CSVs, per-frame master bbox):**
+
+| video | n | geo-mean AR | median AR | coverage @3.24 (648x200) | coverage @0.309 (200x648) | verdict |
+|---|---|---|---|---|---|---|
+| dissapearance | 3334 | 0.580 | 0.563 | 0.187 | **0.551** | portrait |
+| retrynow | 2973 | 0.562 | 0.509 | 0.182 | **0.591** | portrait |
+| sweetdevil | 5546 | 0.476 | 0.447 | 0.157 | **0.673** | portrait |
+| tbaka | 4167 | 1.833 | 1.984 | **0.594** | 0.179 | landscape |
+
+Single-subject dance videos sit at AR 0.45-0.7 (tall) - portrait wins by ~3x. tbaka's three side-by-side dancers sit at AR ~1.8-2.7 - landscape wins by ~3.3x. The decision margin is never close on these, so a strict `flipScore > keepScore` rule with ties keeping the requested orientation is safe.
+
+**Implementation (`pkg/holocropper/auto_orient.go`).**
+- `AutoOrient(input, w, h)`: normalises W/H to even values (same rule as `Crop`), returns `(w,h)` or `(h,w)`. **1:1 outputs bypass the probe entirely** - there is no portrait/landscape choice and the video is never rotated, only the crop transposes. A probe failure or a subjectless video falls back to the requested orientation.
+- `probeSubjectARs`: decodes up to 128 evenly spread frames (`stride = total/128`, ffmpeg `select='not(mod(n,stride))'` + `scale`, `-fps_mode vfr -an`) into a throwaway probe video at the pipeline's analysis size (height 480, **without** the output-height floor - AR is scale-invariant and must not depend on the orientation being tested).
+- `probeDetect`: faithful mirror of the detection stage the framing controller will actually see - grayscale -> Otsu with the same +/-10 hysteresis -> binarize -> connected components -> 20%-of-largest filter with `combineBounds` -> `totalBoundingBox` over all subjects. Frames whose mask is >= 92% white are skipped: fully dark frames degenerate Otsu to threshold 0 and threshold the whole frame as "subject", which would fake a full-frame bbox carrying the frame's own AR.
+- CLI (`cmd/holocropper`): `-auto-orient` prints the probe report (sampled frames, mean/geo/median AR, both coverage scores, the decision) before rendering.
+
+**Battle tests.**
+- A: `-w 648 -h 200 -fps 24 -auto-orient` on all four corpus videos: dissapearance FLIP -> 200x648 (mean AR 0.60, cov 0.185 vs 0.561); retrynow FLIP (0.72, 0.183 vs 0.588); sweetdevil FLIP (0.49, 0.150 vs 0.679); tbaka keeps 648x200 (1.91, 0.590 vs 0.181). Output dims + frame counts verified with ffprobe (e.g. dissapearance 200x648, 3343 frames).
+- B: `-w 200 -h 648 -fps 24 -auto-orient`: dissapearance keeps portrait (0.561 vs 0.185); tbaka FLIPS to 648x200 (0.590 vs 0.181). Both directions of the flip work.
+- Framing untouched: auto-render metrics match the approved §12.10 baselines (portrait: diss 0 trueClips, floor pinned on every grounded frame, 0 head clips; landscape tbaka 88.5% median vertical coverage). CSV-by-CSV comparison auto vs auto2 (same video, same orientation, two probe-flag runs) shows 1-px-level bbox jitter starting mid-video - ffmpeg re-encode noise that snowballs through `combineBounds` (1 px > the 24 px combine tolerance chain), present run-to-run **independently of this feature**; aggregate metrics are unchanged.
+- Contact sheets of every auto render (portrait diss/retry/sweet through their full durations, landscape tbaka incl. group shots) reviewed visually: framing identical to the approved renders.
+
+Probe cost: one extra ffmpeg pass over 128 tiny frames + 128 detection passes - a few seconds per video, once, before rendering.
+
+Unit tests: 28 total (+7: flip/keep in both directions, square bypass, tie and no-subject fallback, containment-score symmetry, synthetic solo-vs-group detection incl. the dark-frame degenerate-mask guard).

@@ -7,9 +7,19 @@ Content-aware video cropper used to prepare videos for the tiny Miku holocube di
 
 ```sh
 bin/holocropper -i vids/song.mp4 -o out-dir -w 200 -h 648 -fps 24
+bin/holocropper -i vids/song.mp4 -o out-dir -w 648 -h 200 -fps 24 -auto-orient
 ```
 
 Any output aspect ratio works (1:1, tall portrait `200x648`, wide landscape `648x200`). Optional tuning flags: `-analysis-height` (default 480), `-zoom-margin` (default 1.12), `-max-zoom` (default 2.0). Setting `HOLOCROPPER_DEBUG_BOXES=boxes.csv` writes a per-frame framing log (subject box, smoothed box, applied crop) for verification.
+
+### Auto-orient (`-auto-orient`)
+
+Give any output resolution — e.g. `-w 648 -h 200` — and let the cropper pick the orientation for you. A preprocessing probe decodes up to 128 evenly spread frames of the input through the same subject-detection machinery the cropper uses, measures each frame's **master bounding box** (one box covering ALL detected subjects), and averages those aspect ratios. The requested `WxH` is compared with its transpose `HxW` by containment score (how much of the output a subject can fill at that ratio) and the better orientation is rendered.
+
+- Tall solo subjects flip a landscape request to portrait; side-by-side groups flip a portrait request to landscape.
+- The video is never rotated or flipped: only the crop orientation transposes, and the source always stays upright.
+- `1:1` outputs bypass the probe completely (there is no portrait/landscape choice to make).
+- The flag is opt-in. Without it `-w`/`-h` are used exactly as requested, so you can still render a portrait and a landscape version of the same video by hand. A probe failure or a subjectless video falls back to the requested orientation.
 
 Design and measured results: [HIGH-ASPECT-RATIO-FIXES.md](HIGH-ASPECT-RATIO-FIXES.md).
 
@@ -26,6 +36,7 @@ The original algorithm (https://github.com/Luigi-Pizzolito/1-1-Content-Aware-Vid
 - **Smoother tracking.** EMA subject bounding box with scene-cut reset, Otsu threshold hysteresis, and no unsharp filter on the analysis stream. Dropout holds the last framing and opens gradually instead of the original `panAdj = 0` hard snap (single-frame jumps up to 71 px in 1:1 mode).
 - **Tall ratios contain, anchored on the feet.** Portrait crops (e.g. 200x648) contain the whole subject and anchor it so the feet sit just above the bottom edge with a small pad and the slack above the head — a real-corpus sweep showed any tighter fit clips the feet on most floor-standing frames.
 - **Faster.** 25-30% faster on portrait and 1:1 despite larger analysis frames; landscape pays a small increase for the larger analysis frame that removes its structural padding.
-- **Tooling the original had none of:** 19 unit tests on the framing controller and geometry, a CSV instrumentation hook for ground-truth verification, and CLI-tunable framing parameters.
+- **Auto-orient probe (`-auto-orient`).** Estimates the average master-bbox aspect ratio of the subjects (all subjects, per frame, sampled through the detection pipeline) and renders the requested resolution or its transpose, whichever keeps them best framed. Never rotates the video; bypassed for 1:1. The original had no equivalent - the output orientation was fixed by the caller.
+- **Tooling the original had none of:** 28 unit tests on the framing controller, geometry, and the auto-orient estimator, a CSV instrumentation hook for ground-truth verification, and CLI-tunable framing parameters.
 
 </details>
