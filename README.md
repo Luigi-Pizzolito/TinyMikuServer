@@ -34,6 +34,60 @@ When a landscape source video is cropped to a landscape output, the subject's le
 
 Design and measured results: [HIGH-ASPECT-RATIO-FIXES.md](HIGH-ASPECT-RATIO-FIXES.md).
 
+### Architecture
+
+`pkg/holocropper` is a channel-connected pipeline: one goroutine per stage (the six `STEP`s), each consuming from the previous frame queue, so a video streams through in one pass. `cmd/holocropper` only sets parameters and calls `Crop`.
+
+```mermaid
+flowchart LR
+  CLI["cmd/holocropper<br/>-w -h -fps flags"] --> CROP["HoloCropper.Crop"]
+  CROP --> ORIENT{"-auto-orient?"}
+  ORIENT -- yes --> PROBE["probe: up to 128 sampled frames<br/>master-bbox AR: keep or flip W x H"]
+  ORIENT -- no --> SCALE
+  PROBE --> SCALE["ffmpeg pre-scale<br/>analysis video, height 480 default"]
+  SCALE --> S1["STEP 1 readVideo<br/>raw RGBA frames"]
+  S1 --> S2["STEP 2 grayscaleVideo"]
+  S2 --> S3["STEP 3 binaryVideo<br/>Otsu with +/-10 hysteresis<br/>connected components<br/>20% area filter + combineBounds"]
+  S3 --> S4["STEP 4 calcVideo<br/>framing controller<br/>(diagram below)"]
+  S4 --> S5["STEP 5 crop frames"]
+  S5 --> S6["STEP 6 save JPEG frames"]
+  S6 --> MUX["ffmpeg mux<br/>frames + source audio<br/>output mp4"]
+  S4 -. HOLOCROPPER_DEBUG_BOXES .-> CSV["per-frame framing CSV"]
+```
+
+STEP 4 owns every per-frame framing decision: subject smoothing, the aspect-locked target geometry, and three plant controllers (pan X, pan Y, zoom):
+
+```mermaid
+flowchart TD
+  BBOX["master bbox over all subjects"] --> CUT{"scene cut?<br/>bbox jump over 25% of frame"}
+  CUT -- yes --> RESET["hard reset:<br/>EMA bbox, PIDs, targets"]
+  CUT -- no --> EMA["EMA subject bbox, alpha 0.3"]
+  RESET --> EMA
+  EMA --> ALT["aspectLockedTarget geometry<br/>containment fit portrait and landscape<br/>dominant-axis fit square<br/>ground snap, zoom floors, width caps<br/>feet-priority anchor"]
+  ALT --> TEMA["smoothed targets<br/>x and y 0.7, height 0.15"]
+  EMA --> VEL["velocity EMA, alpha 0.5<br/>3-frame pan lead"]
+  TEMA --> WALK{"walk mode gate<br/>landscape output from landscape source<br/>aspect at least 0.90 of source aspect"}
+  VEL --> WALK
+  WALK -- leashed --> LEASH["deadzone leash<br/>freeze while slack, edge-chase after"]
+  WALK -- "no window: wide group, lost subject" --> CENTER["centered target + velocity lead"]
+  LEASH --> PX["pan X: applyAxisPID"]
+  CENTER --> PX
+  LEASH --> PY["pan Y: applyAxisPID"]
+  CENTER --> PY
+  TEMA --> ZP["zoom: applyZoomPID"]
+  PX --> PLANT["PI at frame time 1/FPS, no D term<br/>anti-windup, low-passed actuator<br/>crop-relative pan rate caps"]
+  PY --> PLANT
+  ZP --> ZPLANT["PI, low-passed actuator<br/>zoom-in 0.25 px/frame, zoom-out 4 px/frame"]
+  PLANT --> CLAMP["final clamps<br/>aspect lock cropW = cropH x aspect<br/>cx inside frame plus stage pad, cy inside frame<br/>grounded floor pin: crop bottom = stage floor"]
+  ZPLANT --> CLAMP
+  CLAMP --> RECT["crop rectangle for this frame"]
+```
+
+- Dropout (no subject detected): the last crop is held and opens gradually toward full frame at rate limits - no snap.
+- Zoom floors: never upscale past source resolution (absolute); the `maxZoom` policy floor relaxes for landscape, where the containment fit wins.
+- A user `-zoom-margin` above the landscape/portrait padding floors (1.18) overrides them.
+- Every controller plant is PI stepping at frame time (1/FPS) with a low-passed actuator command, so all crop motion is a smooth ramp - deterministic run to run.
+
 <details>
 <summary>Key differences vs the original 1-1-Content-Aware-Video-Crop algorithm</summary>
 
