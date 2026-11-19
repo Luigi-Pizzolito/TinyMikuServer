@@ -244,6 +244,7 @@ func (hc *HoloCropper) totalBoundingBox(rectangles []image.Rectangle) image.Rect
 //     right edges (capped at landscapeMaxCropW, which guarantees the full
 //     frame height always fits, §12.9), and the crop is anchored so the
 //     feet sit at the stage floor (frame bottom). Square outputs center.
+//
 // Returns (width, height, centerX, centerY) in analysis-frame pixels.
 func (hc *HoloCropper) aspectLockedTarget(bbox image.Rectangle, frameW, frameH, aspect float64) (float64, float64, float64, float64) {
 	margin := hc.zoomMargin()

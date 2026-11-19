@@ -121,7 +121,7 @@ const (
 	framingPanIntegral           = 250.0
 	framingZoomIntegral          = 100.0
 
-	panFloorX   = 2.0  // px/frame floors for pan rate limits
+	panFloorX   = 2.0 // px/frame floors for pan rate limits
 	panFloorY   = 1.5
 	panCropFrac = 0.05 // crop-relative pan rate: fraction of the crop's own dimension per frame
 	panErrGain  = 0.10 // extra pan rate allowance proportional to tracking error
