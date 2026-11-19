@@ -174,44 +174,15 @@ const (
 )
 
 func (hc *HoloCropper) calcVideo() {
-	// PI controllers: Kd is deliberately 0 (derivative kicks were the corpus
-	// jitter source, §12.7).
-	panX := NewPIDController(framingPanKp, framingPanKi, 0, framingPanIntegral)
-	panY := NewPIDController(framingPanKp, framingPanKi, 0, framingPanIntegral)
-	pidZ := NewPIDController(framingZoomKp, framingZoomKi, 0, framingZoomIntegral)
-
-	dt := 1.0 / hc.FPS
-	aspect := float64(hc.Width) / float64(hc.Height)
-
-	var emaF [4]float64 // ema bbox: x0,y0,x1,y1 (float to avoid a smoothing dead zone)
-	haveEMA := false
-	lastSubj := 0
-
-	// plant state (analysis px)
-	var cropCx, cropCy, cropH float64
-	// target state
-	var tgtCx, tgtCy, tgtH float64
-	haveTarget := false
-	snapTarget := true // first target after start/cut applies directly, not via EMA
-	// low-passed actuator commands (see applyAxisPID/applyZoomPID)
-	var cmdX, cmdY, cmdZ float64
-	// smoothed subject velocity (analysis px/frame) for the pan lead
-	var vx, vy, prevEcx, prevEcy float64
-	hasPrevEc := false
-
-	var frameW, frameH, cropFloor float64
-	// maxCropW bounds the crop width (frame width, plus the black stage
-	// padding allowance per side for landscape outputs); landscapePad is the
-	// cx clamp allowance (§12.8, video_dsp.go).
-	var maxCropW, landscapePad float64
-	// walkActive gates the walk-mode pan leash for this render (§14).
-	var walkActive bool
-	initialized := false
-	frame := 0
+	// STEP 4 delegates to the framingDecider replay engine (framedecider.go):
+	// the live pipeline and the embeddable Plan pass share one controller
+	// implementation, so replayed framing is bit-identical to live framing.
+	d := newFramingDecider(hc.framingParams(), float64(hc.Width)/float64(hc.Height), 1.0/hc.FPS, hc.srcW, hc.srcH)
 
 	dbg := newBoxDebugger()
 	defer dbg.close()
 
+	frame := 0
 	for {
 		select {
 		case mask, ok := <-hc.procFrameQueue3:
@@ -221,180 +192,32 @@ func (hc *HoloCropper) calcVideo() {
 			}
 			frame++
 
-			bounds := mask.Image.Bounds()
-			if !initialized {
-				frameW, frameH = float64(bounds.Dx()), float64(bounds.Dy())
-				cropCx, cropCy, cropH = frameW/2, frameH/2, frameH
-				tgtCx, tgtCy, tgtH = cropCx, cropCy, cropH
-				// Zoom-in floor: never upscale above source resolution, and
-				// respect the policy maxZoom (HIGH-ASPECT-RATIO-FIXES.md Phase 1).
-				floor := frameH / hc.maxZoom()
-				if hc.srcH > 0 {
-					floor = math.Max(floor, float64(hc.Height)*frameH/float64(hc.srcH))
-				}
-				cropFloor = math.Min(floor, frameH)
-				maxCropW, landscapePad = frameW, 0
-				if aspect >= 2 {
-					// Landscape containment fit (§12.8/§12.9): the maxZoom policy
-					// cap yields to the full-subject fit, only the no-upscale
-					// floor stays absolute, and the crop may grow past the frame
-					// sides up to landscapeMaxCropW (full-frame-height fit) as
-					// black stage padding - vertical subject clipping is
-					// structurally impossible.
-					maxCropW = landscapeMaxCropW(frameW, frameH, aspect)
-					landscapePad = (maxCropW - frameW) / 2
-					cropFloor = 0
-					if hc.srcH > 0 {
-						cropFloor = math.Min(float64(hc.Height)*frameH/float64(hc.srcH), frameH)
-					}
-				}
-				// Walk mode (§14): landscape -> landscape pan leash, always on.
-				// Gate on the true source aspect (the analysis frame preserves it
-				// but rounds to even pixels).
-				gateW, gateH := frameW, frameH
-				if hc.srcW > 0 && hc.srcH > 0 {
-					gateW, gateH = float64(hc.srcW), float64(hc.srcH)
-				}
-				walkActive = walkModeActive(aspect, gateW, gateH)
-				initialized = true
-			}
+			out := d.step(frame, mask.Bbox, mask.Subj, mask.Image.Bounds())
 
-			bbox := mask.Bbox
-			frameArea := float64(bounds.Dx() * bounds.Dy())
-			lost := bbox.Empty() || mask.Subj == 0 ||
-				float64(bbox.Dx()*bbox.Dy())/frameArea < subjectLostAreaFrac
-
-			if !lost {
-				isCut := haveEMA && (math.Abs(emaF[0]-float64(bbox.Min.X)) > cutJumpFraction*frameW ||
-					math.Abs(emaF[1]-float64(bbox.Min.Y)) > cutJumpFraction*frameH ||
-					mask.Subj-lastSubj >= 3 || lastSubj-mask.Subj >= 3)
-				if !haveEMA || isCut {
-					emaF = [4]float64{float64(bbox.Min.X), float64(bbox.Min.Y), float64(bbox.Max.X), float64(bbox.Max.Y)}
-					panX.Reset()
-					panY.Reset()
-					pidZ.Reset()
-					snapTarget = true
-					cmdX, cmdY, cmdZ = 0, 0, 0
-					vx, vy = 0, 0
-					hasPrevEc = false
-				} else {
-					emaF[0] += emaBBoxAlpha * (float64(bbox.Min.X) - emaF[0])
-					emaF[1] += emaBBoxAlpha * (float64(bbox.Min.Y) - emaF[1])
-					emaF[2] += emaBBoxAlpha * (float64(bbox.Max.X) - emaF[2])
-					emaF[3] += emaBBoxAlpha * (float64(bbox.Max.Y) - emaF[3])
-				}
-				haveEMA = true
-				lastSubj = mask.Subj
-			}
-
-			ema := image.Rect(int(emaF[0]), int(emaF[1]), int(emaF[2]), int(emaF[3]))
-
-			// Subject velocity and continuous targets. The EMA bbox center's
-			// smoothed velocity feeds a lead onto the pan targets: the target
-			// EMA always trails a moving subject by ~(1-alpha)/alpha frames,
-			// and the lead cancels that lag without raising the pan gains.
-			// Zoom targets stay continuous: a quantised/stale target produced
-			// discrete visible zoom steps on the real corpus (§12.7).
-			if haveEMA {
-				ecx, ecy := (emaF[0]+emaF[2])/2, (emaF[1]+emaF[3])/2
-				if hasPrevEc {
-					vx += velAlpha * ((ecx - prevEcx) - vx)
-					vy += velAlpha * ((ecy - prevEcy) - vy)
-				}
-				prevEcx, prevEcy, hasPrevEc = ecx, ecy, true
-				if (frame-1)%targetEveryFrames == 0 {
-					_, h, cx, cy := hc.aspectLockedTarget(ema, frameW, frameH, aspect)
-					if snapTarget || !haveTarget {
-						tgtH, tgtCx, tgtCy = h, cx, cy
-						snapTarget = false
-						haveTarget = true
-					} else {
-						tgtH += zoomTargetAlpha * (h - tgtH)
-						tgtCx += targetSmoothAlpha * (cx - tgtCx)
-						tgtCy += targetSmoothAlpha * (cy - tgtCy)
-					}
-				}
-			}
-			if lost {
-				// Hold the last crop center, open toward full frame at rate
-				// limit. Replaces the old hard panAdj=0 snap (F5/gate reset).
-				// For landscape, "full frame" is the widest aspect-locked crop
-				// the padding cap allows (§12.8).
-				tgtH = frameH
-				if tgtH*aspect > maxCropW {
-					tgtH = maxCropW / aspect
-				}
-			}
-
-			// Grounded (landscape, §12.10): the EMA bbox bottom sits in the
-			// floor-proximity band, i.e. the subject stands on the stage
-			// floor even if the mask missed the feet (see ground snap in
-			// aspectLockedTarget). Used for the hard floor pin below.
-			grounded := aspect >= 2 && haveEMA &&
-				frameH-emaF[3] <= landscapeGroundSnapFrac*frameH
-
-			// Plant updates. Zoom first so pan spans see this frame's crop
-			// size; every plant is PI -> low-passed command -> crop-relative
-			// rate cap, so all crop motion is a smooth ramp (no bang-bang
-			// switching, §12.7). The velocity lead kills the walk lag.
-			cropH = hc.applyZoomPID(pidZ, &cmdZ, cropH, tgtH, dt, frameH, cropFloor)
-			cropW := cropH * aspect
-			if cropW > maxCropW {
-				// Keep the aspect lock when the crop hits the padded width cap
-				cropW = maxCropW
-				cropH = cropW / aspect
-			}
-			// Walk mode (§14): with a valid leash window the pan target is the
-			// deadzone target (freeze while the subject has slack, edge-chase
-			// when the walk exhausts it) and carries no velocity lead. Only a
-			// subject wider than the crop minus two margins - no room to leash
-			// - falls back to the centered target + lead, which keeps her
-			// in-bounds exactly as before.
-			tgtX := tgtCx + velLeadFrames*vx
-			walkTgt := 0.0
-			if walkActive && haveEMA && !lost {
-				if leash, ok := walkLeashTarget(cropCx, emaF, cropW); ok {
-					tgtX, walkTgt = leash, leash
-				}
-			}
-			cropCx = hc.applyAxisPID(panX, &cmdX, cropCx, tgtX, dt, cropW, panFloorX)
-			if grounded {
-				// Hard floor pin: with the ground snap the feet rest on the
-				// frame floor, so pin the crop bottom there exactly instead
-				// of chasing a floor-derived target through the pan PID.
-				// The feet line cannot lag the zoom plant or target EMA.
-				cropCy = frameH - cropH/2
-				cmdY = 0
-			} else {
-				cropCy = hc.applyAxisPID(panY, &cmdY, cropCy, tgtCy+velLeadFrames*vy, dt, cropH, panFloorY)
-			}
-
-			// Clamp plant to frame: vertical always fully inside; horizontally
-			// the crop may extend past the frame edges by up to landscapePad
-			// per side (limited black stage padding for extreme landscape
-			// outputs, §12.8). Portrait/square keep the old fully in-frame
-			// clamp (landscapePad = 0 there, F3/F4).
-			cropCx = clampF(cropCx, cropW/2-landscapePad, frameW-cropW/2+landscapePad)
-			cropCy = clampF(cropCy, cropH/2, frameH-cropH/2)
-
-			dbg.line(frame, mask.Subj, bbox, ema, cropCx, cropCy, cropW, cropH, tgtH, walkTgt)
+			dbg.line(frame, mask.Subj, mask.Bbox, out.EMA, out.CropCx, out.CropCy, out.CropW, out.CropH, out.TargetH, out.WalkTgt)
 
 			// Send to next pipe
 			if hc.procFrameQueue4 != nil {
-				hc.procFrameQueue4 <- &ImageCropMask{CBox: hc.cropRectFromFraming(cropCx, cropCy, cropW, cropH, landscapePad, bounds), Image: mask.Image, zoom: hc.zoom}
+				hc.procFrameQueue4 <- &ImageCropMask{CBox: out.CropRect, Image: mask.Image, zoom: hc.zoom}
 			}
 		}
 	}
 }
 
-// applyAxisPID moves pos toward target: PI output -> low-passed actuator
+// applyAxisPID is the pipeline wrapper of applyAxisPIDCalc (used by the CLI
+// path and the framing tests).
+func (hc *HoloCropper) applyAxisPID(p *PIDController, cmd *float64, pos, target, dt, span, floorRate float64) float64 {
+	return applyAxisPIDCalc(p, cmd, pos, target, dt, span, floorRate)
+}
+
+// applyAxisPIDCalc moves pos toward target: PI output -> low-passed actuator
 // command (cmd carries the EMA across frames, reset on cuts) -> crop-relative
 // rate cap. The low-pass is what makes crop motion a smooth ramp instead of
 // frame-to-frame snapping (§12.7). span is the crop's own extent on this axis:
 // allowed speed is a fraction of it plus an error-proportional allowance,
 // hard-capped at panCapFrac of the crop, so wide crops pan fast in pixels and
 // narrow slit crops stay smooth. Target callers may add a velocity lead.
-func (hc *HoloCropper) applyAxisPID(p *PIDController, cmd *float64, pos, target, dt, span, floorRate float64) float64 {
+func applyAxisPIDCalc(p *PIDController, cmd *float64, pos, target, dt, span, floorRate float64) float64 {
 	error := target - pos
 	if math.Abs(error) < framingDeadband {
 		return pos
@@ -440,14 +263,20 @@ func walkLeashTarget(cropCx float64, ema [4]float64, cropW float64) (target floa
 	return clampF(cropCx, lo, hi), true
 }
 
-// applyZoomPID drives crop height toward the target: PI output -> low-passed
-// command -> asymmetric caps. Zoom-out (crop grows) is fast: safety; zoom-in
-// (crop shrinks) is deliberately slow (zoomInMax) so the crop never "breathes".
-// Fast proportional pursuit is gated to retarget gaps larger than
-// zoomRetargetJumpFrac of the frame (reacquiring after subject loss); ordinary
-// target drift stays inside the gentle cap and never shows up as a visible
-// zoom step (§12.7).
+// applyZoomPID is the pipeline wrapper of applyZoomPIDCalc (used by the CLI
+// path and the framing tests).
 func (hc *HoloCropper) applyZoomPID(p *PIDController, cmd *float64, cropH, target, dt, frameH, floor float64) float64 {
+	return applyZoomPIDCalc(p, cmd, cropH, target, dt, frameH, floor)
+}
+
+// applyZoomPIDCalc drives crop height toward the target: PI output ->
+// low-passed command -> asymmetric caps. Zoom-out (crop grows) is fast:
+// safety; zoom-in (crop shrinks) is deliberately slow (zoomInMax) so the crop
+// never "breathes". Fast proportional pursuit is gated to retarget gaps
+// larger than zoomRetargetJumpFrac of the frame (reacquiring after subject
+// loss); ordinary target drift stays inside the gentle cap and never shows up
+// as a visible zoom step (§12.7).
+func applyZoomPIDCalc(p *PIDController, cmd *float64, cropH, target, dt, frameH, floor float64) float64 {
 	error := target - cropH
 	if math.Abs(error) < framingDeadband {
 		return cropH

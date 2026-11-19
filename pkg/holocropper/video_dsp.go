@@ -247,7 +247,14 @@ func (hc *HoloCropper) totalBoundingBox(rectangles []image.Rectangle) image.Rect
 //
 // Returns (width, height, centerX, centerY) in analysis-frame pixels.
 func (hc *HoloCropper) aspectLockedTarget(bbox image.Rectangle, frameW, frameH, aspect float64) (float64, float64, float64, float64) {
-	margin := hc.zoomMargin()
+	return aspectLockedTargetCalc(hc.framingParams(), bbox, frameW, frameH, aspect)
+}
+
+// aspectLockedTargetCalc is the instance-free implementation the replay
+// engine calls: framingParams carries the zoom margin, the maxZoom policy
+// cap and the output/source heights the zoom floors need.
+func aspectLockedTargetCalc(params framingParams, bbox image.Rectangle, frameW, frameH, aspect float64) (float64, float64, float64, float64) {
+	margin := params.Margin
 
 	var h float64
 	if aspect < 0.5 {
@@ -319,10 +326,10 @@ func (hc *HoloCropper) aspectLockedTarget(bbox image.Rectangle, frameW, frameH, 
 	// Zoom-in floors. The no-upscale floor is always absolute; the policy
 	// maxZoom floor is relaxed for landscape, where the containment fit wins.
 	srcFloor := 0.0
-	if hc.srcH > 0 {
-		srcFloor = float64(hc.Height) * frameH / float64(hc.srcH)
+	if params.SrcH > 0 {
+		srcFloor = float64(params.OutH) * frameH / float64(params.SrcH)
 	}
-	minH := math.Max(frameH/hc.maxZoom(), srcFloor)
+	minH := math.Max(frameH/params.MaxZoom, srcFloor)
 	if aspect >= 2 {
 		minH = math.Max(srcFloor, math.Min(minH, h))
 	}
@@ -417,6 +424,12 @@ func widthCoverFrac(aspect float64) float64 {
 // the x clamp window stays valid as long as padAllow >= (w - fw) / 2.
 // cropToBBox composes the out-of-frame regions as black stage padding.
 func (hc *HoloCropper) cropRectFromFraming(cx, cy, w, h, padAllow float64, bounds image.Rectangle) image.Rectangle {
+	return cropRectFromFramingCalc(cx, cy, w, h, padAllow, bounds)
+}
+
+// cropRectFromFramingCalc is the instance-free implementation shared by the
+// pipeline and the replay engine.
+func cropRectFromFramingCalc(cx, cy, w, h, padAllow float64, bounds image.Rectangle) image.Rectangle {
 	fw, fh := float64(bounds.Dx()), float64(bounds.Dy())
 	cx = clampF(cx, w/2-padAllow, fw-w/2+padAllow)
 	cy = clampF(cy, h/2, fh-h/2)
@@ -451,6 +464,12 @@ func (hc *HoloCropper) cropRectFromFraming(cx, cy, w, h, padAllow float64, bound
 // the frame, so out-of-frame vertical padding can never leak through
 // (HIGH-ASPECT-RATIO-FIXES.md F3/F4).
 func (hc *HoloCropper) cropToBBox(src *image.RGBA, cropRect image.Rectangle) *image.RGBA {
+	return cropToBBoxCalc(src, cropRect)
+}
+
+// cropToBBoxCalc is the instance-free implementation shared by the pipeline
+// and the render passes.
+func cropToBBoxCalc(src *image.RGBA, cropRect image.Rectangle) *image.RGBA {
 	cr := cropRect
 	if cr.Empty() {
 		// Degenerate guard: never produce an empty image
@@ -473,7 +492,13 @@ func (hc *HoloCropper) cropToBBox(src *image.RGBA, cropRect image.Rectangle) *im
 // scale, not a fit: no letterbox padding is produced (replaces the old
 // fit-scale + black-letterbox resizeRGBA).
 func (hc *HoloCropper) fillResizeRGBA(img *image.RGBA) *image.RGBA {
-	out := image.NewRGBA(image.Rect(0, 0, hc.Width, hc.Height))
+	return fillResizeTo(img, hc.Width, hc.Height)
+}
+
+// fillResizeTo is the instance-free implementation: scales img to exactly
+// outW x outH.
+func fillResizeTo(img *image.RGBA, outW, outH int) *image.RGBA {
+	out := image.NewRGBA(image.Rect(0, 0, outW, outH))
 	err := rez.Convert(out, img, rez.NewLanczosFilter(2))
 	if err != nil {
 		panic("Failed to resize img: " + err.Error())

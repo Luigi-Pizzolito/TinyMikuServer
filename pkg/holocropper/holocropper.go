@@ -78,6 +78,17 @@ func (hc *HoloCropper) maxZoom() float64 {
 	return 2.0
 }
 
+// framingParams snapshots the framing-relevant settings of this instance for
+// the instance-free geometry functions and the replay engine.
+func (hc *HoloCropper) framingParams() framingParams {
+	return framingParams{
+		Margin:  hc.zoomMargin(),
+		MaxZoom: hc.maxZoom(),
+		OutH:    hc.Height,
+		SrcH:    hc.srcH,
+	}
+}
+
 func (hc *HoloCropper) Crop(height, width int, fps float64, input, output string) error {
 	// Set the parameters
 	hc.Height = height
