@@ -3,20 +3,26 @@ package holocropper
 import (
 	"image"
 	"math"
-	"sort"
 )
 
 /* STEP 1. Read Video */
 
 func (hc *HoloCropper) readVideo() {
 	// Set frame buffer
-	vbuffer := image.NewRGBA(image.Rect(0, 0, hc.video.Width(), hc.video.Height()))
+	w, h := hc.video.Width(), hc.video.Height()
+	vbuffer := image.NewRGBA(image.Rect(0, 0, w, h))
 	hc.video.SetFrameBuffer(vbuffer.Pix)
 
-	// Start reading and piping raw frames
+	// Start reading and piping raw frames. vidio decodes into vbuffer.Pix on
+	// every Read, so each frame is copied out before it enters the pipeline:
+	// downstream stages then own their frames exclusively, and the next Read
+	// cannot mutate a frame already in flight (S4 shared-buffer race, the
+	// frame-aliasing bug the original CLI only got away with by luck).
 	for hc.video.Read() {
 		if hc.procFrameQueue1 != nil {
-			hc.procFrameQueue1 <- vbuffer
+			frame := image.NewRGBA(image.Rect(0, 0, w, h))
+			copy(frame.Pix, vbuffer.Pix)
+			hc.procFrameQueue1 <- frame
 		}
 	}
 
@@ -35,7 +41,7 @@ func (hc *HoloCropper) grayscaleVideo() {
 			}
 
 			// Convert received frame to grayscale
-			maskFrame := hc.convertToMonochrome(img)
+			maskFrame := convertToMonochrome(img)
 			// Send to next pipe
 			if hc.procFrameQueue2 != nil {
 				hc.procFrameQueue2 <- &ImageGrayMask{Mask: maskFrame, Image: img}
@@ -62,46 +68,22 @@ func (hc *HoloCropper) binaryVideo() {
 			}
 
 			// Apply Otsu threshold with hysteresis to the received image
-			newThr := float64(hc.otsuThreshold(mask.Mask))
+			newThr := float64(otsuThreshold(mask.Mask))
 			if lastThr < 0 {
 				lastThr = newThr
 			} else {
 				lastThr = clampF(newThr, lastThr-10, lastThr+10)
 			}
-			binaryImg := hc.applyThreshold(mask.Mask, uint8(lastThr))
+			binaryImg := applyThreshold(mask.Mask, uint8(lastThr))
 
-			// Apply connected component labelling algorithm
-			boundingBoxes, _ := hc.connectedComponentLabeling(binaryImg)
-
-			// Convert map to slice of rectangles
-			var rectangles []image.Rectangle
-			for _, rect := range boundingBoxes {
-				rectangles = append(rectangles, rect)
-			}
-			// Sort bounding boxes by area
-			sort.Sort(ByArea(rectangles))
-
-			// Combine overlapping bounding boxes
-			subjects := make([]image.Rectangle, 0)
-			computedOverlapRects := rectangles
-			for _, bbox := range rectangles {
-				largestArea := rectangles[0].Dx() * rectangles[0].Dy()
-				area := bbox.Dx() * bbox.Dy()
-				perCovered := 100 * float64(float64(area)/float64(largestArea))
-				// Boxes classified as big have at least 20% of the area of the biggest box
-				if perCovered >= 20 {
-					// Merge bounding boxes
-					bbox, computedOverlapRects = hc.combineBounds(bbox, computedOverlapRects, mask.Image.Bounds().Dy()/20)
-					// Append to main subjects list
-					subjects = append(subjects, bbox)
-				}
-			}
-
-			subjects_bbox := hc.totalBoundingBox(subjects)
+			// Subject extraction: the shared stage (video_dsp.go) used by the
+			// embeddable detect pass too, so pipeline and detection stream
+			// always agree frame for frame.
+			subjects_bbox, subj := subjectsFromBinary(binaryImg)
 
 			// Send to next pipe
 			if hc.procFrameQueue3 != nil {
-				hc.procFrameQueue3 <- &ImageGrayBoundMask{Mask: binaryImg, Image: mask.Image, Bbox: subjects_bbox, Subj: len(subjects)}
+				hc.procFrameQueue3 <- &ImageGrayBoundMask{Mask: binaryImg, Image: mask.Image, Bbox: subjects_bbox, Subj: subj}
 			}
 		}
 	}
@@ -332,7 +314,7 @@ func (hc *HoloCropper) saveFinalFrames() {
 
 			// Save frame to temp folder
 			hc.copyAndWrite(img)
-			hc.currentFrame++
+			hc.currentFrame.Add(1)
 		}
 	}
 }

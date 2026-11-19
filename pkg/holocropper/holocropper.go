@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	vidio "github.com/AlexEidt/Vidio"
@@ -19,6 +20,13 @@ import (
 // AnalysisHeight is not set. The analysis frame is never shorter than the
 // requested output (crops are only ever scaled down from it).
 const defaultAnalysisHeight = 480
+
+// Framing parameter defaults shared by the CLI instance accessors, the
+// embeddable Settings resolution and the Schema form spec.
+const (
+	defaultZoomMargin = 1.12 // subject bbox -> crop padding factor
+	defaultMaxZoom    = 2.0  // zoom-in policy cap
+)
 
 /* HoloCropper class */
 type HoloCropper struct {
@@ -46,7 +54,7 @@ type HoloCropper struct {
 
 	video        *vidio.Video
 	totalFrames  int
-	currentFrame int
+	currentFrame atomic.Int64 // written by saveFinalFrames, read by tickPipeline (S4: -race clean)
 
 	inputVideo     string
 	outputDir      string
@@ -67,7 +75,7 @@ func (hc *HoloCropper) zoomMargin() float64 {
 	if hc.ZoomMargin > 0 {
 		return hc.ZoomMargin
 	}
-	return 1.12
+	return defaultZoomMargin
 }
 
 // maxZoom returns the zoom-in policy cap (default 2.0).
@@ -75,7 +83,7 @@ func (hc *HoloCropper) maxZoom() float64 {
 	if hc.MaxZoom > 0 {
 		return hc.MaxZoom
 	}
-	return 2.0
+	return defaultMaxZoom
 }
 
 // framingParams snapshots the framing-relevant settings of this instance for
@@ -153,7 +161,7 @@ func (hc *HoloCropper) Progress() float64 {
 	if hc.totalFrames == 0 {
 		return 0
 	}
-	return float64(float64(hc.currentFrame) / float64(hc.totalFrames))
+	return float64(float64(hc.currentFrame.Load()) / float64(hc.totalFrames))
 }
 
 func (hc *HoloCropper) Done() bool {
@@ -161,7 +169,7 @@ func (hc *HoloCropper) Done() bool {
 	for hc.totalFrames == 0 {
 		time.Sleep(20 * time.Millisecond)
 	}
-	return hc.currentFrame == hc.totalFrames
+	return hc.currentFrame.Load() == int64(hc.totalFrames)
 }
 
 // closePipes closes all pipeline channels exactly once, so tickPipeline and

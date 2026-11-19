@@ -70,14 +70,14 @@ func pickOrientation(w, h int, subjectARs []float64) (flip bool, keepScore, flip
 // 20%-of-largest filter with combineBounds -> union master bbox) so the
 // probe estimates exactly what the framing controller will see.
 func (hc *HoloCropper) probeDetect(img *image.RGBA, lastThr *float64) (image.Rectangle, int) {
-	gray := hc.convertToMonochrome(img)
-	thr := float64(hc.otsuThreshold(gray))
+	gray := convertToMonochrome(img)
+	thr := float64(otsuThreshold(gray))
 	if *lastThr < 0 {
 		*lastThr = thr
 	} else {
 		*lastThr = clampF(thr, *lastThr-10, *lastThr+10)
 	}
-	binaryImg := hc.applyThreshold(gray, uint8(*lastThr))
+	binaryImg := applyThreshold(gray, uint8(*lastThr))
 
 	// Degenerate-mask guard: on fully dark frames Otsu degenerates to
 	// threshold 0 and the whole frame thresholds as "subject", faking a
@@ -95,28 +95,9 @@ func (hc *HoloCropper) probeDetect(img *image.RGBA, lastThr *float64) (image.Rec
 		return image.ZR, 0
 	}
 
-	boundingBoxes, _ := hc.connectedComponentLabeling(binaryImg)
-	var rectangles []image.Rectangle
-	for _, rect := range boundingBoxes {
-		rectangles = append(rectangles, rect)
-	}
-	if len(rectangles) == 0 {
-		return image.ZR, 0
-	}
-	sort.Sort(ByArea(rectangles))
-
-	subjects := make([]image.Rectangle, 0)
-	computedOverlapRects := rectangles
-	for _, bbox := range rectangles {
-		largestArea := rectangles[0].Dx() * rectangles[0].Dy()
-		area := bbox.Dx() * bbox.Dy()
-		perCovered := 100 * float64(float64(area)/float64(largestArea))
-		if perCovered >= 20 {
-			bbox, computedOverlapRects = hc.combineBounds(bbox, computedOverlapRects, binaryImg.Bounds().Dy()/20)
-			subjects = append(subjects, bbox)
-		}
-	}
-	return hc.totalBoundingBox(subjects), len(subjects)
+	// The shared subject-extraction stage (identical filter the pipeline
+	// uses) behind the degenerate-mask guard above.
+	return subjectsFromBinary(binaryImg)
 }
 
 // probeSubjectARs decodes up to probeMaxSamples evenly spread frames of the
@@ -196,6 +177,45 @@ func (hc *HoloCropper) probeSubjectARs(input string) (ars []float64, examined in
 	return ars, examined, nil
 }
 
+// orientationStats computes the full OrientationStat (AR aggregates + the
+// keep/flip containment-score decision) from a set of master-bbox aspect
+// ratios. Shared by the CLI probe path (AutoOrient) and the embeddable Plan
+// orientation aggregate, which feeds it the whole detection stream instead
+// of a sampled probe decode - so the decision and its reporting are
+// identical across paths.
+func orientationStats(subjectARs []float64, w, h int) (outW, outH int, stat OrientationStat) {
+	stat.FramesWithSubjects = len(subjectARs)
+	if len(subjectARs) == 0 {
+		return w, h, stat
+	}
+
+	sum, logSum := 0.0, 0.0
+	for _, s := range subjectARs {
+		sum += s
+		logSum += math.Log(s)
+	}
+	sorted := make([]float64, len(subjectARs))
+	copy(sorted, subjectARs)
+	sort.Float64s(sorted)
+	mid := len(sorted) / 2
+	median := sorted[mid]
+	if len(sorted)%2 == 0 {
+		median = (sorted[mid-1] + sorted[mid]) / 2
+	}
+	stat.MeanAR = sum / float64(len(subjectARs))
+	stat.GeoMeanAR = math.Exp(logSum / float64(len(subjectARs)))
+	stat.MedianAR = median
+
+	flip, keep, flipped := pickOrientation(w, h, subjectARs)
+	stat.KeepScore = keep
+	stat.FlipScore = flipped
+	stat.Flip = flip
+	if flip {
+		return h, w, stat
+	}
+	return w, h, stat
+}
+
 // AutoOrient probes the input and returns the output dimensions that best
 // fit its subjects at the requested resolution: (w, h) as requested, or
 // (h, w) when the transposed aspect scores better. Square outputs bypass
@@ -216,38 +236,10 @@ func (hc *HoloCropper) AutoOrient(input string, w, h int) (outW, outH int, stat 
 	}
 
 	ars, examined, err := hc.probeSubjectARs(input)
-	stat.FramesExamined = examined
-	stat.FramesWithSubjects = len(ars)
 	if err != nil {
-		return w, h, stat, err
+		return w, h, OrientationStat{FramesExamined: examined}, err
 	}
-	if len(ars) == 0 {
-		return w, h, stat, nil
-	}
-
-	sum, logSum := 0.0, 0.0
-	for _, s := range ars {
-		sum += s
-		logSum += math.Log(s)
-	}
-	sorted := make([]float64, len(ars))
-	copy(sorted, ars)
-	sort.Float64s(sorted)
-	mid := len(sorted) / 2
-	median := sorted[mid]
-	if len(sorted)%2 == 0 {
-		median = (sorted[mid-1] + sorted[mid]) / 2
-	}
-	stat.MeanAR = sum / float64(len(ars))
-	stat.GeoMeanAR = math.Exp(logSum / float64(len(ars)))
-	stat.MedianAR = median
-
-	flip, keep, flipped := pickOrientation(w, h, ars)
-	stat.KeepScore = keep
-	stat.FlipScore = flipped
-	stat.Flip = flip
-	if flip {
-		return h, w, stat, nil
-	}
-	return w, h, stat, nil
+	outW, outH, stat = orientationStats(ars, w, h)
+	stat.FramesExamined = examined
+	return outW, outH, stat, nil
 }

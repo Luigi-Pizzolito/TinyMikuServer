@@ -45,7 +45,7 @@ func (hc *HoloCropper) startPipeline() error {
 	}
 
 	hc.totalFrames = hc.video.Frames()
-	hc.currentFrame = 0
+	hc.currentFrame.Store(0)
 
 	// Start pipeline goroutines
 	go hc.readVideo()
@@ -59,7 +59,7 @@ func (hc *HoloCropper) startPipeline() error {
 }
 
 func (hc *HoloCropper) checkPipelineDone() bool {
-	if hc.currentFrame == hc.totalFrames {
+	if hc.currentFrame.Load() == int64(hc.totalFrames) {
 		// Close pipeline channels (once, guarded)
 		hc.closePipes()
 
@@ -75,7 +75,7 @@ func (hc *HoloCropper) tickPipeline() {
 	for {
 		select {
 		case <-ticker.C:
-			hc.bart.Set(hc.currentFrame)
+			hc.bart.Set(int(hc.currentFrame.Load()))
 			if hc.checkPipelineDone() {
 				return
 			}

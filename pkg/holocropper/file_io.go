@@ -88,7 +88,7 @@ func (hc *HoloCropper) copyAndWrite(img *image.RGBA) error {
 	draw.Draw(copiedImg, copiedImg.Bounds(), img, img.Bounds().Min, draw.Src)
 
 	// Write the frame to the image
-	abspath := filepath.Join(hc.tempDirFrames, fmt.Sprintf("%d.jpg", hc.currentFrame))
+	abspath := filepath.Join(hc.tempDirFrames, fmt.Sprintf("%d.jpg", hc.currentFrame.Load()))
 
 	f, err := os.Create(abspath)
 	if err != nil {

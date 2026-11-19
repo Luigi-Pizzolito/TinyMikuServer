@@ -5,19 +5,20 @@ import (
 	"image/color"
 	"image/draw"
 	"math"
+	"sort"
 
 	"github.com/bamiaux/rez"
 )
 
-// Function to convert frame to grayscale
-func (hc *HoloCropper) convertToMonochrome(img *image.RGBA) *image.Gray {
+// convertToMonochrome converts a frame to grayscale.
+func convertToMonochrome(img *image.RGBA) *image.Gray {
 	monoFrame := image.NewGray(img.Bounds())
 	draw.Draw(monoFrame, monoFrame.Bounds(), img, img.Bounds().Min, draw.Src)
 	return monoFrame
 }
 
-// Otsu's thresholding algorithm
-func (hc *HoloCropper) otsuThreshold(img *image.Gray) uint8 {
+// otsuThreshold applies Otsu's thresholding algorithm.
+func otsuThreshold(img *image.Gray) uint8 {
 	// Calculate histogram
 	histogram := make([]int, 256)
 	totalPixels := float64(img.Bounds().Dx() * img.Bounds().Dy())
@@ -62,8 +63,8 @@ func (hc *HoloCropper) otsuThreshold(img *image.Gray) uint8 {
 	return optimalThreshold
 }
 
-// Apply threshold to image
-func (hc *HoloCropper) applyThreshold(img *image.Gray, threshold uint8) *image.Gray {
+// applyThreshold applies a binary threshold to an image.
+func applyThreshold(img *image.Gray, threshold uint8) *image.Gray {
 	binaryImg := image.NewGray(img.Bounds())
 	black := color.Gray{Y: 0}
 	white := color.Gray{Y: 255}
@@ -80,8 +81,8 @@ func (hc *HoloCropper) applyThreshold(img *image.Gray, threshold uint8) *image.G
 	return binaryImg
 }
 
-// Connected component labeling algorithm
-func (hc *HoloCropper) connectedComponentLabeling(binaryMap *image.Gray) (map[int]image.Rectangle, [][]int) {
+// connectedComponentLabeling runs the connected component labeling algorithm.
+func connectedComponentLabeling(binaryMap *image.Gray) (map[int]image.Rectangle, [][]int) {
 	labelMatrix := make([][]int, binaryMap.Bounds().Dy())
 	for i := range labelMatrix {
 		labelMatrix[i] = make([]int, binaryMap.Bounds().Dx())
@@ -93,7 +94,7 @@ func (hc *HoloCropper) connectedComponentLabeling(binaryMap *image.Gray) (map[in
 	for y := binaryMap.Bounds().Min.Y; y < binaryMap.Bounds().Max.Y; y++ {
 		for x := binaryMap.Bounds().Min.X; x < binaryMap.Bounds().Max.X; x++ {
 			if binaryMap.GrayAt(x, y).Y > 0 && labelMatrix[y][x] == 0 {
-				boundingBox := hc.dfs(binaryMap, labelMatrix, x, y, label)
+				boundingBox := dfs(binaryMap, labelMatrix, x, y, label)
 				boundingBoxes[label] = boundingBox
 				label++
 			}
@@ -103,8 +104,8 @@ func (hc *HoloCropper) connectedComponentLabeling(binaryMap *image.Gray) (map[in
 	return boundingBoxes, labelMatrix
 }
 
-// Depth-first search to label connected components
-func (hc *HoloCropper) dfs(binaryMap *image.Gray, labelMatrix [][]int, x, y, label int) image.Rectangle {
+// dfs runs a depth-first search to label connected components.
+func dfs(binaryMap *image.Gray, labelMatrix [][]int, x, y, label int) image.Rectangle {
 	minX, minY, maxX, maxY := x, y, x, y
 
 	stack := []image.Point{{x, y}}
@@ -168,16 +169,16 @@ func (a ByArea) Len() int           { return len(a) }
 func (a ByArea) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByArea) Less(i, j int) bool { return a[i].Dx()*a[i].Dy() > a[j].Dx()*a[j].Dy() }
 
-// CombineBounds combines the bounds of all rectangles in the slice
+// combineBounds combines the bounds of all rectangles in the slice
 // that overlap with the given rectangle and removes them from the slice.
-func (hc *HoloCropper) combineBounds(rect image.Rectangle, rects []image.Rectangle, tol int) (combined image.Rectangle, remainingRects []image.Rectangle) {
+func combineBounds(rect image.Rectangle, rects []image.Rectangle, tol int) (combined image.Rectangle, remainingRects []image.Rectangle) {
 	// Initialize the combined rectangle with the rectangle passed as an argument
 	combined = rect
 
 	// Iterate over the rectangles in the slice
 	for _, r := range rects {
 		// Check if the current rectangle overlaps with the given rectangle
-		if hc.expandRectangle(combined, tol).Overlaps(r) {
+		if expandRectangle(combined, tol).Overlaps(r) {
 			// Combine the bounds of overlapping rectangles
 			combined = combined.Union(r)
 		} else {
@@ -189,8 +190,8 @@ func (hc *HoloCropper) combineBounds(rect image.Rectangle, rects []image.Rectang
 	return combined, remainingRects
 }
 
-// ExpandRectangle expands the given rectangle by x pixels from its center.
-func (hc *HoloCropper) expandRectangle(rect image.Rectangle, x int) image.Rectangle {
+// expandRectangle expands the given rectangle by x pixels from its center.
+func expandRectangle(rect image.Rectangle, x int) image.Rectangle {
 	// Expand the rectangle
 	newMinX := rect.Min.X - x
 	newMinY := rect.Min.Y - x
@@ -201,8 +202,8 @@ func (hc *HoloCropper) expandRectangle(rect image.Rectangle, x int) image.Rectan
 	return image.Rect(newMinX, newMinY, newMaxX, newMaxY)
 }
 
-// TotalBoundingBox finds the total bounding box given a slice of image.Rectangles.
-func (hc *HoloCropper) totalBoundingBox(rectangles []image.Rectangle) image.Rectangle {
+// totalBoundingBox finds the total bounding box given a slice of image.Rectangles.
+func totalBoundingBox(rectangles []image.Rectangle) image.Rectangle {
 	if len(rectangles) == 0 {
 		// Return zero rectangle if there are no input rectangles
 		return image.ZR
@@ -230,6 +231,58 @@ func (hc *HoloCropper) totalBoundingBox(rectangles []image.Rectangle) image.Rect
 
 	// Construct and return the total bounding box
 	return image.Rect(minX, minY, maxX, maxY)
+}
+
+// subjectsFromBinary runs the shared subject-extraction stage: connected
+// component labelling -> area sort -> keep boxes with at least 20% of the
+// largest box's area (merging overlapping neighbours expanded by 5% of the
+// frame height) -> union master bbox. Used by the fused pipeline
+// (binaryVideo), the auto-orient probe (probeDetect) and the embeddable
+// detect pass (detectFrame) - all three see exactly the same subjects.
+func subjectsFromBinary(binaryImg *image.Gray) (image.Rectangle, int) {
+	boundingBoxes, _ := connectedComponentLabeling(binaryImg)
+	var rectangles []image.Rectangle
+	for _, rect := range boundingBoxes {
+		rectangles = append(rectangles, rect)
+	}
+	if len(rectangles) == 0 {
+		return image.ZR, 0
+	}
+	sort.Sort(ByArea(rectangles))
+
+	subjects := make([]image.Rectangle, 0)
+	computedOverlapRects := rectangles
+	for _, bbox := range rectangles {
+		largestArea := rectangles[0].Dx() * rectangles[0].Dy()
+		area := bbox.Dx() * bbox.Dy()
+		perCovered := 100 * float64(float64(area)/float64(largestArea))
+		// Boxes classified as big have at least 20% of the area of the biggest box
+		if perCovered >= 20 {
+			// Merge bounding boxes
+			bbox, computedOverlapRects = combineBounds(bbox, computedOverlapRects, binaryImg.Bounds().Dy()/20)
+			// Append to main subjects list
+			subjects = append(subjects, bbox)
+		}
+	}
+	return totalBoundingBox(subjects), len(subjects)
+}
+
+// detectFrame runs the full single-frame subject detection exactly as the
+// fused pipeline's grayscale+binary stages do: grayscale -> Otsu with the
+// +/-10 gray-level hysteresis (lastThr carries the state across frames,
+// start at -1) -> binary -> subjectsFromBinary. The embeddable detect pass
+// streams frames through it, so the DetectionStream carries the same
+// decisions the pipeline's STEP 3 produces.
+func detectFrame(img *image.RGBA, lastThr *float64) (image.Rectangle, int) {
+	gray := convertToMonochrome(img)
+	thr := float64(otsuThreshold(gray))
+	if *lastThr < 0 {
+		*lastThr = thr
+	} else {
+		*lastThr = clampF(thr, *lastThr-10, *lastThr+10)
+	}
+	binaryImg := applyThreshold(gray, uint8(*lastThr))
+	return subjectsFromBinary(binaryImg)
 }
 
 // aspectLockedTarget computes the desired crop from a (smoothed) subject
