@@ -1,6 +1,6 @@
 # HoloCropper Embeddable API Plan
 
-Status: **scheme v5 — awaiting owner approval. No implementation starts before sign-off.**
+Status: **scheme v5 — approved 2026-11-19. Implementation in progress on branch `feat/holocropper-api` (see the implementation record in §11).**
 Consumer: the Wails app (Go backend, web UI via bindings). No HTTP layer, no queue: the app owns jobs and serves files itself; holocropper provides the data, previews, passes and progress through Go binding funcs.
 
 ## 1. Owner requirements on record
@@ -175,7 +175,7 @@ Live behaviour during Detect (requirement 8): `PartialStream()` returns the fram
 ### 6.4 Plan (the real-time replay — requirement 6)
 
 ```go
-func Plan(stream DetectionStream, s Settings) (*Plan, error)
+func NewPlan(stream DetectionStream, s Settings) (*Plan, error)   // renamed from Plan: Go forbids a type and func of the same name (see §11)
 
 type Plan struct{ /* replayed framing, immutable */ }
 func (p *Plan) Records() []FrameRecord   // full per-frame stream, all three coordinate spaces
@@ -461,6 +461,23 @@ The Wails UI itself; uploads; HTTP/network of any kind; job persistence/history;
 - Final output naming dimension-tagged (`<basename>-<WxH>.mp4`): re-rendering a video at a new target never clobbers a previous production file.
 - Added §9.1: UI implementation suggestions for the Wails frontend (layout, JS state model, `requestVideoFrameCallback` overlay loop, preload-then-swap preview refresh, spinner wiring, file serving, final render flow) — app-side guidance, not API contract.
 
+### v5 → implementation record (Milestone A, branch `feat/holocropper-api`)
+
+What changed while building it, and why. Everything here is the shipped shape; the §6 surface above is otherwise as designed.
+
+- **`Plan(stream, s)` became `NewPlan(stream, s)`.** Go forbids a package-level type `Plan` and a function `Plan` in the same scope. The type and all its methods are unchanged; only the constructor is renamed.
+- **`PreviewRequest` has no `TempDir`.** Previews are written inside the `Analysis`'s own cache dir, under the `TempDir` that produced that analysis — a preview can never be pointed at a scratch root that does not hold its analysis video. `RenderRequest` keeps its own `TempDir` + `OutputDir` (the final file is the app's, not cache).
+- **`Resolved.AnalysisReused` removed.** Cache-hit vs re-analyze is already visible without it: a cached `Analyze` Task completes without ever entering a phase, and `Analysis.Status().Cached` reports the stream.
+- **Orientation is computed from the stream** (A5 as designed): `orientationStats` is shared by the CLI probe (`AutoOrient`, ≤128 probe frames) and `NewPlan`, which feeds it the master-bbox aspect ratio of *every* detected frame — strictly more evidence, identical decision machinery. `Plan.Orientation().FramesExamined` is the stream length.
+- **Detection and geometry became instance-free** (A3 groundwork). The STEP 4 controller lives in `framingDecider.step()` and `calcVideo` is a thin driver of it, so live and replayed framing share one implementation. The geometry/plant functions (`aspectLockedTargetCalc`, `cropRectFromFramingCalc`, `cropToBBoxCalc`, `fillResizeTo`, `applyAxisPIDCalc`, `applyZoomPIDCalc`) and the detection stages (`convertToMonochrome`, `otsuThreshold`, `applyThreshold`, `connectedComponentLabeling`, `dfs`, `combineBounds`, `expandRectangle`, `totalBoundingBox`) no longer take an `HoloCropper` receiver; the `hc.` methods remain as wrappers where the CLI path and the pre-existing tests call them. One subject-extraction implementation (`subjectsFromBinary`) and one per-frame detector (`detectFrame`) now serve the pipeline, the probe and the detect pass, so a cached stream and a live pipeline cannot disagree frame for frame.
+- **A1 landed as sequential ctx-aware passes, not channel teardown.** Prepare/detect (and the render passes in Milestone B) are cancel-safe loops with `exec.CommandContext` + shared `runFFmpegProgress` (stderr `frame=` counters into the Task phase, error tokens to `Observer.OnWarning`), and per-Task scratch names under `TempDir`. The fused CLI pipeline keeps its channel stages until C3 ports the CLI onto this surface. A killed ffmpeg or a cancelled decode loop maps to the `cancelled` Task state.
+- **Cache layout and key, as built** (§6.3): `<TempDir>/holocropper-analysis-<key12>/` holding `analysis.mp4` (prepare: `-vf scale=… -sws_flags lanczos+accurate_rnd -fps_mode passthrough -an`), `stream.bin.gz` (10 bytes/frame: 4×`int16` master bbox + `uint16` subject count → ~10 KB per 1 000 frames) and `meta.json`. Key = `sha256(abs input | mtime ns | size | rounded-even analysis height | "pt1")[:12]`. Scratch is task-tagged before the extension (`analysis.tmp-<taskID>.mp4`) so ffmpeg still infers the muxer, and renamed into place; a cancelled or failed pass leaves a directory that is still a consistent **miss** (no `meta.json`, no `stream.bin.gz`).
+- **`DetectionStream` also exposes `Complete()` and `FPS()`**; frame alignment is carried in `meta.json` (the `pt1` tag in the cache key) rather than as a stream getter. `AnalyzeRequest` additionally has `KeepWorkDir` (leave scratch behind on failure/cancel for debugging).
+- **`ErrStreamIncompatible` is fps-independent.** Detection has no fps dependence (fps feeds only the controller `dt` and the mux), so the sole incompatibility is an effective output height above the analyzed height — checked *after* the auto-orient flip.
+- **A3 equivalence is proven on a synthetic fixture**, because the corpus clips are not in the repository: `TestReplayParityVsDebugCSV` runs the fused CLI `Crop` with the debug CSV on, replays that CSV's bbox stream through `NewPlan`, and compares crop cx/cy/w/h, `target_h`, `walk_tgt`, bbox and EMA — worst drift 0.005 px over 96 frames, i.e. the CSV's own 2-decimal rounding. The same comparison can be re-run against any corpus clip on demand.
+- **Frame batching flushes at 24 records or 250 ms from the batch's start** (not from the previous flush), so a stalled trickle still delivers.
+- **Task IDs come from a package-wide counter**, unique across every slot and `Analysis`, so a UI can key spinners by ID alone.
+
 ## 12. Remaining tunables (defaults; not blocking approval)
 
 - Preview retention: newest 3 versions per kind (raise if the UI wants an A/B compare of consecutive settings).
@@ -471,3 +488,5 @@ The Wails UI itself; uploads; HTTP/network of any kind; job persistence/history;
 
 `A1 → A2 → A3 → A4 → A5 → {A6, B1, B2} → {B3, B4} → C1 → C2 → C3`.
 A3 is the architectural keystone: everything in B and the interactive flow stands on the replay engine. First deliverable checkpoint: A5 (interactive re-planning proven on corpus streams, before any video is re-rendered).
+
+**Status 2026-11-19:** the A5 checkpoint is reached on `feat/holocropper-api` — A3 (replay engine + CLI delegation), A4 (analysis pass, cache, partial stream) and A5 (`NewPlan` with records/orientation/walk/dropouts and the < 100 ms benchmark gate) are implemented and tested, A2 shipped with them and A1 delivered as scoped in the implementation record. Next: Milestone B (B1/B2 previews and final render at output resolution), with A6 (metrics port) alongside.
