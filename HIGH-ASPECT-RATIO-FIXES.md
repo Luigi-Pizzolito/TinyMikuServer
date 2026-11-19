@@ -559,3 +559,60 @@ Single-subject dance videos sit at AR 0.45-0.7 (tall) - portrait wins by ~3x. tb
 Probe cost: one extra ffmpeg pass over 128 tiny frames + 128 detection passes - a few seconds per video, once, before rendering.
 
 Unit tests: 28 total (+7: flip/keep in both directions, square bypass, tie and no-subject fallback, containment-score symmetry, synthetic solo-vs-group detection incl. the dark-frame degenerate-mask guard).
+
+---
+
+## 14. Walk mode: landscape -> landscape deadzone pan leash (2026-11-19)
+
+Owner request: most source videos are landscape, and the dance choreography includes Miku walking left and right. The pan controller's job in portrait and portrait-bound crops is to *follow* the subject, but at landscape -> landscape outputs that tracking pins her to the middle of the output - her choreography disappears. Walk mode keeps her walking: when Miku walks left/right in the source she walks left/right in the resized landscape output, always in bounds, smoothly, with no jitter or jumps. Always on for qualifying renders (no flag); portrait/square framing untouched (their close crops have no slack to walk in); the §12.10 zoom headroom reduction with feet anchoring unchanged - walk mode only replaces the horizontal target.
+
+**Gate.** Walk mode applies when output aspect >= source aspect x 0.90 (leniency so slightly-narrower-than-source ratios qualify), the source is landscape, and the output is landscape. Rationale (owner rule): the mode is only meaningful when the output X axis has room for the source's full walk range - output AR wider or equal to input AR. For a 16:9 source: 16:9/16:10/648x200 outputs qualify; 4:3 output (1.333 < 1.60) does not - there the crop cannot show the whole walk, so centered follow-tracking is kept. For a 4:3 source, 4:3 output and slightly below qualify (gate 1.20).
+
+**Design: continuous deadzone leash (`walkLeashTarget`).** With crop width `cw`, EMA subject bbox `[x0, x1]` and leash margin `m = 0.10 cw`, the legal crop centers form the window:
+
+    lo = x1 + m - cw/2      hi = x0 - m + cw/2      target = clamp(cropCx, lo, hi)
+
+- cropCx inside the window -> target == cropCx: the crop FREEZES and the subject visibly travels across the output (the deadzone).
+- The walk exhausts the slack -> the binding edge (lo for a rightward walk) chases the subject continuously - window edges move with the EMA bbox, so the target is continuous; the existing PI + low-passed actuator + rate cap make the pan a smooth ramp. No bang-bang switching, no target jumps, freeze <-> chase handover happens exactly at the window boundary.
+- Window invalid (`x1 - x0 + 2m > cw`: subject wider than the crop minus margins, e.g. a side-by-side dance group at 16:9): fall back to the centered target + velocity lead, i.e. the pre-§14 controller.
+- Velocity lead is NOT added on leash targets: the window edge already leads the subject; a lead on top overshoots and drifts the crop.
+
+**Subject can never walk off screen in X (owner hard requirement).** Two structural guarantees: (1) while leashed the target keeps the subject bbox + margin strictly inside the crop; (2) the crop center is clamped to `[cw/2 - pad, frameW - cw/2 + pad]`, so whenever the subject reaches a frame edge the crop covers that edge completely (its edge sits at frameW or beyond via stage padding). The leash margin (>= 113 analysis px measured minima on the corpus) absorbs EMA and PI tracking lag so the subject never visually grazes an output edge. In fallback frames (no window) the clamped centered tracking is exactly the previously approved in-bounds behaviour.
+
+**Measured (shipped renders, debug CSVs; pre-walk baseline -> walk mode).**
+
+| | subject travel on output | crop pan jitter dCx p99/max (analysis px) | leash frozen frames | raw bbox-outside-crop |
+|---|---|---|---|---|
+| sweetdevil 648x200 | 135 -> **394** px of 648 | 8.49 / 13.56 -> **0.00** / 1.59 | 5542 / 5557 | 0 -> 0 |
+| tbaka 648x200 | 78 -> **244** px of 648 | 15.25 / 26.66 -> **1.16** / 7.70 | 4070 frozen of 4167 (window valid on every frame after §14.1) | 0 -> 0 |
+| sweetdevil 512x288 | 368 -> 384 px of 512 | 7.77 / 12.44 -> 6.84 / 12.52 | 5019 / 5437 active | 50 -> 61 (all fade-out end-card / single-frame mask spikes - subject fully framed on every visible frame, reviewed with vision) |
+| tbaka 512x288 (group) | 129 -> **171** px of 512 | 14.68 / 26.75 -> **7.06** / 14.81 | 1674 frozen of 2225 active (wider-group frames use the centered fallback) | 1056 -> **47** (§14.1 padding fit) |
+| dissapearance 200x648 portrait | 100.7 -> 100.7 px (identical) | unchanged | 0 active - gate off | unchanged |
+
+- 3.24 landscape: the crop goes essentially static (p99 jitter 0) and the subject's choreography travels across 64% of the 648 px output. Subject-trace plots show smooth continuous walking curves matching the choreography (standing passages flat-centered, walk passages big rounded excursions) where the pre-walk trace was pinned at center.
+- 16:9 landscape from 16:9: she walks +/- ~35% of output width, in step with the source; crop still pans near clamp extremes but 92% of leashed frames are frozen; jitter reduced.
+- tbaka 3.24 (approved §12.10 render): no containment change - all three dancers stay fully framed and grounded in every sampled frame, the group drifts a bit more naturally, crop jitter drops 13x. tbaka 16:9: with the §14.1 padding fit the leash window is valid on 53% of frames; the frames where the group is genuinely wider than the crop release to the centered fallback exactly as designed.
+- Portrait renders on the walk-mode binary are bit-for-bit the same behaviour (gate off, `walk_tgt` column all zeros).
+- Contact sheets (original frame + pre-walk crop overlay + walk crop overlay, pre-walk render, walk render) reviewed visually for sweetdevil 3.24/16:9 and tbaka 3.24: composition, feet grounding, headroom and containment unchanged; the only difference is the subject now walks.
+
+Unit tests: 36 total (+6: gate matrix across 16:9/4:3/square/portrait sources and 16:9/16:10/3.24/4:3/square outputs with leniency, freeze-inside, edge-chase both directions, continuity sweep (target change never exceeds subject step), invalid-window fallback, containment invariant of the leash target).
+
+---
+
+## 14.1 Post-review fix, walk mode part 2: landscape outputs need empty L/R stage padding (2026-11-19)
+
+Owner review of the first walk renders: "make sure there is some L/R empty padding extra margin like 2% like with the top - those L/R edges for tbaka in the last render look really close to cropping on L/R". Measured root cause, two structural gaps in the landscape fits:
+
+- **1 < aspect < 2 (e.g. 16:9 output from 16:9):** the dominant-axis fit's width term was `dx/aspect` with **no margin at all** - when the subject width dominated (any side-by-side group), the crop came out exactly subject-wide: zero side slack. tbaka 512x288: the applied crop was 574 px for a 575 px group; raw slack minima -60.5 / -134.5 analysis px - **actual dancers clipped at the output edges on 1056/4167 frames**.
+- **aspect >= 2 (e.g. 648x200):** the containment fit used the default 1.12 zoom margin - >= 5.4% target slack per side, but controller lag ate it down to ~36 analysis px (~3%) on tbaka's tightest frames: padded but visually close to the edge.
+
+Fix (`landscapeContainMargin` in video_dsp.go): landscape subject fits take a zoom-margin floor of 1.18 - the same padding factor the portrait containment regime already uses (`portraitContainMargin`, §12.7). Applied to the containment fit (aspect >= 2) and to the width term (1 < aspect < 2). A width-dominated fit now sizes the crop at 1.18 * dx, i.e. >= 7.6% of the crop width empty per side; a height-dominated fit at the wider padded width keeps >= 2% per side on the corpus (tbaka 3.24 measured worst 3.5%, sweetdevil 3.24 worst 12%). Square 1:1 and portrait regimes untouched (owner: portrait has no room to walk in X and was not to be touched); a user `-zoom-margin` above the floor still overrides. tbaka 512x288 crop: 574 -> 678 px (51.8 px = 7.6% empty per side).
+
+Measured after the fix (same CSVs as the table above):
+
+- tbaka 16:9 raw edge overshoot: 1056 -> 47 frames, worst -46.7 -> -13.1/-46.7 px, and the residual 47 are 4-frame group-spread transients where the **source itself** spreads the group wider than any in-frame crop - the pre-walk baseline clipped those same dancers identically (visual review of frames 1646/1764/2804-2807: no regression). sweetdevil 16:9 residual 61: the 7 fade-out end-card frames where detection degenerates to a full-frame bbox (the video is literally fading to black) plus single-frame mask spikes - Miku fully framed on every visible frame.
+- tbaka 3.24: slack minima 67.3/55.9 -> 58.3/40.5 analysis px **on a wider crop** (1096 -> 1155): >= 3.5% empty per side; the leash window became valid on every frame (4167/4167, 4070 frozen), jitter p99 15.25 -> 1.16 px, travel unchanged 244 px. auto-orient landscape trueClips 11 -> 2 frames (worst 1.9 output px), floor pin intact on all frames.
+- Cost, accepted: median subject-height coverage on landscape tbaka 88.5% -> 84.0% - the padding floor makes the subject slightly smaller, exactly the trade the owner asked for ("padding like the headroom on top").
+- Visual verification: comparison sheets (original + pre-walk/walk crop overlays + both renders) for tbaka 3.24 and 16:9 across group-spread and walking extremes, and sweetdevil 3.24: clear empty stage bands on both sides of every visible frame, nobody grazes an edge, feet/headroom unchanged, walks intact.
+
+Unit tests: 36 total (+2: 575 px group at 16:9 output -> 1.18-width fit with 7.6% side padding; same group at 3.24 -> height-driven fit with >= 2% side padding and floor pin intact). The five calibrated landscape geometry tests were recalibrated to the 1.18 fits.
