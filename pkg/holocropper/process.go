@@ -1,95 +1,14 @@
 package holocropper
 
 import (
-	"image"
 	"math"
 )
 
-/* STEP 1. Read Video */
-
-func (hc *HoloCropper) readVideo() {
-	// Set frame buffer
-	w, h := hc.video.Width(), hc.video.Height()
-	vbuffer := image.NewRGBA(image.Rect(0, 0, w, h))
-	hc.video.SetFrameBuffer(vbuffer.Pix)
-
-	// Start reading and piping raw frames. vidio decodes into vbuffer.Pix on
-	// every Read, so each frame is copied out before it enters the pipeline:
-	// downstream stages then own their frames exclusively, and the next Read
-	// cannot mutate a frame already in flight (S4 shared-buffer race, the
-	// frame-aliasing bug the original CLI only got away with by luck).
-	for hc.video.Read() {
-		if hc.procFrameQueue1 != nil {
-			frame := image.NewRGBA(image.Rect(0, 0, w, h))
-			copy(frame.Pix, vbuffer.Pix)
-			hc.procFrameQueue1 <- frame
-		}
-	}
-
-	hc.video.Close()
-}
-
-/* STEP 2. GRAYSCALE VIDEO */
-
-func (hc *HoloCropper) grayscaleVideo() {
-	for {
-		select {
-		case img, ok := <-hc.procFrameQueue1:
-			if !ok {
-				// Channel is closed
-				return
-			}
-
-			// Convert received frame to grayscale
-			maskFrame := convertToMonochrome(img)
-			// Send to next pipe
-			if hc.procFrameQueue2 != nil {
-				hc.procFrameQueue2 <- &ImageGrayMask{Mask: maskFrame, Image: img}
-			}
-		}
-	}
-}
-
-/* STEP 3. BINARY VIDEO (BITMAP) */
-
-func (hc *HoloCropper) binaryVideo() {
-	// Otsu threshold hysteresis: raw per-frame Otsu flickers with scene
-	// brightness and feeds that flicker straight into the framing controller.
-	// The effective threshold is clamped to +/-10 gray levels per frame
-	// (HIGH-ASPECT-RATIO-FIXES.md Phase 3).
-	lastThr := -1.0
-
-	for {
-		select {
-		case mask, ok := <-hc.procFrameQueue2:
-			if !ok {
-				// Channel is closed
-				return
-			}
-
-			// Apply Otsu threshold with hysteresis to the received image
-			newThr := float64(otsuThreshold(mask.Mask))
-			if lastThr < 0 {
-				lastThr = newThr
-			} else {
-				lastThr = clampF(newThr, lastThr-10, lastThr+10)
-			}
-			binaryImg := applyThreshold(mask.Mask, uint8(lastThr))
-
-			// Subject extraction: the shared stage (video_dsp.go) used by the
-			// embeddable detect pass too, so pipeline and detection stream
-			// always agree frame for frame.
-			subjects_bbox, subj := subjectsFromBinary(binaryImg)
-
-			// Send to next pipe
-			if hc.procFrameQueue3 != nil {
-				hc.procFrameQueue3 <- &ImageGrayBoundMask{Mask: binaryImg, Image: mask.Image, Bbox: subjects_bbox, Subj: subj}
-			}
-		}
-	}
-}
-
-/* STEP 4. CALCULATE VIDEO CROP */
+// Framing controller machinery: the gains, the axis/zoom PID actuators and
+// the walk-mode leash. framedecider.go drives them once per frame, and after
+// story C3 removed the fused pipeline this is the only home of the framing
+// behaviour the real corpus was tuned against (HIGH-ASPECT-RATIO-FIXES.md
+// §12.7, §14).
 
 // Framing controller gains and limits. All position/size values are in
 // analysis-frame pixels; dt is frame time (1/FPS). Tuned programmatically by
@@ -155,43 +74,6 @@ const (
 	walkLeashMarginFrac = 0.10
 )
 
-func (hc *HoloCropper) calcVideo() {
-	// STEP 4 delegates to the framingDecider replay engine (framedecider.go):
-	// the live pipeline and the embeddable Plan pass share one controller
-	// implementation, so replayed framing is bit-identical to live framing.
-	d := newFramingDecider(hc.framingParams(), float64(hc.Width)/float64(hc.Height), 1.0/hc.FPS, hc.srcW, hc.srcH)
-
-	dbg := newBoxDebugger()
-	defer dbg.close()
-
-	frame := 0
-	for {
-		select {
-		case mask, ok := <-hc.procFrameQueue3:
-			if !ok {
-				// Channel is closed
-				return
-			}
-			frame++
-
-			out := d.step(frame, mask.Bbox, mask.Subj, mask.Image.Bounds())
-
-			dbg.line(frame, mask.Subj, mask.Bbox, out.EMA, out.CropCx, out.CropCy, out.CropW, out.CropH, out.TargetH, out.WalkTgt)
-
-			// Send to next pipe
-			if hc.procFrameQueue4 != nil {
-				hc.procFrameQueue4 <- &ImageCropMask{CBox: out.CropRect, Image: mask.Image, zoom: hc.zoom}
-			}
-		}
-	}
-}
-
-// applyAxisPID is the pipeline wrapper of applyAxisPIDCalc (used by the CLI
-// path and the framing tests).
-func (hc *HoloCropper) applyAxisPID(p *PIDController, cmd *float64, pos, target, dt, span, floorRate float64) float64 {
-	return applyAxisPIDCalc(p, cmd, pos, target, dt, span, floorRate)
-}
-
 // applyAxisPIDCalc moves pos toward target: PI output -> low-passed actuator
 // command (cmd carries the EMA across frames, reset on cuts) -> crop-relative
 // rate cap. The low-pass is what makes crop motion a smooth ramp instead of
@@ -245,12 +127,6 @@ func walkLeashTarget(cropCx float64, ema [4]float64, cropW float64) (target floa
 	return clampF(cropCx, lo, hi), true
 }
 
-// applyZoomPID is the pipeline wrapper of applyZoomPIDCalc (used by the CLI
-// path and the framing tests).
-func (hc *HoloCropper) applyZoomPID(p *PIDController, cmd *float64, cropH, target, dt, frameH, floor float64) float64 {
-	return applyZoomPIDCalc(p, cmd, cropH, target, dt, frameH, floor)
-}
-
 // applyZoomPIDCalc drives crop height toward the target: PI output ->
 // low-passed command -> asymmetric caps. Zoom-out (crop grows) is fast:
 // safety; zoom-in (crop shrinks) is deliberately slow (zoomInMax) so the crop
@@ -272,49 +148,4 @@ func applyZoomPIDCalc(p *PIDController, cmd *float64, cropH, target, dt, frameH,
 	}
 	*cmd = clampF(*cmd, -limIn, limOut)
 	return clampF(cropH+*cmd, floor, frameH)
-}
-
-/* STEP 5. CROP VIDEO */
-
-func (hc *HoloCropper) cropVideo() {
-	for {
-		select {
-		case mask, ok := <-hc.procFrameQueue4:
-			if !ok {
-				// Channel is closed
-				return
-			}
-
-			// Crop to the framed region (out-of-frame sides compose as black
-			// stage padding for landscape, §12.8)
-			croppedImg := hc.cropToBBox(mask.Image, mask.CBox)
-
-			// Scale the framed region to fill the exact output size
-			if hc.zoom {
-				croppedImg = hc.fillResizeRGBA(croppedImg)
-			}
-
-			// Send to next pipe
-			if hc.procFrameQueue5 != nil {
-				hc.procFrameQueue5 <- croppedImg
-			}
-		}
-	}
-}
-
-/* STEP 6. SAVE FINAL FRAMES */
-func (hc *HoloCropper) saveFinalFrames() {
-	for {
-		select {
-		case img, ok := <-hc.procFrameQueue5:
-			if !ok {
-				// Channel is closed
-				return
-			}
-
-			// Save frame to temp folder
-			hc.copyAndWrite(img)
-			hc.currentFrame.Add(1)
-		}
-	}
 }

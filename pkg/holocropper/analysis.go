@@ -644,8 +644,10 @@ func analyzeWork(ctx context.Context, entry *analysisEntry, task *AnalysisTask, 
 	// so Snapshot/ContactSheet on Plans built from PartialStream work too.
 	sd.setVideoPath(videoPath)
 
-	// Detect: stream the analysis video through the exact pipeline
-	// detection stages (detectFrame mirrors binaryVideo frame-for-frame).
+	// Detect: stream the analysis video through the shared single-frame
+	// detector (detectFrame): grayscale -> Otsu hysteresis -> binary ->
+	// subjectsFromBinary, the same measurements the corpus framing decisions
+	// were tuned on.
 	tb.setPhase(PhaseDetect, srcFrames)
 	batcher := newFrameBatcher(req.Observer)
 	frames, err := runDetectStream(ctx, videoPath, tb, sd, batcher)

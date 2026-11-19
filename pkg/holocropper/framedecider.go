@@ -8,14 +8,16 @@ import (
 /* framingDecider — the framing controller extracted as a replayable state
 machine (HOLOCROPPER-API-PLAN.md story A3, the replay engine).
 
-calcVideo drives it from the live detection pipeline; the embeddable Plan
-pass replays it over a cached DetectionStream. step() transcribes the fused
-calcVideo loop body verbatim — same order, same arithmetic, same state — so
-live and replayed framing are bit-identical for the same bbox stream. Pure
-computation only: no channels, no images, no ffmpeg, no wall-clock.
+The Plan pass replays it over a cached DetectionStream. step() transcribes
+the fused calcVideo loop body verbatim - the loop story C3 deleted - same
+order, same arithmetic, same state, so a replay produces exactly the framing
+the real corpus was calibrated against; TestReplayParityVsDebugCSV pins that
+against the pipeline's own golden decision CSV. Pure computation only: no
+channels, no images, no ffmpeg, no wall-clock.
 
-The controller constants, PI gains and rate caps live in process.go next to
-the original loop they were tuned against (HIGH-ASPECT-RATIO-FIXES.md §12.7).
+The controller constants, PI gains and rate caps live in process.go: they were
+tuned against the loop body step() transcribes (HIGH-ASPECT-RATIO-FIXES.md
+§12.7).
 */
 
 // framingParams are the framing-relevant render settings, free of any

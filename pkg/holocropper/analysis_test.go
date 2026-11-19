@@ -5,7 +5,6 @@ import (
 	"encoding/csv"
 	"errors"
 	"fmt"
-	"image"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -575,38 +574,80 @@ func readDebugCSV(t *testing.T, path string) []csvFrameRow {
 	return out
 }
 
+// parityGoldenName is the framing decision stream the fused CLI pipeline
+// wrote for this fixture through HOLOCROPPER_DEBUG_BOXES, committed before
+// story C3 removed that pipeline. TestReplayParityVsDebugCSV is the gate the
+// deletion rides on: the embeddable passes must reproduce those decisions.
+const parityGoldenName = "holocropper-parity-fixture-240.csv"
+
+// TestReplayParityVsDebugCSV is the framing-parity gate (story C3, golden
+// mode). The golden CSV is the fused pipeline's own ground truth for the
+// fixture, checked against the embeddable API in three layers: Analyze
+// reproduces its per-frame subject boxes, NewPlan reproduces its framing
+// decisions, and the HOLOCROPPER_DEBUG_BOXES shim on NewPlan re-emits the
+// file the corpus tooling reads.
+//
+// Set HOLOCROPPER_REGENERATE_GOLDEN=1 to rewrite the golden from the API
+// chain - for example after an ffmpeg upgrade changes decode drift.
 func TestReplayParityVsDebugCSV(t *testing.T) {
 	ffmpeg := requireFFmpeg(t)
-
-	// Keep the fused CLI path's own scratch inside the test's temp tree.
-	t.Setenv("TMPDIR", t.TempDir())
-
-	inputDir, outDir := t.TempDir(), t.TempDir()
-	fixture := buildFixture(t, ffmpeg, inputDir)
-	csvPath := filepath.Join(t.TempDir(), "boxes.csv")
-	t.Setenv("HOLOCROPPER_DEBUG_BOXES", csvPath)
 
 	const (
 		outH, outW = 240, 240
 		fps        = fixtureFPS
 	)
-	hc := &HoloCropper{}
-	if err := hc.Crop(outH, outW, fps, fixture, outDir); err != nil {
-		t.Fatalf("CLI crop on the fixture: %v", err)
-	}
-	rows := readDebugCSV(t, csvPath)
+	golden := filepath.Join("testdata", parityGoldenName)
 
-	// The CLI analysis frame for this fixture: height 480, width follows the
-	// source aspect (even). Same geometry the embeddable pass produces.
-	aw := defaultAnalysisHeight * fixtureW / fixtureH
-	if aw%2 != 0 {
-		aw++
+	inputDir, tempDir := t.TempDir(), t.TempDir()
+	fixture := buildFixture(t, ffmpeg, inputDir)
+
+	if os.Getenv("HOLOCROPPER_REGENERATE_GOLDEN") != "" {
+		regenerateParityGolden(t, ffmpeg, fixture, tempDir, golden, outW, outH, fps)
+		return
 	}
-	samples := make([]streamSample, len(rows))
-	for i, r := range rows {
-		samples[i] = newStreamSample(image.Rect(r.bboxX0, r.bboxY0, r.bboxX0+r.bboxW, r.bboxY0+r.bboxH), r.subjects)
+
+	rows := readDebugCSV(t, golden)
+
+	// Layer 1 - detection. Analyze over the fixture measures the same subject
+	// boxes, frame for frame, that the fused path measured, in the same
+	// analysis frame (height 480, width follows the source aspect, even).
+	task, err := Analyze(context.Background(), AnalyzeRequest{
+		Input: fixture, TempDir: tempDir, FFmpegPath: ffmpeg,
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
-	stream := newTestStream(samples, aw, defaultAnalysisHeight, fixtureW, fixtureH)
+	a, err := task.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := a.Stream()
+	if stream.Len() != len(rows) {
+		t.Fatalf("analysis stream has %d frames, golden CSV has %d rows", stream.Len(), len(rows))
+	}
+	wantAW := defaultAnalysisHeight * fixtureW / fixtureH
+	if wantAW%2 != 0 {
+		wantAW++
+	}
+	aw, ah := stream.AnalysisWidth(), stream.AnalysisHeight()
+	if aw != wantAW || ah != defaultAnalysisHeight {
+		t.Fatalf("analysis frame %dx%d, want %dx%d", aw, ah, wantAW, defaultAnalysisHeight)
+	}
+	for _, r := range rows {
+		f := stream.Frame(r.frame - 1)
+		if f.Subjects != r.subjects {
+			t.Fatalf("frame %d: detected subjects %d, golden %d", r.frame, f.Subjects, r.subjects)
+		}
+		if f.BBox.X != float64(r.bboxX0) || f.BBox.Y != float64(r.bboxY0) ||
+			f.BBox.W != float64(r.bboxW) || f.BBox.H != float64(r.bboxH) {
+			t.Fatalf("frame %d: detected bbox %+v, golden {%d %d %d %d} - the detect pass drifted",
+				r.frame, f.BBox, r.bboxX0, r.bboxY0, r.bboxW, r.bboxH)
+		}
+	}
+
+	// Layer 2 - framing replay over the analysis stream itself.
+	csvPath := filepath.Join(t.TempDir(), "shim.csv")
+	t.Setenv("HOLOCROPPER_DEBUG_BOXES", csvPath)
 
 	p, err := NewPlan(stream, Settings{Width: outW, Height: outH, FPS: fps})
 	if err != nil {
@@ -614,34 +655,34 @@ func TestReplayParityVsDebugCSV(t *testing.T) {
 	}
 	recs := p.Records()
 	if len(recs) != len(rows) {
-		t.Fatalf("replay length %d, CSV rows %d", len(recs), len(rows))
+		t.Fatalf("replay length %d, golden rows %d", len(recs), len(rows))
 	}
-	if r := p.Resolved(); r.AnalysisW != aw || r.AnalysisH != defaultAnalysisHeight ||
+	if r := p.Resolved(); r.AnalysisW != aw || r.AnalysisH != ah ||
 		r.OutputW != outW || r.OutputH != outH || r.SourceW != fixtureW || r.SourceH != fixtureH {
 		t.Errorf("resolved geometry mismatch: %+v", r)
 	}
 
-	// CSV floats are written with 2 decimals, so the parity tolerance is the
-	// rounding band, not drift: 0.01 px plus a hair.
+	// Golden floats carry 2 decimals, so the parity tolerance is the rounding
+	// band, not drift: 0.01 px plus a hair.
 	const tol = 0.011
 	var maxCropDrift, maxTargetDrift float64
 	worstCrop, worstTarget := 0, 0
 	for i, r := range rows {
 		rec := recs[i]
 		if rec.Frame != r.frame {
-			t.Fatalf("record %d: Frame = %d, CSV frame %d", i, rec.Frame, r.frame)
+			t.Fatalf("record %d: Frame = %d, golden frame %d", i, rec.Frame, r.frame)
 		}
 		if rec.Subjects != r.subjects {
-			t.Errorf("frame %d: subjects %d vs CSV %d", r.frame, rec.Subjects, r.subjects)
+			t.Errorf("frame %d: subjects %d vs golden %d", r.frame, rec.Subjects, r.subjects)
 		}
 		// Inputs and the integer tracking box must match exactly.
 		if rec.BBox.X != float64(r.bboxX0) || rec.BBox.Y != float64(r.bboxY0) ||
 			rec.BBox.W != float64(r.bboxW) || rec.BBox.H != float64(r.bboxH) {
-			t.Fatalf("frame %d: bbox %+v vs CSV {%d %d %d %d}", r.frame, rec.BBox, r.bboxX0, r.bboxY0, r.bboxW, r.bboxH)
+			t.Fatalf("frame %d: bbox %+v vs golden {%d %d %d %d}", r.frame, rec.BBox, r.bboxX0, r.bboxY0, r.bboxW, r.bboxH)
 		}
 		if rec.EMA.X != float64(r.emaX0) || rec.EMA.Y != float64(r.emaY0) ||
 			rec.EMA.W != float64(r.emaW) || rec.EMA.H != float64(r.emaH) {
-			t.Fatalf("frame %d: EMA %+v vs CSV {%d %d %d %d} - tracking replay diverged",
+			t.Fatalf("frame %d: EMA %+v vs golden {%d %d %d %d} - tracking replay diverged",
 				r.frame, rec.EMA, r.emaX0, r.emaY0, r.emaW, r.emaH)
 		}
 
@@ -661,7 +702,7 @@ func TestReplayParityVsDebugCSV(t *testing.T) {
 				maxCropDrift, worstCrop = absF(drift), r.frame
 			}
 			if absF(drift) > tol {
-				t.Fatalf("frame %d: %s = %.4f, CSV %.4f (drift %.4f > %.3f)",
+				t.Fatalf("frame %d: %s = %.4f, golden %.4f (drift %.4f > %.3f)",
 					r.frame, d.name, d.got, d.want, drift, tol)
 			}
 		}
@@ -670,13 +711,13 @@ func TestReplayParityVsDebugCSV(t *testing.T) {
 			maxTargetDrift, worstTarget = absF(targetDrift), r.frame
 		}
 		if absF(targetDrift) > tol {
-			t.Fatalf("frame %d: target_h = %.4f, CSV %.4f (drift %.4f)", r.frame, rec.TargetH, r.targetH, targetDrift)
+			t.Fatalf("frame %d: target_h = %.4f, golden %.4f (drift %.4f)", r.frame, rec.TargetH, r.targetH, targetDrift)
 		}
 		if absF(rec.WalkTgt-r.walkTgt) > tol {
-			t.Fatalf("frame %d: walk_tgt = %.4f, CSV %.4f", r.frame, rec.WalkTgt, r.walkTgt)
+			t.Fatalf("frame %d: walk_tgt = %.4f, golden %.4f", r.frame, rec.WalkTgt, r.walkTgt)
 		}
 		if r.walkTgt == 0 && rec.WalkActive {
-			t.Errorf("frame %d: replay says an active leash, CSV says none", r.frame)
+			t.Errorf("frame %d: replay says an active leash, golden says none", r.frame)
 		}
 	}
 	t.Logf("parity over %d frames: worst crop drift %.4f px (frame %d), worst target drift %.4f px (frame %d)",
@@ -685,36 +726,71 @@ func TestReplayParityVsDebugCSV(t *testing.T) {
 	// The crop must sit fully inside the analysis frame for a square output.
 	for _, rec := range recs {
 		if rec.Crop.X < -0.01 || rec.Crop.Y < -0.01 ||
-			rec.Crop.X+rec.Crop.W > float64(aw)+0.01 || rec.Crop.Y+rec.Crop.H > float64(defaultAnalysisHeight)+0.01 {
+			rec.Crop.X+rec.Crop.W > float64(aw)+0.01 || rec.Crop.Y+rec.Crop.H > float64(ah)+0.01 {
 			t.Fatalf("frame %d: replayed crop escapes the analysis frame: %+v", rec.Frame, rec.Crop)
 		}
 	}
 
-	// The HOLOCROPPER_DEBUG_BOXES shim on the replay path (story C3): the
-	// NewPlan above re-emitted the CSV (the env is still set), so the file
-	// now holds the replay's own lines. They must match the fused path's
-	// ground truth exactly the same way - this is the comparison C3 will
-	// run against golden CSVs once the fused path is gone.
+	// Layer 3 - the HOLOCROPPER_DEBUG_BOXES shim: the NewPlan above re-emitted
+	// the CSV (the env is still set), so the file holds the replay's own
+	// lines. They must reproduce the golden row for row - this is what corpus
+	// tooling sees after the fused pipeline is gone.
 	shim := readDebugCSV(t, csvPath)
 	if len(shim) != len(rows) {
-		t.Fatalf("shim CSV has %d rows, ground truth %d", len(shim), len(rows))
+		t.Fatalf("shim CSV has %d rows, golden has %d", len(shim), len(rows))
 	}
 	for i, r := range rows {
 		s := shim[i]
 		if s.frame != r.frame || s.subjects != r.subjects ||
 			s.bboxX0 != r.bboxX0 || s.bboxY0 != r.bboxY0 || s.bboxW != r.bboxW || s.bboxH != r.bboxH ||
 			s.emaX0 != r.emaX0 || s.emaY0 != r.emaY0 || s.emaW != r.emaW || s.emaH != r.emaH {
-			t.Fatalf("shim CSV row %d disagrees with the fused ground truth: %+v vs %+v", i, s, r)
+			t.Fatalf("shim CSV row %d disagrees with the golden: %+v vs %+v", i, s, r)
 		}
 		for _, pr := range [][2]float64{
 			{s.cropCx, r.cropCx}, {s.cropCy, r.cropCy}, {s.cropW, r.cropW}, {s.cropH, r.cropH},
 			{s.targetH, r.targetH}, {s.walkTgt, r.walkTgt},
 		} {
 			if absF(pr[0]-pr[1]) > tol {
-				t.Fatalf("shim CSV row %d: %.4f vs ground truth %.4f (drift > %.3f)", i, pr[0], pr[1], tol)
+				t.Fatalf("shim CSV row %d: %.4f vs golden %.4f (drift > %.3f)", i, pr[0], pr[1], tol)
 			}
 		}
 	}
+}
+
+// regenerateParityGolden rewrites the golden CSV from the API chain
+// (Analyze + the NewPlan shim). Run it explicitly, review the diff, and keep
+// the frame counts and drift in check before committing the new golden.
+func regenerateParityGolden(t *testing.T, ffmpeg, fixture, tempDir, golden string, outW, outH int, fps float64) {
+	t.Helper()
+
+	csvPath := filepath.Join(t.TempDir(), "golden.csv")
+	t.Setenv("HOLOCROPPER_DEBUG_BOXES", csvPath)
+
+	task, err := Analyze(context.Background(), AnalyzeRequest{
+		Input: fixture, TempDir: tempDir, FFmpegPath: ffmpeg,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := task.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewPlan(a.Stream(), Settings{Width: outW, Height: outH, FPS: fps}); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(csvPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(golden), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(golden, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("regenerated %s from the API chain (%d bytes)", golden, len(data))
 }
 
 func absF(v float64) float64 {

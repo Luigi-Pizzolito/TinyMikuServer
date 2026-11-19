@@ -99,12 +99,15 @@ func syntheticFrame(w, h int, rects []image.Rectangle) *image.RGBA {
 	return img
 }
 
-func TestProbeDetectSyntheticSubjects(t *testing.T) {
-	hc := &HoloCropper{}
-
+// TestDetectFrameSyntheticSubjects pins the shared single-frame detector the
+// detect pass streams frames through (video_dsp.go detectFrame): grayscale ->
+// Otsu hysteresis -> binary -> subject filter -> union master bbox. These are
+// the AR measurements auto-orientation decides on, so the master bbox must
+// match the drawn subject layout.
+func TestDetectFrameSyntheticSubjects(t *testing.T) {
 	// One tall solo dancer: master bbox == its own box, AR ~ 0.375.
 	lastThr := -1.0
-	bbox, subj := hc.probeDetect(syntheticFrame(854, 480,
+	bbox, subj := detectFrame(syntheticFrame(854, 480,
 		[]image.Rectangle{image.Rect(300, 90, 420, 410)}), &lastThr)
 	if subj != 1 {
 		t.Fatalf("solo subject count %d, want 1", subj)
@@ -115,7 +118,7 @@ func TestProbeDetectSyntheticSubjects(t *testing.T) {
 
 	// Three side-by-side dancers: union master bbox is wide, AR ~ 2.29.
 	lastThr = -1.0
-	bbox, subj = hc.probeDetect(syntheticFrame(854, 480, []image.Rectangle{
+	bbox, subj = detectFrame(syntheticFrame(854, 480, []image.Rectangle{
 		image.Rect(100, 100, 180, 380), image.Rect(380, 100, 460, 380), image.Rect(660, 100, 740, 380),
 	}), &lastThr)
 	if subj != 3 {
@@ -124,23 +127,36 @@ func TestProbeDetectSyntheticSubjects(t *testing.T) {
 	if ar := float64(bbox.Dx()) / float64(bbox.Dy()); ar < 2.0 || ar > 2.5 {
 		t.Fatalf("group master AR %.3f not ~2.29 (bbox %v)", ar, bbox)
 	}
+}
 
-	// Fully dark frames degenerate to an all-white mask in this thresholding
-	// algorithm; the probe must not mistake that for a full-frame subject.
-	lastThr = -1.0
-	if bbox, subj = hc.probeDetect(syntheticFrame(854, 480, nil), &lastThr); subj != 0 || !bbox.Eq(image.ZR) {
-		t.Fatalf("empty frame detected as subject: subj=%d bbox=%v", subj, bbox)
+// degenerateMasterBBox is the AR-level guard the deleted CLI probe carried:
+// a detection that stands for the whole frame carries the frame's own aspect
+// ratio, not a subject's, and must never enter the AR averages.
+func TestDegenerateMasterBBoxGuard(t *testing.T) {
+	if !degenerateMasterBBox(image.Rect(0, 0, 854, 480), 854, 480) {
+		t.Error("a full-frame detection must be flagged degenerate")
+	}
+	if !degenerateMasterBBox(image.Rect(4, 4, 851, 477), 854, 480) {
+		t.Error("a near-full-frame detection must be flagged degenerate")
+	}
+	if degenerateMasterBBox(image.Rect(300, 90, 420, 410), 854, 480) {
+		t.Error("a real subject bbox flagged degenerate")
+	}
+	if degenerateMasterBBox(image.ZR, 854, 480) {
+		t.Error("an empty bbox is not a degenerate detection, it is no detection")
+	}
+	if !degenerateMasterBBox(image.Rect(0, 0, 10, 10), 0, 480) {
+		t.Error("a zero-area frame has no subject evidence either way")
 	}
 }
 
-func TestAutoOrientSquareBypassesProbe(t *testing.T) {
-	hc := &HoloCropper{}
-	// The probe is never invoked for 1:1, so a nonexistent path must not error.
-	outW, outH, stat, err := hc.AutoOrient("does-not-exist.mp4", 320, 320)
-	if err != nil {
-		t.Fatalf("1:1 AutoOrient errored: %v", err)
-	}
-	if outW != 320 || outH != 320 || stat.Flip {
-		t.Fatalf("1:1 must pass through unchanged, got %dx%d flip=%v", outW, outH, stat.Flip)
+// A square output has no portrait/landscape choice: orientationStats passes
+// the requested dims through and never flips, whatever the subjects look like.
+func TestOrientationStatsSquareOutputNeverFlips(t *testing.T) {
+	for _, ar := range [][]float64{tallSubjectARs, groupSubjectARs, nil} {
+		outW, outH, stat := orientationStats(ar, 320, 320)
+		if outW != 320 || outH != 320 || stat.Flip {
+			t.Fatalf("320x320 with ARs %v must pass through, got %dx%d flip=%v", ar, outW, outH, stat.Flip)
+		}
 	}
 }

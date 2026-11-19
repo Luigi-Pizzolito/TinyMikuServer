@@ -128,17 +128,18 @@ func NewPlan(stream DetectionStream, s Settings) (*Plan, error) {
 	}
 
 	// Auto-orient: the flip decision from the stream's own subject aspect
-	// ratios (the CLI probe samples <=128 frames by decoding; the stream
-	// already holds every frame's master bbox, so the aggregates cover the
-	// whole video - strictly more evidence, same decision machinery, see
-	// orientationStats).
+	// ratios. The stream holds every frame's master bbox, so the aggregates
+	// cover the whole video - strictly more evidence than the sampled probe
+	// decode story C3 removed, same decision machinery (orientationStats) and
+	// the same guard against frames whose detection degenerates to the whole
+	// frame (degenerateMasterBBox).
 	flip := false
 	orientation := OrientationStat{}
 	if s.AutoOrient && w != h {
 		ars := make([]float64, 0, len(samples))
 		for _, sm := range samples {
 			bb := sm.bbox()
-			if sm.subjects > 0 && !bb.Empty() {
+			if sm.subjects > 0 && !bb.Empty() && !degenerateMasterBBox(bb, aw, ah) {
 				ars = append(ars, float64(bb.Dx())/float64(bb.Dy()))
 			}
 		}

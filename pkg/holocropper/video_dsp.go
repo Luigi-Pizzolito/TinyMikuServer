@@ -236,9 +236,10 @@ func totalBoundingBox(rectangles []image.Rectangle) image.Rectangle {
 // subjectsFromBinary runs the shared subject-extraction stage: connected
 // component labelling -> area sort -> keep boxes with at least 20% of the
 // largest box's area (merging overlapping neighbours expanded by 5% of the
-// frame height) -> union master bbox. Used by the fused pipeline
-// (binaryVideo), the auto-orient probe (probeDetect) and the embeddable
-// detect pass (detectFrame) - all three see exactly the same subjects.
+// frame height) -> union master bbox. detectFrame (the embeddable detect
+// pass) is its only caller now that the fused pipeline and its probe are
+// gone, so the DetectionStream and every path built on it see exactly these
+// subjects.
 func subjectsFromBinary(binaryImg *image.Gray) (image.Rectangle, int) {
 	boundingBoxes, _ := connectedComponentLabeling(binaryImg)
 	var rectangles []image.Rectangle
@@ -285,9 +286,9 @@ func detectFrame(img *image.RGBA, lastThr *float64) (image.Rectangle, int) {
 	return subjectsFromBinary(binaryImg)
 }
 
-// aspectLockedTarget computes the desired crop from a (smoothed) subject
-// bounding box: a rectangle locked to the output aspect ratio, padded by
-// hc.zoomMargin, with zoom-in floors:
+// aspectLockedTargetCalc computes the desired crop from a (smoothed) subject
+// bounding box: a rectangle locked to the output aspect ratio, padded by the
+// framing margin, with zoom-in floors:
 //  1. never upscale above the source resolution (cropH >= outH * frameH / srcH)
 //  2. policy maxZoom (cropH >= frameH / maxZoom) - relaxed for extreme
 //     landscape outputs, where full-subject containment outranks it (§12.8)
@@ -299,13 +300,8 @@ func detectFrame(img *image.RGBA, lastThr *float64) (image.Rectangle, int) {
 //     feet sit at the stage floor (frame bottom). Square outputs center.
 //
 // Returns (width, height, centerX, centerY) in analysis-frame pixels.
-func (hc *HoloCropper) aspectLockedTarget(bbox image.Rectangle, frameW, frameH, aspect float64) (float64, float64, float64, float64) {
-	return aspectLockedTargetCalc(hc.framingParams(), bbox, frameW, frameH, aspect)
-}
-
-// aspectLockedTargetCalc is the instance-free implementation the replay
-// engine calls: framingParams carries the zoom margin, the maxZoom policy
-// cap and the output/source heights the zoom floors need.
+// framingParams carries the zoom margin, the maxZoom policy cap and the
+// output/source heights the zoom floors need.
 func aspectLockedTargetCalc(params framingParams, bbox image.Rectangle, frameW, frameH, aspect float64) (float64, float64, float64, float64) {
 	margin := params.Margin
 
@@ -470,18 +466,12 @@ func widthCoverFrac(aspect float64) float64 {
 	}
 }
 
-// cropRectFromFraming converts the smoothed float framing state into an
+// cropRectFromFramingCalc converts the smoothed float framing state into an
 // integer crop rectangle. Vertical extents always stay inside the frame;
 // horizontally the rect may extend past the frame's left/right edges by up
 // to padAllow pixels per side (landscape containment padding, §12.8), and
 // the x clamp window stays valid as long as padAllow >= (w - fw) / 2.
-// cropToBBox composes the out-of-frame regions as black stage padding.
-func (hc *HoloCropper) cropRectFromFraming(cx, cy, w, h, padAllow float64, bounds image.Rectangle) image.Rectangle {
-	return cropRectFromFramingCalc(cx, cy, w, h, padAllow, bounds)
-}
-
-// cropRectFromFramingCalc is the instance-free implementation shared by the
-// pipeline and the replay engine.
+// cropToBBoxCalc composes the out-of-frame regions as black stage padding.
 func cropRectFromFramingCalc(cx, cy, w, h, padAllow float64, bounds image.Rectangle) image.Rectangle {
 	fw, fh := float64(bounds.Dx()), float64(bounds.Dy())
 	cx = clampF(cx, w/2-padAllow, fw-w/2+padAllow)
@@ -511,17 +501,11 @@ func cropRectFromFramingCalc(cx, cy, w, h, padAllow float64, bounds image.Rectan
 	return image.Rect(x0, y0, x1, y1)
 }
 
-// Function to crop a frame to a bounding box. The rect may extend past the
-// frame's left/right edges (landscape containment padding, §12.8): those
+// cropToBBoxCalc crops a frame to a bounding box. The rect may extend past
+// the frame's left/right edges (landscape containment padding, §12.8): those
 // regions are composed as black stage padding. Vertical extents stay inside
 // the frame, so out-of-frame vertical padding can never leak through
 // (HIGH-ASPECT-RATIO-FIXES.md F3/F4).
-func (hc *HoloCropper) cropToBBox(src *image.RGBA, cropRect image.Rectangle) *image.RGBA {
-	return cropToBBoxCalc(src, cropRect)
-}
-
-// cropToBBoxCalc is the instance-free implementation shared by the pipeline
-// and the render passes.
 func cropToBBoxCalc(src *image.RGBA, cropRect image.Rectangle) *image.RGBA {
 	cr := cropRect
 	if cr.Empty() {
@@ -540,16 +524,9 @@ func cropToBBoxCalc(src *image.RGBA, cropRect image.Rectangle) *image.RGBA {
 	return dst
 }
 
-// fillResizeRGBA scales the framed crop to exactly fill the requested output
-// size. The crop rect is aspect-locked in calcVideo, so this is a straight
-// scale, not a fit: no letterbox padding is produced (replaces the old
-// fit-scale + black-letterbox resizeRGBA).
-func (hc *HoloCropper) fillResizeRGBA(img *image.RGBA) *image.RGBA {
-	return fillResizeTo(img, hc.Width, hc.Height)
-}
-
-// fillResizeTo is the instance-free implementation: scales img to exactly
-// outW x outH.
+// fillResizeTo scales the framed crop to exactly fill outW x outH. The crop
+// rect is aspect-locked by aspectLockedTargetCalc, so this is a straight
+// scale, not a fit: no letterbox padding is produced.
 func fillResizeTo(img *image.RGBA, outW, outH int) *image.RGBA {
 	out := image.NewRGBA(image.Rect(0, 0, outW, outH))
 	err := rez.Convert(out, img, rez.NewLanczosFilter(2))

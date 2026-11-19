@@ -1,69 +1,47 @@
 package holocropper
 
-import (
-	"fmt"
-	"image"
-	"sync"
-	"sync/atomic"
-	"time"
-
-	vidio "github.com/AlexEidt/Vidio"
-	"github.com/schollz/progressbar/v3"
-)
-
 /**
  * Refactor of https://github.com/Luigi-Pizzolito/1-1-Content-Aware-Video-Crop into a Go package
  *
+ * Story C3 removed the fused one-shot pipeline (the channelled read ->
+ * grayscale -> binary -> calc -> crop -> save stages, their channels and the
+ * probe decoder). The framing machinery they produced lives on here and in
+ * framedecider.go; the passes that run it are the embeddable API in
+ * analysis.go / plan.go / renders.go:
+ *
+ *	Analyze -> NewPlan -> Analysis.RenderPreview / Analysis.RenderFinal
  */
 
-// defaultAnalysisHeight is the height of the internal analysis frame when
-// AnalysisHeight is not set. The analysis frame is never shorter than the
-// requested output (crops are only ever scaled down from it).
+// defaultAnalysisHeight is the analysis frame height when none is requested
+// (AnalyzeRequest.AnalysisHeight == 0). Plan rejects streams analysed below
+// the output height, because crops are only ever scaled DOWN from the
+// analysis frame (see ErrStreamIncompatible).
 const defaultAnalysisHeight = 480
 
-// Framing parameter defaults shared by the CLI instance accessors, the
+// Framing parameter defaults shared by the instance accessors, the
 // embeddable Settings resolution and the Schema form spec.
 const (
 	defaultZoomMargin = 1.12 // subject bbox -> crop padding factor
 	defaultMaxZoom    = 2.0  // zoom-in policy cap
 )
 
-/* HoloCropper class */
+// HoloCropper holds the framing parameters of a crop. After story C3 removed
+// the fused pipeline it is no longer a video processor: it is the
+// tuned-parameters holder whose framingParams() feeds the geometry functions
+// (aspectLockedTargetCalc, cropRectFromFramingCalc, cropToBBoxCalc) and the
+// corpus-calibrated framing tests. The API passes resolve the same parameters
+// from Settings, so rendering never needs an instance.
 type HoloCropper struct {
-	/* meta */
+	// Output height. The zoom floors compare it with the analysis frame and
+	// the source height (never upscale above the source).
 	Height int
-	Width  int
-	FPS    float64
 
-	/* optional framing parameters; zero values select built-in defaults */
-	AnalysisHeight int     // analysis frame height (default 480, never below Height)
-	ZoomMargin     float64 // subject bbox -> crop padding factor (default 1.12)
-	MaxZoom        float64 // zoom-in policy cap (default 2.0)
+	// Optional framing parameters; zero values select built-in defaults.
+	ZoomMargin float64 // subject bbox -> crop padding factor (default 1.12)
+	MaxZoom    float64 // zoom-in policy cap (default 2.0)
 
-	/* private */
-
-	/** pipeline **/
-	procFrameQueue1 chan *image.RGBA
-	procFrameQueue2 chan *ImageGrayMask
-	procFrameQueue3 chan *ImageGrayBoundMask
-	procFrameQueue4 chan *ImageCropMask
-	procFrameQueue5 chan *image.RGBA
-	pipeOnce        sync.Once
-
-	zoom bool
-
-	video        *vidio.Video
-	totalFrames  int
-	currentFrame atomic.Int64 // written by saveFinalFrames, read by tickPipeline (S4: -race clean)
-
-	inputVideo     string
-	outputDir      string
-	tempDirTinyVid string
-	tempDirFrames  string
-
-	srcW, srcH int
-
-	bart *progressbar.ProgressBar
+	// Private: source frame height, set by whoever knows the source video.
+	srcH int
 }
 
 func NewHoloCropper() *HoloCropper {
@@ -95,106 +73,4 @@ func (hc *HoloCropper) framingParams() framingParams {
 		OutH:    hc.Height,
 		SrcH:    hc.srcH,
 	}
-}
-
-func (hc *HoloCropper) Crop(height, width int, fps float64, input, output string) error {
-	// Set the parameters
-	hc.Height = height
-	hc.Width = width
-	hc.FPS = fps
-	hc.inputVideo = input
-	hc.outputDir = output
-	hc.zoom = true
-
-	// Check if width and height are set
-	if hc.Width == 0 || hc.Height == 0 {
-		return fmt.Errorf("Error: Must specify either width or height")
-	}
-	// Check if output FPS is set
-	if hc.FPS == 0 {
-		return fmt.Errorf("Error: Must specify FPS")
-	}
-
-	// Keep output dimensions even, as before
-	if hc.Height%2 != 0 {
-		hc.Height++
-	}
-	if hc.Width%2 != 0 {
-		hc.Width++
-	}
-
-	// Create temp paths and clean up
-	if err := hc.cleanPathsAndTempDir(); err != nil {
-		return err
-	}
-	defer hc.rmTempDirs()
-
-	// Initial resize
-	if err := hc.initialResize(); err != nil {
-		return err
-	}
-
-	// Init progress bar
-	fmt.Printf("Starting crop processing for %s\n", hc.inputVideo)
-	hc.bart = progressbar.Default(int64(hc.totalFrames))
-
-	// Start the pipeline
-	hc.establishPipes()
-	if err := hc.startPipeline(); err != nil {
-		return err
-	}
-
-	// Wait for pipeline to complete
-	hc.tickPipeline()
-
-	hc.bart.Close()
-
-	// Join final output images to output MP4
-	if err := hc.joinOutputImgs(); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (hc *HoloCropper) Progress() float64 {
-	if hc.totalFrames == 0 {
-		return 0
-	}
-	return float64(float64(hc.currentFrame.Load()) / float64(hc.totalFrames))
-}
-
-func (hc *HoloCropper) Done() bool {
-	// Wait (without spinning on the CPU) until the frame count is known
-	for hc.totalFrames == 0 {
-		time.Sleep(20 * time.Millisecond)
-	}
-	return hc.currentFrame.Load() == int64(hc.totalFrames)
-}
-
-// closePipes closes all pipeline channels exactly once, so tickPipeline and
-// Cancel can never double-close them.
-func (hc *HoloCropper) closePipes() {
-	hc.pipeOnce.Do(func() {
-		if hc.procFrameQueue1 != nil {
-			close(hc.procFrameQueue1)
-		}
-		if hc.procFrameQueue2 != nil {
-			close(hc.procFrameQueue2)
-		}
-		if hc.procFrameQueue3 != nil {
-			close(hc.procFrameQueue3)
-		}
-		if hc.procFrameQueue4 != nil {
-			close(hc.procFrameQueue4)
-		}
-		if hc.procFrameQueue5 != nil {
-			close(hc.procFrameQueue5)
-		}
-	})
-}
-
-func (hc *HoloCropper) Cancel() {
-	hc.closePipes()
-	hc.rmTempDirs()
 }

@@ -1,31 +1,47 @@
 package holocropper
 
 import (
-	"fmt"
 	"image"
 	"math"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"sort"
-
-	vidio "github.com/AlexEidt/Vidio"
 )
 
-// Auto-orientation (HIGH-ASPECT-RATIO-FIXES.md §13): a preprocessing probe
-// that estimates the average aspect ratio of the master subject bounding
-// box (the box covering ALL detected subjects, per frame) across sampled
-// frames, then picks the output orientation - the requested WxH or its
-// transpose HxW - that keeps the subjects best framed at that resolution.
-// The video is never rotated: the crop just becomes tall or wide, the
-// source stays upright. 1:1 outputs bypass the probe entirely.
+// Auto-orientation (HIGH-ASPECT-RATIO-FIXES.md §13): estimate the aspect
+// ratio of the master subject bounding box (the box covering ALL detected
+// subjects, per frame) across frames, then pick the output orientation - the
+// requested WxH or its transpose HxW - that keeps the subjects best framed at
+// that resolution. The video is never rotated: the crop just becomes tall or
+// wide, the source stays upright. 1:1 outputs bypass the decision entirely.
+//
+// The evidence is the DetectionStream: Plan feeds orientationStats the
+// master-bbox ARs of every frame it already has. Story C3 removed the old
+// separate probe decode (a sampled ffmpeg pass plus its own copy of the
+// detection stages) - the stream holds the same measurements for the whole
+// video, so the decision machinery is shared by every path.
 
-const probeMaxSamples = 128
+// degenerateBBoxAreaFrac is the share of the analysis frame a master bbox has
+// to cover before it counts as standing in for the whole frame. Frames whose
+// mask degenerates (a fully dark frame, where Otsu collapses to threshold 0
+// and everything thresholds as "subject") report the FRAME's aspect ratio, not
+// a subject's, so they must not enter the AR averages. The CLI probe this
+// package used to run guarded against exactly that; the stream path filters
+// the same frames out of the aggregates while leaving framing untouched.
+const degenerateBBoxAreaFrac = 0.92
+
+// degenerateMasterBBox reports whether bbox covers enough of the frameW x
+// frameH analysis frame to be a degenerate full-frame detection.
+func degenerateMasterBBox(bbox image.Rectangle, frameW, frameH int) bool {
+	area := float64(frameW) * float64(frameH)
+	if area <= 0 {
+		return true
+	}
+	return float64(bbox.Dx()*bbox.Dy()) >= degenerateBBoxAreaFrac*area
+}
 
 // OrientationStat describes one auto-orient decision for reporting.
 type OrientationStat struct {
-	FramesExamined     int     // probe frames decoded
-	FramesWithSubjects int     // probe frames with at least one subject
+	FramesExamined     int     // frames the stream covers
+	FramesWithSubjects int     // frames of those with at least one subject
 	MeanAR             float64 // mean master-bbox aspect ratio (w/h)
 	MedianAR           float64
 	GeoMeanAR          float64 // geometric mean: ARs are ratios, so logs are the natural average
@@ -65,124 +81,10 @@ func pickOrientation(w, h int, subjectARs []float64) (flip bool, keepScore, flip
 	return flipScore > keepScore, keepScore, flipScore
 }
 
-// probeDetect mirrors the pipeline's subject detection (grayscale -> Otsu
-// with the same +/-10 hysteresis -> binary -> connected components -> the
-// 20%-of-largest filter with combineBounds -> union master bbox) so the
-// probe estimates exactly what the framing controller will see.
-func (hc *HoloCropper) probeDetect(img *image.RGBA, lastThr *float64) (image.Rectangle, int) {
-	gray := convertToMonochrome(img)
-	thr := float64(otsuThreshold(gray))
-	if *lastThr < 0 {
-		*lastThr = thr
-	} else {
-		*lastThr = clampF(thr, *lastThr-10, *lastThr+10)
-	}
-	binaryImg := applyThreshold(gray, uint8(*lastThr))
-
-	// Degenerate-mask guard: on fully dark frames Otsu degenerates to
-	// threshold 0 and the whole frame thresholds as "subject", faking a
-	// full-frame bbox with the frame's own AR. Such frames carry no
-	// subject information and are skipped.
-	white, area := 0, binaryImg.Bounds().Dx()*binaryImg.Bounds().Dy()
-	for y := binaryImg.Bounds().Min.Y; y < binaryImg.Bounds().Max.Y; y++ {
-		for x := binaryImg.Bounds().Min.X; x < binaryImg.Bounds().Max.X; x++ {
-			if binaryImg.GrayAt(x, y).Y > 0 {
-				white++
-			}
-		}
-	}
-	if float64(white) >= 0.92*float64(area) {
-		return image.ZR, 0
-	}
-
-	// The shared subject-extraction stage (identical filter the pipeline
-	// uses) behind the degenerate-mask guard above.
-	return subjectsFromBinary(binaryImg)
-}
-
-// probeSubjectARs decodes up to probeMaxSamples evenly spread frames of the
-// input at a small analysis size and returns the master-bbox aspect ratio
-// (w/h) of every sampled frame that contains subjects. The probe writes a
-// throwaway tiny video (ffmpeg select + scale, audio dropped) and runs the
-// real detection machinery on it; frames without subjects are skipped.
-func (hc *HoloCropper) probeSubjectARs(input string) (ars []float64, examined int, err error) {
-	src, err := vidio.NewVideo(input)
-	if err != nil {
-		return nil, 0, err
-	}
-	srcW, srcH, totalFrames := src.Width(), src.Height(), src.Frames()
-	src.Close()
-	if srcW <= 0 || srcH <= 0 || totalFrames <= 0 {
-		return nil, 0, fmt.Errorf("auto-orient probe: unreadable input video %s", input)
-	}
-
-	// Analysis size: same rule as the pipeline but WITHOUT the output-height
-	// floor - the probe measures subject aspect ratios, which are
-	// scale-invariant, and must not depend on the orientation being tested.
-	ah := hc.AnalysisHeight
-	if ah <= 0 {
-		ah = defaultAnalysisHeight
-	}
-	aw := ah * srcW / srcH
-	if aw < 16 {
-		aw = 16
-	}
-	if aw%2 != 0 {
-		aw++
-	}
-	if ah%2 != 0 {
-		ah++
-	}
-
-	stride := totalFrames / probeMaxSamples
-	if stride < 1 {
-		stride = 1
-	}
-
-	tmpDir, err := os.MkdirTemp("", "tinyprobe")
-	if err != nil {
-		return nil, 0, err
-	}
-	defer os.RemoveAll(tmpDir)
-	probeVideo := filepath.Join(tmpDir, "probe.mp4")
-
-	cmd := exec.Command("ffmpeg", "-v", "error",
-		"-i", input,
-		"-vf", fmt.Sprintf("select='not(mod(n\\,%d))',scale=%d:%d", stride, aw, ah),
-		"-fps_mode", "vfr",
-		"-an",
-		probeVideo, "-y",
-	)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return nil, 0, fmt.Errorf("auto-orient probe encode failed: %v: %s", err, out)
-	}
-
-	video, err := vidio.NewVideo(probeVideo)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer video.Close()
-
-	buf := image.NewRGBA(image.Rect(0, 0, video.Width(), video.Height()))
-	video.SetFrameBuffer(buf.Pix)
-
-	lastThr := -1.0
-	for video.Read() {
-		examined++
-		bbox, subj := hc.probeDetect(buf, &lastThr)
-		if subj > 0 && bbox.Dx() > 0 && bbox.Dy() > 0 {
-			ars = append(ars, float64(bbox.Dx())/float64(bbox.Dy()))
-		}
-	}
-	return ars, examined, nil
-}
-
 // orientationStats computes the full OrientationStat (AR aggregates + the
 // keep/flip containment-score decision) from a set of master-bbox aspect
-// ratios. Shared by the CLI probe path (AutoOrient) and the embeddable Plan
-// orientation aggregate, which feeds it the whole detection stream instead
-// of a sampled probe decode - so the decision and its reporting are
-// identical across paths.
+// ratios: the decision and its reporting are one function, whatever path
+// measured the ratios.
 func orientationStats(subjectARs []float64, w, h int) (outW, outH int, stat OrientationStat) {
 	stat.FramesWithSubjects = len(subjectARs)
 	if len(subjectARs) == 0 {
@@ -214,32 +116,4 @@ func orientationStats(subjectARs []float64, w, h int) (outW, outH int, stat Orie
 		return h, w, stat
 	}
 	return w, h, stat
-}
-
-// AutoOrient probes the input and returns the output dimensions that best
-// fit its subjects at the requested resolution: (w, h) as requested, or
-// (h, w) when the transposed aspect scores better. Square outputs bypass
-// the probe (1:1 has no portrait/landscape choice and the video is always
-// kept upright). A failed or subjectless probe falls back to the requested
-// orientation with the error (if any) attached.
-func (hc *HoloCropper) AutoOrient(input string, w, h int) (outW, outH int, stat OrientationStat, err error) {
-	// Match Crop()'s even-dimension normalisation so the decision aspect is
-	// the aspect actually rendered.
-	if w%2 != 0 {
-		w++
-	}
-	if h%2 != 0 {
-		h++
-	}
-	if w == h {
-		return w, h, stat, nil
-	}
-
-	ars, examined, err := hc.probeSubjectARs(input)
-	if err != nil {
-		return w, h, OrientationStat{FramesExamined: examined}, err
-	}
-	outW, outH, stat = orientationStats(ars, w, h)
-	stat.FramesExamined = examined
-	return outW, outH, stat, nil
 }

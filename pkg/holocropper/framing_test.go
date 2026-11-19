@@ -20,13 +20,12 @@ func newFramingZoom() *PIDController {
 }
 
 func TestPIDConvergence(t *testing.T) {
-	hc := &HoloCropper{}
 	p := newFramingZoom()
 	pos := 0.0
 	cmd := 0.0
 	tol := framingDeadband + 1.0 // plant holds inside the deadband by design
 	for i := 0; i < 600; i++ {
-		pos = hc.applyZoomPID(p, &cmd, pos, 100, 1.0/24, 10000, 0)
+		pos = applyZoomPIDCalc(p, &cmd, pos, 100, 1.0/24, 10000, 0)
 		if i > 500 && math.Abs(pos-100) > tol {
 			t.Fatalf("not converged by frame %d: pos=%.2f", i, pos)
 		}
@@ -37,13 +36,12 @@ func TestPIDConvergence(t *testing.T) {
 }
 
 func TestPIDAntiWindup(t *testing.T) {
-	hc := &HoloCropper{}
 	p := newFramingZoom()
 	pos := 0.0
 	cmd := 0.0
 	// large error for 1000 frames: the integrator must clamp, not wind up
 	for i := 0; i < 1000; i++ {
-		pos = hc.applyZoomPID(p, &cmd, pos, 50, 1.0/24, 10000, -1000)
+		pos = applyZoomPIDCalc(p, &cmd, pos, 50, 1.0/24, 10000, -1000)
 	}
 	if math.Abs(p.integral) > framingZoomIntegral+1 {
 		t.Fatalf("integral %.2f escaped anti-windup clamp %.2f", p.integral, framingZoomIntegral)
@@ -52,7 +50,7 @@ func TestPIDAntiWindup(t *testing.T) {
 	// the integrator did not wind up beyond its clamp
 	recovered := -1
 	for i := 0; i < 600; i++ {
-		pos = hc.applyZoomPID(p, &cmd, pos, -50, 1.0/24, 10000, -1000)
+		pos = applyZoomPIDCalc(p, &cmd, pos, -50, 1.0/24, 10000, -1000)
 		if math.Abs(pos+50) < framingDeadband+1.0 {
 			recovered = i
 			break
@@ -64,7 +62,6 @@ func TestPIDAntiWindup(t *testing.T) {
 }
 
 func TestPIDNoiseAttenuation(t *testing.T) {
-	hc := &HoloCropper{}
 	p := newFramingZoom()
 	pos := 400.0
 	cmd := 0.0
@@ -73,7 +70,7 @@ func TestPIDNoiseAttenuation(t *testing.T) {
 	prev := pos
 	for i := 0; i < 500; i++ {
 		target := 400 + rng.NormFloat64()*6 // noisy setpoint sigma=6
-		pos = hc.applyZoomPID(p, &cmd, pos, target, 1.0/24, 100000, 0)
+		pos = applyZoomPIDCalc(p, &cmd, pos, target, 1.0/24, 100000, 0)
 		deltas = append(deltas, pos-prev)
 		prev = pos
 	}
@@ -119,13 +116,12 @@ func TestPIDDeterminism(t *testing.T) {
 // never trigger the fast retarget allowance: every applied zoom step stays
 // inside the gentle zoomInMax cap.
 func TestZoomDriftStaysSmooth(t *testing.T) {
-	hc := &HoloCropper{}
 	p := newFramingZoom()
 	cropH, cmd := 400.0, 0.0
 	for i := 0; i < 200; i++ {
 		target := 400 + 0.2*float64(i) // 0.2 px/frame drift, well under any retarget gap
 		prev := cropH
-		cropH = hc.applyZoomPID(p, &cmd, cropH, target, 1.0/24, 10000, 0)
+		cropH = applyZoomPIDCalc(p, &cmd, cropH, target, 1.0/24, 10000, 0)
 		if d := math.Abs(cropH - prev); d > zoomInMax+1e-9 {
 			t.Fatalf("frame %d: drift step %.2f exceeded zoomInMax %.2f (retarget allowance leaked)", i, d, zoomInMax)
 		}
@@ -139,14 +135,13 @@ func TestZoomDriftStaysSmooth(t *testing.T) {
 // the frame (reacquire after subject loss) DO get the fast allowance - faster
 // than the base cap, but still bounded by zoomRetOutMax/zoomRetInMax.
 func TestZoomRetargetAllowanceGated(t *testing.T) {
-	hc := &HoloCropper{}
 	// grow: gap 3000 > 0.25*10000
 	p := newFramingZoom()
 	cropH, cmd := 400.0, 0.0
 	start, target := 400.0, 3400.0
 	for i := 0; i < 30; i++ {
 		prev := cropH
-		cropH = hc.applyZoomPID(p, &cmd, cropH, target, 1.0/24, 10000, 0)
+		cropH = applyZoomPIDCalc(p, &cmd, cropH, target, 1.0/24, 10000, 0)
 		if d := cropH - prev; d > zoomRetOutMax+1e-9 {
 			t.Fatalf("frame %d: zoom-out step %.2f exceeded zoomRetOutMax %.2f", i, d, zoomRetOutMax)
 		}
@@ -160,7 +155,7 @@ func TestZoomRetargetAllowanceGated(t *testing.T) {
 	maxD := 0.0
 	for i := 0; i < 30; i++ {
 		prev := cropH
-		cropH = hc.applyZoomPID(p, &cmd, cropH, -2600, 1.0/24, 10000, -6000)
+		cropH = applyZoomPIDCalc(p, &cmd, cropH, -2600, 1.0/24, 10000, -6000)
 		d := math.Abs(cropH - prev)
 		if d > zoomRetInMax+1e-9 {
 			t.Fatalf("frame %d: zoom-in step %.2f exceeded zoomRetInMax %.2f", i, d, zoomRetInMax)
@@ -177,10 +172,10 @@ func TestZoomRetargetAllowanceGated(t *testing.T) {
 /* aspect-locked target geometry tests (Phase 1 / Phase 4 / §12.7) */
 
 func TestAspectLockedTargetSquare1to1(t *testing.T) {
-	hc := &HoloCropper{Height: 240, Width: 240, srcH: 1080}
+	hc := &HoloCropper{Height: 240, srcH: 1080}
 	// subject bbox 111x422 in an 854x480 analysis frame from a 1080-tall source
 	bbox := image.Rect(300, 30, 411, 452)
-	w, h, _, cy := hc.aspectLockedTarget(bbox, 854, 480, 1)
+	w, h, _, cy := aspectLockedTargetCalc(hc.framingParams(), bbox, 854, 480, 1)
 	if h < 470 || h > 476 {
 		t.Fatalf("square crop height %.1f not ~473 (1.12x of 422)", h)
 	}
@@ -193,11 +188,11 @@ func TestAspectLockedTargetSquare1to1(t *testing.T) {
 }
 
 func TestAspectLockedTargetPortrait(t *testing.T) {
-	hc := &HoloCropper{Height: 648, Width: 200, srcH: 1080}
+	hc := &HoloCropper{Height: 648, srcH: 1080}
 	// 200:648 output, 1152x648 analysis frame, subject bbox 150x570.
 	// Containment fit: 1.18 * 570 = 673 clamps to the frame height.
 	bbox := image.Rect(500, 39, 650, 609)
-	w, h, _, _ := hc.aspectLockedTarget(bbox, 1152, 648, 200.0/648)
+	w, h, _, _ := aspectLockedTargetCalc(hc.framingParams(), bbox, 1152, 648, 200.0/648)
 	if h < 647 || h > 649 {
 		t.Fatalf("portrait crop height %.1f not clamped to frame height 648", h)
 	}
@@ -207,10 +202,10 @@ func TestAspectLockedTargetPortrait(t *testing.T) {
 }
 
 func TestAspectLockedTargetPortraitSmallSubjectZoomsIn(t *testing.T) {
-	hc := &HoloCropper{Height: 648, Width: 200, srcH: 1080}
+	hc := &HoloCropper{Height: 648, srcH: 1080}
 	// small subject 40x120: must zoom in to the floors, not stay full-frame
 	bbox := image.Rect(556, 264, 596, 384)
-	w, h, _, _ := hc.aspectLockedTarget(bbox, 1152, 648, 200.0/648)
+	w, h, _, _ := aspectLockedTargetCalc(hc.framingParams(), bbox, 1152, 648, 200.0/648)
 	// floor = max(outH*frameH/srcH, frameH/maxZoom) = max(388.8, 324) = 388.8
 	if h < 388 || h > 390 {
 		t.Fatalf("small-subject crop height %.1f not at floor ~389", h)
@@ -226,9 +221,9 @@ func TestAspectLockedTargetPortraitSmallSubjectZoomsIn(t *testing.T) {
 // containment plus side padding; the crop may overflow the frame's left/right
 // edges (bounded padding) and its bottom pins to the frame floor.
 func TestAspectLockedTargetLandscapeContainment(t *testing.T) {
-	hc := &HoloCropper{Height: 200, Width: 648, srcH: 1080}
+	hc := &HoloCropper{Height: 200, srcH: 1080}
 	bbox := image.Rect(252, 178, 602, 478) // 350x300, feet on the frame floor
-	w, h, cx, cy := hc.aspectLockedTarget(bbox, 854, 480, 648.0/200)
+	w, h, cx, cy := aspectLockedTargetCalc(hc.framingParams(), bbox, 854, 480, 648.0/200)
 	if h < 355 || h > 357 {
 		t.Fatalf("landscape crop height %.1f not ~356 (1.18x containment of 302)", h)
 	}
@@ -255,9 +250,9 @@ func TestAspectLockedTargetLandscapeContainment(t *testing.T) {
 // old maxZoom floor (240): for landscape the fit wins, and the feet stay
 // feetPadFraction*h above the crop bottom instead of the 25/75 slack split.
 func TestAspectLockedTargetLandscapeFeetAnchor(t *testing.T) {
-	hc := &HoloCropper{Height: 200, Width: 648, srcH: 1080}
+	hc := &HoloCropper{Height: 200, srcH: 1080}
 	bbox := image.Rect(177, 165, 677, 315) // 500x150
-	w, h, _, cy := hc.aspectLockedTarget(bbox, 854, 480, 648.0/200)
+	w, h, _, cy := aspectLockedTargetCalc(hc.framingParams(), bbox, 854, 480, 648.0/200)
 	if h < 181 || h > 183 {
 		t.Fatalf("landscape crop height %.1f not ~182 (containment fit 1.18*154.3)", h)
 	}
@@ -285,9 +280,9 @@ func TestAspectLockedTargetLandscapeFeetAnchor(t *testing.T) {
 // 350 px black stage padding per side) under the padded-width cap (1571)
 // and pins its bottom to the frame floor.
 func TestAspectLockedTargetLandscapeNoClipGuarantee(t *testing.T) {
-	hc := &HoloCropper{Height: 200, Width: 648, srcH: 1080}
+	hc := &HoloCropper{Height: 200, srcH: 1080}
 	bbox := image.Rect(212, 51, 412, 480) // 200x429, feet on the frame floor
-	w, h, _, cy := hc.aspectLockedTarget(bbox, 854, 480, 648.0/200)
+	w, h, _, cy := aspectLockedTargetCalc(hc.framingParams(), bbox, 854, 480, 648.0/200)
 	if h < float64(bbox.Dy()) {
 		t.Fatalf("crop height %.1f shorter than subject %d: head/feet would clip", h, bbox.Dy())
 	}
@@ -315,9 +310,9 @@ func TestAspectLockedTargetLandscapeNoClipGuarantee(t *testing.T) {
 // anchor to the floor: full-frame-height fit, bottom pinned to 480, head
 // clear of the crop top.
 func TestAspectLockedTargetLandscapeGroundSnap(t *testing.T) {
-	hc := &HoloCropper{Height: 200, Width: 648, srcH: 1080}
+	hc := &HoloCropper{Height: 200, srcH: 1080}
 	bbox := image.Rect(341, 98, 480, 427) // 139x329, 53 px floor gap
-	w, h, _, cy := hc.aspectLockedTarget(bbox, 854, 480, 648.0/200)
+	w, h, _, cy := aspectLockedTargetCalc(hc.framingParams(), bbox, 854, 480, 648.0/200)
 	if h < 449 || h > 452 {
 		t.Fatalf("crop height %.1f not the snapped fit 1.18*(480-98)~450.8", h)
 	}
@@ -336,9 +331,9 @@ func TestAspectLockedTargetLandscapeGroundSnap(t *testing.T) {
 // the frame floor is outside the snap band (jump): no snap, the fit uses the
 // actual bbox height and the feet anchor stays at bbox bottom + feet pad.
 func TestAspectLockedTargetLandscapeAirborneNoSnap(t *testing.T) {
-	hc := &HoloCropper{Height: 200, Width: 648, srcH: 1080}
+	hc := &HoloCropper{Height: 200, srcH: 1080}
 	bbox := image.Rect(341, 100, 480, 380) // 139x280, 100 px floor gap
-	_, h, _, cy := hc.aspectLockedTarget(bbox, 854, 480, 648.0/200)
+	_, h, _, cy := aspectLockedTargetCalc(hc.framingParams(), bbox, 854, 480, 648.0/200)
 	if h < 330 || h > 331 {
 		t.Fatalf("crop height %.1f not 1.18*280~330.4: snap fired on an airborne subject", h)
 	}
@@ -357,9 +352,9 @@ func TestAspectLockedTargetLandscapeAirborneNoSnap(t *testing.T) {
 // 1.18*dx/aspect, guaranteeing 7.6% of the crop width empty per side - well
 // over the 2% the owner asked for.
 func TestAspectLockedTargetLandscapeSidePadding169(t *testing.T) {
-	hc := &HoloCropper{Height: 288, Width: 512, srcH: 1080}
+	hc := &HoloCropper{Height: 288, srcH: 1080}
 	bbox := image.Rect(139, 215, 714, 473) // 575x258 group, feet near the frame floor
-	w, h, _, _ := hc.aspectLockedTarget(bbox, 854, 480, 512.0/288)
+	w, h, _, _ := aspectLockedTargetCalc(hc.framingParams(), bbox, 854, 480, 512.0/288)
 	if h < 381 || h > 383 {
 		t.Fatalf("crop height %.1f not the padded width fit ~381.7 (1.18*575/1.778)", h)
 	}
@@ -377,9 +372,9 @@ func TestAspectLockedTargetLandscapeSidePadding169(t *testing.T) {
 // every side keeps >= 2% of the crop width as empty stage, the crop bottom
 // still pins to the frame floor.
 func TestAspectLockedTargetLandscapeSidePadding324(t *testing.T) {
-	hc := &HoloCropper{Height: 200, Width: 648, srcH: 1080}
+	hc := &HoloCropper{Height: 200, srcH: 1080}
 	bbox := image.Rect(139, 215, 714, 473) // snapped: 265 tall, 575 wide
-	w, h, _, cy := hc.aspectLockedTarget(bbox, 854, 480, 648.0/200)
+	w, h, _, cy := aspectLockedTargetCalc(hc.framingParams(), bbox, 854, 480, 648.0/200)
 	if h < 312 || h > 314 {
 		t.Fatalf("crop height %.1f not the snapped fit 1.18*(480-215)~312.7", h)
 	}
@@ -395,13 +390,13 @@ func TestAspectLockedTargetLandscapeSidePadding324(t *testing.T) {
 }
 
 func TestAspectLockedTargetPortraitContainsWideSubject(t *testing.T) {
-	hc := &HoloCropper{Height: 648, Width: 200, srcH: 1080}
+	hc := &HoloCropper{Height: 648, srcH: 1080}
 	// 200x400 subject (twin-tails spread wide): the containment fit must keep
 	// the whole subject - feet included - in frame even though the crop then
 	// runs to the full analysis-frame height. Feat clipping (the old
 	// height-dominant fit) was rejected on vision review (§12.7).
 	bbox := image.Rect(480, 124, 680, 524) // 200x400
-	w, h, _, _ := hc.aspectLockedTarget(bbox, 1152, 648, 200.0/648)
+	w, h, _, _ := aspectLockedTargetCalc(hc.framingParams(), bbox, 1152, 648, 200.0/648)
 	if h < 647 || h > 648 {
 		t.Fatalf("portrait crop height %.1f not at frame height: subject not contained", h)
 	}
@@ -414,12 +409,12 @@ func TestAspectLockedTargetPortraitContainsWideSubject(t *testing.T) {
 }
 
 func TestAspectLockedTargetPortraitFeetAnchor(t *testing.T) {
-	hc := &HoloCropper{Height: 648, Width: 200, srcH: 1080}
+	hc := &HoloCropper{Height: 648, srcH: 1080}
 	// feet-priority anchoring: subject 150x300 with feet at y=600; the crop
 	// bottom must sit feetPadFraction*h below the feet, all slack above the
 	// head. bbox width 150 -> width containment drives h: 486*1.18 = 573.5.
 	bbox := image.Rect(500, 300, 650, 600)
-	_, h, _, cy := hc.aspectLockedTarget(bbox, 1152, 648, 200.0/648)
+	_, h, _, cy := aspectLockedTargetCalc(hc.framingParams(), bbox, 1152, 648, 200.0/648)
 	if h < 571 || h > 575 {
 		t.Fatalf("portrait crop height %.1f not ~573 (containment fit)", h)
 	}
@@ -435,7 +430,6 @@ func TestAspectLockedTargetPortraitFeetAnchor(t *testing.T) {
 /* plant rate-limit tests: caps scale with the crop's own span (§12.7) */
 
 func TestPanRateLimitsAreCropRelative(t *testing.T) {
-	hc := &HoloCropper{}
 	for _, c := range []struct {
 		span, floor float64
 	}{{160, panFloorX}, {473, panFloorX}, {264, panFloorY}, {30, panFloorX}} {
@@ -443,7 +437,7 @@ func TestPanRateLimitsAreCropRelative(t *testing.T) {
 		cmd, pos, prev := 0.0, 0.0, 0.0
 		maxDelta := 0.0
 		for i := 0; i < 40; i++ {
-			pos = hc.applyAxisPID(p, &cmd, pos, 1000, 1.0/24, c.span, c.floor)
+			pos = applyAxisPIDCalc(p, &cmd, pos, 1000, 1.0/24, c.span, c.floor)
 			d := math.Abs(pos - prev)
 			prev = pos
 			if d > maxDelta {
@@ -462,7 +456,6 @@ func TestPanRateLimitsAreCropRelative(t *testing.T) {
 }
 
 func TestPanTracksWalkingSubjectPortrait(t *testing.T) {
-	hc := &HoloCropper{}
 	p := NewPIDController(framingPanKp, framingPanKi, 0, framingPanIntegral)
 	const cropW = 160.0 // 200:648 crop in a 1152-wide analysis frame
 	const walk = 8.0    // px/frame steady subject x-speed
@@ -476,7 +469,7 @@ func TestPanTracksWalkingSubjectPortrait(t *testing.T) {
 		vx += velAlpha * ((subject - prevSubject) - vx)
 		prevSubject = subject
 		// the shipped loop applies the smoothed velocity lead to the target
-		pos = hc.applyAxisPID(p, &cmd, pos, subject+velLeadFrames*vx, 1.0/24, cropW, panFloorX)
+		pos = applyAxisPIDCalc(p, &cmd, pos, subject+velLeadFrames*vx, 1.0/24, cropW, panFloorX)
 		if i > 120 {
 			if lag := math.Abs(pos - subject); lag > maxLag {
 				maxLag = lag
@@ -495,7 +488,6 @@ func TestPanTracksWalkingSubjectPortrait(t *testing.T) {
 /* framing state -> crop rect tests */
 
 func TestCropRectAlwaysInsideFrame(t *testing.T) {
-	hc := &HoloCropper{Height: 648, Width: 200}
 	bounds := image.Rect(0, 0, 1152, 648)
 	cases := []struct{ cx, cy, w, h float64 }{
 		{10, 10, 200, 648},     // pushed out top-left
@@ -504,7 +496,7 @@ func TestCropRectAlwaysInsideFrame(t *testing.T) {
 	}
 	for _, c := range cases {
 		// portrait/square pass padAllow = 0: fully in-frame clamp (F3/F4)
-		r := hc.cropRectFromFraming(c.cx, c.cy, c.w, c.h, 0, bounds)
+		r := cropRectFromFramingCalc(c.cx, c.cy, c.w, c.h, 0, bounds)
 		if !r.In(bounds) {
 			t.Fatalf("crop %v escapes frame %v", r, bounds)
 		}
@@ -518,12 +510,11 @@ func TestCropRectAlwaysInsideFrame(t *testing.T) {
 // the frame's left/right edges, but never past the allowance, never
 // vertically, and never at the cost of the aspect lock.
 func TestCropRectLandscapePadding(t *testing.T) {
-	hc := &HoloCropper{Height: 200, Width: 648}
 	bounds := image.Rect(0, 0, 854, 480)
 	padAllow := landscapePadCapFrac * 854
 	// subject pinned hard against the left edge: cx would sit far out of the
 	// in-frame clamp window
-	r := hc.cropRectFromFraming(100, 312, 1090, 336, padAllow, bounds)
+	r := cropRectFromFramingCalc(100, 312, 1090, 336, padAllow, bounds)
 	if r.Dx() != 1090 {
 		t.Fatalf("crop width %d not 1090: aspect lock broken by edge clamp", r.Dx())
 	}
@@ -549,7 +540,6 @@ func TestCropRectLandscapePadding(t *testing.T) {
 // TestCropToBBoxBlackPadding: crop regions outside the frame compose as
 // black stage padding; in-frame regions copy the source pixels.
 func TestCropToBBoxBlackPadding(t *testing.T) {
-	hc := &HoloCropper{Height: 200, Width: 648}
 	src := image.NewRGBA(image.Rect(0, 0, 854, 480))
 	filled := color.RGBA{R: 20, G: 200, B: 60, A: 255}
 	for y := 0; y < 480; y++ {
@@ -557,7 +547,7 @@ func TestCropToBBoxBlackPadding(t *testing.T) {
 			src.Set(x, y, filled)
 		}
 	}
-	dst := hc.cropToBBox(src, image.Rect(-120, 0, 240, 480))
+	dst := cropToBBoxCalc(src, image.Rect(-120, 0, 240, 480))
 	if dst.Bounds() != image.Rect(0, 0, 360, 480) {
 		t.Fatalf("padded crop bounds %v not the full rect extent", dst.Bounds())
 	}
