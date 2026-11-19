@@ -188,6 +188,10 @@ func (hc *HoloCropper) calcVideo() {
 	hasPrevEc := false
 
 	var frameW, frameH, cropFloor float64
+	// maxCropW bounds the crop width (frame width, plus the black stage
+	// padding allowance per side for landscape outputs); landscapePad is the
+	// cx clamp allowance (§12.8, video_dsp.go).
+	var maxCropW, landscapePad float64
 	initialized := false
 	frame := 0
 
@@ -215,6 +219,19 @@ func (hc *HoloCropper) calcVideo() {
 					floor = math.Max(floor, float64(hc.Height)*frameH/float64(hc.srcH))
 				}
 				cropFloor = math.Min(floor, frameH)
+				maxCropW, landscapePad = frameW, 0
+				if aspect >= 2 {
+					// Landscape containment fit (§12.8): the maxZoom policy cap
+					// yields to the full-subject fit, only the no-upscale floor
+					// stays absolute, and the crop may overflow the frame sides
+					// by up to landscapePadCapFrac per side as black padding.
+					landscapePad = landscapePadCapFrac * frameW
+					maxCropW = frameW + 2*landscapePad
+					cropFloor = 0
+					if hc.srcH > 0 {
+						cropFloor = math.Min(float64(hc.Height)*frameH/float64(hc.srcH), frameH)
+					}
+				}
 				initialized = true
 			}
 
@@ -277,7 +294,12 @@ func (hc *HoloCropper) calcVideo() {
 			if lost {
 				// Hold the last crop center, open toward full frame at rate
 				// limit. Replaces the old hard panAdj=0 snap (F5/gate reset).
+				// For landscape, "full frame" is the widest aspect-locked crop
+				// the padding cap allows (§12.8).
 				tgtH = frameH
+				if tgtH*aspect > maxCropW {
+					tgtH = maxCropW / aspect
+				}
 			}
 
 			// Plant updates. Zoom first so pan spans see this frame's crop
@@ -286,22 +308,27 @@ func (hc *HoloCropper) calcVideo() {
 			// switching, §12.7). The velocity lead kills the walk lag.
 			cropH = hc.applyZoomPID(pidZ, &cmdZ, cropH, tgtH, dt, frameH, cropFloor)
 			cropW := cropH * aspect
-			if cropW > frameW {
-				cropW = frameW
+			if cropW > maxCropW {
+				// Keep the aspect lock when the crop hits the padded width cap
+				cropW = maxCropW
+				cropH = cropW / aspect
 			}
 			cropCx = hc.applyAxisPID(panX, &cmdX, cropCx, tgtCx+velLeadFrames*vx, dt, cropW, panFloorX)
 			cropCy = hc.applyAxisPID(panY, &cmdY, cropCy, tgtCy+velLeadFrames*vy, dt, cropH, panFloorY)
 
-			// Clamp plant to frame so the crop never leaves the frame
-			// (no out-of-frame transparent padding, HIGH-ASPECT-RATIO-FIXES.md F3/F4).
-			cropCx = clampF(cropCx, cropW/2, frameW-cropW/2)
+			// Clamp plant to frame: vertical always fully inside; horizontally
+			// the crop may extend past the frame edges by up to landscapePad
+			// per side (limited black stage padding for extreme landscape
+			// outputs, §12.8). Portrait/square keep the old fully in-frame
+			// clamp (landscapePad = 0 there, F3/F4).
+			cropCx = clampF(cropCx, cropW/2-landscapePad, frameW-cropW/2+landscapePad)
 			cropCy = clampF(cropCy, cropH/2, frameH-cropH/2)
 
 			dbg.line(frame, mask.Subj, bbox, ema, cropCx, cropCy, cropW, cropH, tgtH)
 
 			// Send to next pipe
 			if hc.procFrameQueue4 != nil {
-				hc.procFrameQueue4 <- &ImageCropMask{CBox: hc.cropRectFromFraming(cropCx, cropCy, cropW, cropH, bounds), Image: mask.Image, zoom: hc.zoom}
+				hc.procFrameQueue4 <- &ImageCropMask{CBox: hc.cropRectFromFraming(cropCx, cropCy, cropW, cropH, landscapePad, bounds), Image: mask.Image, zoom: hc.zoom}
 			}
 		}
 	}
@@ -360,7 +387,8 @@ func (hc *HoloCropper) cropVideo() {
 				return
 			}
 
-			// Crop to bounding box (always clamped inside the frame)
+			// Crop to the framed region (out-of-frame sides compose as black
+			// stage padding for landscape, §12.8)
 			croppedImg := hc.cropToBBox(mask.Image, mask.CBox)
 
 			// Scale the framed region to fill the exact output size

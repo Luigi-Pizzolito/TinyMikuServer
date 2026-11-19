@@ -233,14 +233,16 @@ func (hc *HoloCropper) totalBoundingBox(rectangles []image.Rectangle) image.Rect
 }
 
 // aspectLockedTarget computes the desired crop from a (smoothed) subject
-// bounding box: a rectangle locked to the output aspect ratio, fitted on the
-// dominant axis (fitDominantAxis), padded by hc.zoomMargin, with zoom-in
-// floors:
+// bounding box: a rectangle locked to the output aspect ratio, padded by
+// hc.zoomMargin, with zoom-in floors:
 //  1. never upscale above the source resolution (cropH >= outH * frameH / srcH)
-//  2. policy maxZoom (cropH >= frameH / maxZoom)
-//  3. extreme landscape ratios (aspect >= 2): cropH >= 0.6 * subject height
-//     so a tall subject is never reduced to a sliver; head/torso priority
-//     centering is used there (HIGH-ASPECT-RATIO-FIXES.md Phase 1/4).
+//  2. policy maxZoom (cropH >= frameH / maxZoom) - relaxed for extreme
+//     landscape outputs, where full-subject containment outranks it (§12.8)
+//  3. extreme portrait (aspect < 0.5) and landscape (aspect >= 2) use a
+//     containment fit: the crop must hold the whole padded subject. For
+//     landscape this can require limited black padding beyond the frame's
+//     left/right edges (landscapePadCapFrac), and the crop is anchored so
+//     the feet sit at the stage floor (frame bottom). Square outputs center.
 // Returns (width, height, centerX, centerY) in analysis-frame pixels.
 func (hc *HoloCropper) aspectLockedTarget(bbox image.Rectangle, frameW, frameH, aspect float64) (float64, float64, float64, float64) {
 	margin := hc.zoomMargin()
@@ -256,8 +258,17 @@ func (hc *HoloCropper) aspectLockedTarget(bbox image.Rectangle, frameW, frameH, 
 		// margin around the subject in the containment regime.
 		containMargin := math.Max(margin, portraitContainMargin)
 		h = math.Max(float64(bbox.Dy()), float64(bbox.Dx())/aspect) * containMargin
+	} else if aspect >= 2 {
+		// Wide outputs (e.g. 648:200): containment fit as well (§12.8). An
+		// aspect-locked crop inside a 16:9 analysis frame can never be taller
+		// than frameW/aspect (~264 px), shorter than a standing subject
+		// (~300 px), so keeping the feet in frame forced clipping. The crop
+		// now grows past the frame's left/right edges (capped below) with
+		// black stage padding - the owner's accepted trade: fitting the full
+		// subject outranks maximal subject scale.
+		h = math.Max(float64(bbox.Dy()), float64(bbox.Dx())/aspect) * margin
 	} else {
-		// Square/wide outputs: dominant-axis fit. Cover the subject height and
+		// Square outputs: dominant-axis fit. Cover the subject height and
 		// at least widthCoverFrac of its width; trailing limbs clip rather
 		// than the crop ballooning.
 		h = float64(bbox.Dy()) * margin
@@ -267,52 +278,53 @@ func (hc *HoloCropper) aspectLockedTarget(bbox image.Rectangle, frameW, frameH, 
 	}
 	w := h * aspect
 
-	// Stay inside the analysis frame: no out-of-frame padding, no shrink below
-	// source scale. Width constrains landscape outputs.
-	if w > frameW {
-		w = frameW
-		h = w / aspect
-	}
+	// Vertical is always inside the frame (no out-of-frame vertical padding).
+	// Width is inside the frame except for landscape, where the containment
+	// fit may overflow by up to landscapePadCapFrac of the frame per side.
 	if h > frameH {
 		h = frameH
 		w = h * aspect
 	}
-
-	// Zoom-in floors
-	minH := frameH / hc.maxZoom()
-	if hc.srcH > 0 {
-		minH = math.Max(minH, float64(hc.Height)*frameH/float64(hc.srcH))
-	}
+	maxW := frameW
 	if aspect >= 2 {
-		minH = math.Max(minH, 0.6*float64(bbox.Dy()))
+		maxW = frameW * (1 + 2*landscapePadCapFrac)
+	}
+	if w > maxW {
+		w = maxW
+		h = w / aspect
+	}
+
+	// Zoom-in floors. The no-upscale floor is always absolute; the policy
+	// maxZoom floor is relaxed for landscape, where the containment fit wins.
+	srcFloor := 0.0
+	if hc.srcH > 0 {
+		srcFloor = float64(hc.Height) * frameH / float64(hc.srcH)
+	}
+	minH := math.Max(frameH/hc.maxZoom(), srcFloor)
+	if aspect >= 2 {
+		minH = math.Max(srcFloor, math.Min(minH, h))
 	}
 	if h < minH {
 		h = minH
-		w = minH * aspect
-	}
-	if w > frameW {
-		w = frameW
+		w = h * aspect
+		if w > maxW {
+			w = maxW
+			h = w / aspect
+		}
 	}
 
 	cx := float64(bbox.Min.X+bbox.Max.X) / 2
 	cy := float64(bbox.Min.Y+bbox.Max.Y) / 2
 	switch {
-	case aspect >= 2:
-		// Top-aligned framing for extreme landscape: when the subject is
-		// taller than the crop its top edge sits at the crop top, so the
-		// output never carries an empty strip above the head (legs overflow
-		// the bottom instead). When the subject is shorter than the crop, the
-		// slack is distributed 25/75 top/bottom so the head still hugs the
-		// top edge (documented policy, HIGH-ASPECT-RATIO-FIXES.md Phase 4).
-		dy := float64(bbox.Dy())
-		cy = float64(bbox.Min.Y) + 0.5*math.Min(h, dy) + 0.25*math.Max(0, h-dy)
-	case aspect < 0.5:
-		// Feet-priority anchoring for tall outputs: the subject's feet sit a
-		// stable pad (feetPadFraction of the crop, ~5%) above the crop bottom
-		// and all remaining slack goes above the head. Dark footwear on dark
-		// stages is routinely under-masked by a few pixels; centering left the
-		// feet on or past the crop edge in 2-7% of corpus frames.
+	case aspect >= 2, aspect < 0.5:
+		// Feet-priority anchoring for both containment regimes: the
+		// subject's feet sit a stable pad (feetPadFraction of the crop)
+		// above the crop bottom and all remaining slack goes above the head.
+		// In these videos the stage floor is the frame bottom, so for
+		// grounded subjects the clamp below pins the crop bottom exactly to
+		// the frame floor - the feet line is geometrically stable.
 		cy = float64(bbox.Max.Y) - h/2 + feetPadFraction*h
+		cy = clampF(cy, h/2, frameH-h/2)
 	}
 
 	return w, h, cx, cy
@@ -323,6 +335,12 @@ func (hc *HoloCropper) aspectLockedTarget(bbox image.Rectangle, frameW, frameH, 
 // HIGH-ASPECT-RATIO-FIXES.md §12.7). Landscape/square fits keep the user's
 // hc.zoomMargin.
 const portraitContainMargin = 1.18
+
+// landscapePadCapFrac caps how far the landscape containment fit may push the
+// crop past each side of the analysis frame as black stage padding (§12.8).
+// 0.17 of an 854-wide frame is ~145 px per side, enough for the corpus'
+// 275-300 px tall subjects under a 3.24:1 output aspect.
+const landscapePadCapFrac = 0.17
 
 // widthCoverFrac is the minimum fraction of the subject bbox width the crop
 // must cover. Tall output ratios clip trailing limbs/props rather than
@@ -340,23 +358,33 @@ func widthCoverFrac(aspect float64) float64 {
 }
 
 // cropRectFromFraming converts the smoothed float framing state into an
-// integer crop rectangle clamped fully inside the frame.
-func (hc *HoloCropper) cropRectFromFraming(cx, cy, w, h float64, bounds image.Rectangle) image.Rectangle {
+// integer crop rectangle. Vertical extents always stay inside the frame;
+// horizontally the rect may extend past the frame's left/right edges by up
+// to padAllow pixels per side (landscape containment padding, §12.8), and
+// the x clamp window stays valid as long as padAllow >= (w - fw) / 2.
+// cropToBBox composes the out-of-frame regions as black stage padding.
+func (hc *HoloCropper) cropRectFromFraming(cx, cy, w, h, padAllow float64, bounds image.Rectangle) image.Rectangle {
 	fw, fh := float64(bounds.Dx()), float64(bounds.Dy())
-	cx = clampF(cx, w/2, fw-w/2)
+	cx = clampF(cx, w/2-padAllow, fw-w/2+padAllow)
 	cy = clampF(cy, h/2, fh-h/2)
 	x0 := int(math.Round(cx - w/2))
 	y0 := int(math.Round(cy - h/2))
 	x1 := x0 + int(math.Round(w))
 	y1 := y0 + int(math.Round(h))
-	if x1 > bounds.Max.X {
-		x1 = bounds.Max.X
+	// The x edges are deliberately not clamped to the frame: shaving them
+	// would break the aspect lock. Only a degenerate caller (crop wider than
+	// frame + 2*padAllow) gets trimmed to the padded frame edges.
+	loX := bounds.Min.X - int(math.Round(padAllow))
+	hiX := bounds.Max.X + int(math.Round(padAllow))
+	if x1 > hiX {
+		x1 = hiX
 	}
+	if x0 < loX {
+		x0 = loX
+	}
+	// Only y can trim to the frame: cy is always fully in-frame.
 	if y1 > bounds.Max.Y {
 		y1 = bounds.Max.Y
-	}
-	if x0 < bounds.Min.X {
-		x0 = bounds.Min.X
 	}
 	if y0 < bounds.Min.Y {
 		y0 = bounds.Min.Y
@@ -364,22 +392,25 @@ func (hc *HoloCropper) cropRectFromFraming(cx, cy, w, h float64, bounds image.Re
 	return image.Rect(x0, y0, x1, y1)
 }
 
-// Function to crop a frame to a bounding box. The crop rect is always
-// intersected with the frame: out-of-frame regions can no longer leak through
-// as transparent (black) padding (HIGH-ASPECT-RATIO-FIXES.md F3/F4).
+// Function to crop a frame to a bounding box. The rect may extend past the
+// frame's left/right edges (landscape containment padding, §12.8): those
+// regions are composed as black stage padding. Vertical extents stay inside
+// the frame, so out-of-frame vertical padding can never leak through
+// (HIGH-ASPECT-RATIO-FIXES.md F3/F4).
 func (hc *HoloCropper) cropToBBox(src *image.RGBA, cropRect image.Rectangle) *image.RGBA {
-	cr := cropRect.Intersect(src.Bounds())
+	cr := cropRect
 	if cr.Empty() {
 		// Degenerate guard: never produce an empty image
 		mn := src.Bounds().Min
 		cr = image.Rect(mn.X, mn.Y, mn.X+1, mn.Y+1)
 	}
 
-	// Create a new RGBA image for the cropped portion
-	dst := image.NewRGBA(cr)
-
-	// Copy the cropped portion from the source image to the destination image
-	draw.Draw(dst, cr, src, cr.Min, draw.Src)
+	// Destination is normalised to Min=(0,0) with the crop's full extent;
+	// regions of the crop that lie outside the frame stay zeroed (black).
+	dst := image.NewRGBA(image.Rect(0, 0, cr.Dx(), cr.Dy()))
+	if inter := cr.Intersect(src.Bounds()); !inter.Empty() {
+		draw.Draw(dst, inter.Sub(cr.Min), src, inter.Min, draw.Src)
+	}
 
 	return dst
 }

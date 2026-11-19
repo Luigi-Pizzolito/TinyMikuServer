@@ -2,6 +2,7 @@ package holocropper
 
 import (
 	"image"
+	"image/color"
 	"math"
 	"math/rand"
 	"testing"
@@ -219,47 +220,82 @@ func TestAspectLockedTargetPortraitSmallSubjectZoomsIn(t *testing.T) {
 	}
 }
 
-func TestAspectLockedTargetExtremeLandscapePriorityFit(t *testing.T) {
+// TestAspectLockedTargetLandscapeContainment: the shipped landscape policy
+// (§12.8). A 350x300 subject needs a 336-tall crop for full containment;
+// the crop may overflow the frame's left/right edges (bounded padding) and
+// its bottom pins to the frame floor for a grounded subject.
+func TestAspectLockedTargetLandscapeContainment(t *testing.T) {
 	hc := &HoloCropper{Height: 200, Width: 648, srcH: 1080}
-	// 648x200 output: a tall narrow subject (111x422) cannot fit any legal
-	// crop; expect frame-width clamp, height >= 0.6*bbox, head-biased center
-	bbox := image.Rect(300, 30, 411, 452)
+	bbox := image.Rect(252, 178, 602, 478) // 350x300, feet on the frame floor
 	w, h, cx, cy := hc.aspectLockedTarget(bbox, 854, 480, 648.0/200)
-	if w > 854.001 {
-		t.Fatalf("landscape crop width %.1f exceeds frame", w)
+	if h < 335 || h > 337 {
+		t.Fatalf("landscape crop height %.1f not ~336 (1.12x containment of 300)", h)
 	}
-	if h < 260 || h > 268 {
-		t.Fatalf("landscape crop height %.1f not ~264 (frame-width clamp)", h)
+	if h < float64(bbox.Dy())-0.5 {
+		t.Fatalf("crop height %.1f shorter than subject %d: feet would clip", h, bbox.Dy())
 	}
-	if h < 0.6*float64(bbox.Dy())-1 {
-		t.Fatalf("landscape crop height %.1f below 0.6*bbox subject-fit floor", h)
+	if w < 1087 || w > 1090 {
+		t.Fatalf("landscape crop width %.1f not ~1089 (aspect locked)", w)
 	}
-	wantCy := float64(bbox.Min.Y) + 0.5*h // subject taller than crop => exactly top-aligned
-	if math.Abs(cy-wantCy) > 1 {
-		t.Fatalf("landscape centroid %.1f != top-aligned %.1f", cy, wantCy)
+	pad := (w - 854) / 2
+	if pad > landscapePadCapFrac*854+1 {
+		t.Fatalf("side padding %.1f exceeds cap %.1f", pad, landscapePadCapFrac*854)
+	}
+	if math.Abs(cy+h/2-480) > 0.5 {
+		t.Fatalf("crop bottom %.1f not pinned to the frame floor 480", cy+h/2)
 	}
 	if math.Abs(cx-float64(bbox.Dx())/2-float64(bbox.Min.X)) > 1 {
 		t.Fatalf("landscape center x %.1f not bbox center", cx)
 	}
 }
 
-func TestAspectLockedTargetLandscapeShortSubjectSlackSplit(t *testing.T) {
+// TestAspectLockedTargetLandscapeFeetAnchor: short subject (500x150) in the
+// landscape containment regime. The containment fit (172.8) sits below the
+// old maxZoom floor (240): for landscape the fit wins, and the feet stay
+// feetPadFraction*h above the crop bottom instead of the 25/75 slack split.
+func TestAspectLockedTargetLandscapeFeetAnchor(t *testing.T) {
 	hc := &HoloCropper{Height: 200, Width: 648, srcH: 1080}
-	// short wide subject 500x150 in 854x480 frame: crop must cover full width
-	// (560*aspect>frame) - slack above subject height splits 25/75 so the top
-	// strip stays small.
 	bbox := image.Rect(177, 165, 677, 315) // 500x150
 	w, h, _, cy := hc.aspectLockedTarget(bbox, 854, 480, 648.0/200)
-	if h < 154 {
-		t.Fatalf("landscape crop height %.1f below subject+margin", h)
+	if h < 171 || h > 174 {
+		t.Fatalf("landscape crop height %.1f not ~173 (containment fit 1.12*154.3)", h)
 	}
-	topGap := float64(bbox.Min.Y) - (cy - h/2) // empty strip above subject top
-	botGap := (cy + h/2) - (float64(bbox.Min.Y) + float64(bbox.Dy())) // empty strip below subject bottom
-	if topGap > 0.4*(h-float64(bbox.Dy()))+1 || topGap < -1 {
-		t.Fatalf("top gap %.1f not ~25%% of slack (bottom gap %.1f, crop %.1fx%.1f)", topGap, botGap, w, h)
+	if h >= 480/2.0 {
+		t.Fatalf("crop height %.1f not relaxed below the maxZoom floor 240", h)
 	}
-	if botGap < topGap-1 {
-		t.Fatalf("slack not bottom-biased: top %.1f bottom %.1f", topGap, botGap)
+	if math.Abs(w-h*(648.0/200)) > 1e-9 {
+		t.Fatalf("crop %.1fx%.1f not aspect locked", w, h)
+	}
+	gap := (cy + h/2) - float64(bbox.Max.Y) // empty strip below the feet
+	if want := feetPadFraction * h; math.Abs(gap-want) > 0.5 {
+		t.Fatalf("feet gap %.1f != feetPadFraction*h %.1f", gap, want)
+	}
+	if topGap := float64(bbox.Min.Y) - (cy - h/2); topGap < -1 {
+		t.Fatalf("head clipped: top gap %.1f", topGap)
+	}
+	if cy+h/2 > 480 || cy-h/2 < 0 {
+		t.Fatalf("crop leaves the frame vertically: [%.1f, %.1f]", cy-h/2, cy+h/2)
+	}
+}
+
+// TestAspectLockedTargetLandscapePadCap: a subject so tall that even the
+// padded-width cap fit must clip some margin: the crop caps at
+// frameW*(1+2*landscapePadCapFrac) and still contains the subject height.
+func TestAspectLockedTargetLandscapePadCap(t *testing.T) {
+	hc := &HoloCropper{Height: 200, Width: 648, srcH: 1080}
+	bbox := image.Rect(327, 150, 527, 480) // 200x330, feet on the frame floor
+	w, h, _, cy := hc.aspectLockedTarget(bbox, 854, 480, 648.0/200)
+	if w > 854*(1+2*landscapePadCapFrac)+1 {
+		t.Fatalf("crop width %.1f exceeds padded cap %.1f", w, 854*(1+2*landscapePadCapFrac))
+	}
+	if h < 352 || h > 354 {
+		t.Fatalf("crop height %.1f not ~353 (cap fit)", h)
+	}
+	if h < float64(bbox.Dy())-0.5 {
+		t.Fatalf("crop height %.1f shorter than subject %d: feet would clip", h, bbox.Dy())
+	}
+	if math.Abs(cy+h/2-480) > 0.5 {
+		t.Fatalf("crop bottom %.1f not pinned to the frame floor 480", cy+h/2)
 	}
 }
 
@@ -372,12 +408,69 @@ func TestCropRectAlwaysInsideFrame(t *testing.T) {
 		{576, 324, 2000, 6480}, // absurd oversize
 	}
 	for _, c := range cases {
-		r := hc.cropRectFromFraming(c.cx, c.cy, c.w, c.h, bounds)
+		// portrait/square pass padAllow = 0: fully in-frame clamp (F3/F4)
+		r := hc.cropRectFromFraming(c.cx, c.cy, c.w, c.h, 0, bounds)
 		if !r.In(bounds) {
 			t.Fatalf("crop %v escapes frame %v", r, bounds)
 		}
 		if r.Empty() {
 			t.Fatalf("crop %v degenerated to empty", r)
 		}
+	}
+}
+
+// TestCropRectLandscapePadding: with a landscape padAllow the rect may leave
+// the frame's left/right edges, but never past the allowance, never
+// vertically, and never at the cost of the aspect lock.
+func TestCropRectLandscapePadding(t *testing.T) {
+	hc := &HoloCropper{Height: 200, Width: 648}
+	bounds := image.Rect(0, 0, 854, 480)
+	padAllow := landscapePadCapFrac * 854
+	// subject pinned hard against the left edge: cx would sit far out of the
+	// in-frame clamp window
+	r := hc.cropRectFromFraming(100, 312, 1090, 336, padAllow, bounds)
+	if r.Dx() != 1090 {
+		t.Fatalf("crop width %d not 1090: aspect lock broken by edge clamp", r.Dx())
+	}
+	if left := -r.Min.X; left < 0 || float64(left) > padAllow+1 {
+		t.Fatalf("left overflow %d outside [0, %.1f]", left, padAllow)
+	}
+	if right := r.Max.X - 854; right < 0 || float64(right) > padAllow+1 {
+		t.Fatalf("right overflow %d outside [0, %.1f]", right, padAllow)
+	}
+	if r.Min.X >= 0 && r.Max.X <= 854 {
+		t.Fatalf("crop %v never used the padding allowance it was given", r)
+	}
+	if r.Min.Y < 0 || r.Max.Y > 480 {
+		t.Fatalf("crop %v escaped the frame vertically", r)
+	}
+}
+
+// TestCropToBBoxBlackPadding: crop regions outside the frame compose as
+// black stage padding; in-frame regions copy the source pixels.
+func TestCropToBBoxBlackPadding(t *testing.T) {
+	hc := &HoloCropper{Height: 200, Width: 648}
+	src := image.NewRGBA(image.Rect(0, 0, 854, 480))
+	filled := color.RGBA{R: 20, G: 200, B: 60, A: 255}
+	for y := 0; y < 480; y++ {
+		for x := 0; x < 854; x++ {
+			src.Set(x, y, filled)
+		}
+	}
+	dst := hc.cropToBBox(src, image.Rect(-120, 0, 240, 480))
+	if dst.Bounds() != image.Rect(0, 0, 360, 480) {
+		t.Fatalf("padded crop bounds %v not the full rect extent", dst.Bounds())
+	}
+	if got := dst.At(0, 240); got != (color.RGBA{0, 0, 0, 0}) {
+		t.Fatalf("out-of-frame padding pixel %v not transparent black", got)
+	}
+	if got := dst.At(119, 240); got != (color.RGBA{0, 0, 0, 0}) {
+		t.Fatalf("out-of-frame padding pixel %v not transparent black", got)
+	}
+	if got := dst.At(120, 240); got != filled {
+		t.Fatalf("in-frame pixel %v not copied from source", got)
+	}
+	if got := dst.At(359, 479); got != filled {
+		t.Fatalf("in-frame pixel %v not copied from source", got)
 	}
 }
