@@ -441,3 +441,41 @@ Second visual review of the §12.6 renders flagged three framing-quality faults,
 **Visual verification.** Side-by-side montages (sim crop applied to original 60 fps frames vs shipped renders) selected the containment candidate over dominant-fit and tighter-margin variants; final contact sheets at every previously flagged timestamp (dissapearance f2184 torso-clip, walking frames, floor-standing poses, kneeling poses, arm-spread poses, tbaka group) show feet stable at the bottom with pad, full subject in frame, and no excessive zoom.
 
 Unit tests: 16 total (+`TestZoomDriftStaysSmooth`, +`TestZoomRetargetAllowanceGated`, +`TestAspectLockedTargetPortraitContainsWideSubject`, +`TestAspectLockedTargetPortraitFeetAnchor`, +`TestPanRateLimitsAreCropRelative`; walk-tracking and plant tests rewritten against the new PI + command-EMA signatures).
+
+### 12.8 Landscape containment fit: floor-anchored zoom window with capped stage padding (2026-11-19)
+
+Third visual review: landscape 648x200 framing cut feet. The owner's spec for landscape: **"fit full subject in is the most important"** - the whole body, above all the feet, must always be in frame; a smaller subject scale is accepted and deferred to a dedicated landscape-scale pass.
+
+**The structural problem.** The Phase-4 landscape policy capped the crop at the frame width: max in-frame height 854 / 3.24 = **264 analysis px**, while the corpus' standing subjects are 275-301 px tall (merged bboxes to 353 px with hair, 387-480 px in extreme poses). Full containment was geometrically impossible inside the frame, so the top-anchor 25/75 slack split kept the head framed and cut feet instead: measured true feet-clips (crop shorter than the bbox while the subject stands fully inside the frame) on the sweep windows: **235/394, 935/1158, 1117/1242, 29/339** frames (dissapearance / retrynow / sweetdevil / tbaka), worst cuts 51-89 px out.
+
+**Fix (geometry + plant).** Landscape (aspect >= 2) now uses the same containment policy as portrait, plus a bounded escape past the frame's sides:
+
+1. **Containment fit**: `h = max(bbox_h, bbox_w / aspect) x zoomMargin` (1.12). The old `0.6 x bbox_h` landscape floor and the top-anchor slack split are gone.
+2. **Capped side padding**: the crop width may overflow the frame's left/right edges by `landscapePadCapFrac = 0.17` per side - `maxCropW = 1.34 x frameW` (1144 analysis px), max crop height 353 px. **Vertical padding is never allowed**: cy stays fully in-frame, so F3/F4 (no out-of-frame leakage) hold vertically exactly as before. `cropToBBox` composes out-of-frame columns as transparent-black stage padding; `cropRectFromFraming` takes a `padAllow` parameter, and portrait/square call it with 0 (identical clamp behaviour to §12.7).
+3. **Zoom floor relaxation**: the no-upscale floor (`outH x frameH / srcH`) remains absolute; the policy `maxZoom` floor yields to the containment fit, in both `aspectLockedTarget` and the plant's `cropFloor`. The subject-loss branch's open-to-full-frame target is capped at `maxCropW / aspect` so the lost-state crop also respects the padding cap.
+4. **Feet anchor unified with portrait**: `cy = bbox.Max.Y - h/2 + 0.05·h`, clamped in-frame. For grounded subjects the clamp pins the crop bottom **exactly to the stage floor** (feetGap median was -28.9 / -4.7 / -13.8 px clipped; now 0.0 / 0.8 / 0.7 px pad), which is what makes the residual clips on uncontainable extreme poses fall on head/arms instead of feet.
+
+**Accepted trade.** Subjects taller than 353 analysis px (extreme arm-raised/leaning poses, maxBH 430-480) need >38% side padding to contain; that exceeds the cap and is not paid for. On those frames the feet anchor moves the cut to the head/arms. Vision review confirmed this is the right casualty order.
+
+**Measured after the change** (sweep windows, output px, shipped-Go debug CSVs old vs new renders):
+
+| | dissapearance | retrynow | sweetdevil | tbaka |
+|---|---|---|---|---|
+| true feet-clip | 235/394 -> **67/395** | 935/1158 -> **19/1158** | 1117/1242 -> **49/1240** | 29/339 -> **0/341** |
+| worst cut | 65 -> 33 px | 89 -> 83 px | 52 -> 15 px | 9 -> 0 px |
+| visual loss | 17.4% -> **3.4%** | 4.9% -> **0.6%** | 12.8% -> **0.4%** | 0.25% -> 0.31% |
+| vertical visibility p05 | 68 -> 91% | 86 -> 98% | 78 -> 98% | 98 -> 98% |
+| coverage median | 114 -> 98 | 104 -> 89 | 112 -> 89 | 94 -> 89 |
+| feet gap median | -28.9 -> 0.0 | -4.7 -> +0.8 | -13.8 -> +0.7 | 0 -> 0 |
+| out-of-frame | 0% | 0% | 0% | 0% |
+| zoom dH p99 / jerk p99 | 0.15 / 0.10 | 0.98 / 0.18 | 0.61 / 0.23 | 0.44 / 0.10 |
+| mean x-lag | 34.9 | 2.3 (was 6.3) | 83.0 | 9.0 (was 45.5) |
+| pan dX p50 / p99 | 0.0 / 4.0 | 0.4 / 4.2 | 0.3 / 5.7 | 0.6 / 9.5 |
+
+Motion stays smooth: dH p99 <= 1.0 px/frame, zoom jerk p99 <= 0.23, tracking lag improved (retarget gates unchanged, §12.7). dX p99 rose from 0.4-1.0 to 4.0-9.5 px/frame while p50 stayed 0.0-0.6: padded crops hit the widened clamp window at frame edges and cuts, where the crop pans faster - expected, sub-10 px events only. Max side padding reaches exactly the cap (145 analysis px = 110 out px, 17% per side) on all four videos and is invisible on the corpus' dark stages.
+
+**Sim fidelity.** The Python replay sim (measurement only) was mirrored to the new geometry (`ls_margin 1.12`, `pad_cap 0.17`, feet anchor, relaxed floors) before rendering; its predictions matched the shipped Go renders (dissapearance: trueClip 68 sim vs 67 real, visual loss 3.42 vs 3.41, pad 145.2 both).
+
+**Visual verification.** Contact sheets per video at max-padding, max-bbox-height, worst-clip, and mid-window normal frames: full head-to-feet framing everywhere, feet at or pinned to the bottom edge, padding invisible against dark stage backgrounds, tbaka group intact, sweetdevil fade-out fallback acceptable. The only visible residual cut is the extreme arm-raised pose (head/arms), never feet.
+
+Unit tests: 19 total (+`TestAspectLockedTargetLandscapeContainment`, +`TestAspectLockedTargetLandscapeFeetAnchor`, +`TestAspectLockedTargetLandscapePadCap`, +`TestCropRectLandscapePadding`, +`TestCropToBBoxBlackPadding`; the two §12.4-era landscape geometry tests rewritten to the containment/floor-anchor policy; `TestCropRectAlwaysInsideFrame` keeps the padAllow=0 in-frame guarantee for portrait/square).
