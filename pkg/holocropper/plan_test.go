@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"image"
 	"math"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -331,4 +332,48 @@ func TestNewPlanBenchmark(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("auto-orient replay of 5558 frames: %v", time.Since(start))
+}
+
+// The HOLOCROPPER_DEBUG_BOXES shim on the replay path (story C3): with the
+// env set, NewPlan writes the same 16-column CSV the fused CLI path wrote -
+// one line per frame, values straight from the records it returns.
+func TestPlanDebugCSVMatchesRecords(t *testing.T) {
+	csvPath := filepath.Join(t.TempDir(), "plan.csv")
+	t.Setenv("HOLOCROPPER_DEBUG_BOXES", csvPath)
+
+	s := newTestStream(walkingSamples(12, 100, 4, 120, 200), 428, 240, fixtureW, fixtureH)
+	p, err := NewPlan(s, Settings{Width: 240, Height: 240, FPS: fixtureFPS})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rows := readDebugCSV(t, csvPath)
+	recs := p.Records()
+	if len(rows) != len(recs) {
+		t.Fatalf("shim wrote %d rows for %d records", len(rows), len(recs))
+	}
+	const tol = 0.011 // the CSV's own 2-decimal rounding band, plus a hair
+	for i, r := range rows {
+		rec := recs[i]
+		if r.frame != rec.Frame || r.subjects != rec.Subjects {
+			t.Errorf("row %d: frame/subjects %d/%d vs record %d/%d", i, r.frame, r.subjects, rec.Frame, rec.Subjects)
+		}
+		if r.bboxX0 != int(rec.BBox.X) || r.bboxY0 != int(rec.BBox.Y) ||
+			r.bboxW != int(rec.BBox.W) || r.bboxH != int(rec.BBox.H) {
+			t.Errorf("frame %d: CSV bbox {%d,%d,%d,%d} vs record %+v", r.frame, r.bboxX0, r.bboxY0, r.bboxW, r.bboxH, rec.BBox)
+		}
+		if r.emaX0 != int(rec.EMA.X) || r.emaY0 != int(rec.EMA.Y) ||
+			r.emaW != int(rec.EMA.W) || r.emaH != int(rec.EMA.H) {
+			t.Errorf("frame %d: CSV ema {%d,%d,%d,%d} vs record %+v", r.frame, r.emaX0, r.emaY0, r.emaW, r.emaH, rec.EMA)
+		}
+		cropCx, cropCy := rec.Crop.X+rec.Crop.W/2, rec.Crop.Y+rec.Crop.H/2
+		for _, pr := range [][2]float64{
+			{r.cropCx, cropCx}, {r.cropCy, cropCy}, {r.cropW, rec.Crop.W}, {r.cropH, rec.Crop.H},
+			{r.targetH, rec.TargetH}, {r.walkTgt, rec.WalkTgt},
+		} {
+			if math.Abs(pr[0]-pr[1]) > tol {
+				t.Errorf("frame %d: CSV %.4f vs record %.4f (drift > %.3f)", r.frame, pr[0], pr[1], tol)
+			}
+		}
+	}
 }

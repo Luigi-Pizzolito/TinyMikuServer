@@ -166,6 +166,13 @@ func NewPlan(stream DetectionStream, s Settings) (*Plan, error) {
 	}
 	dec := newFramingDecider(params, float64(w)/float64(h), 1.0/fps, srcW, srcH)
 
+	// HOLOCROPPER_DEBUG_BOXES shim, kept from the fused CLI path (story
+	// C3): when the env var names a file, the replay emits the same CSV
+	// the corpus framing tooling reads - one line per frame, same columns.
+	// The file reflects the most recent plan built in this process.
+	dbg := newBoxDebugger()
+	defer dbg.close()
+
 	records := make([]FrameRecord, 0, len(samples))
 	cropRects := make([]image.Rectangle, 0, len(samples))
 	var dropouts []IntRange
@@ -184,6 +191,7 @@ func NewPlan(stream DetectionStream, s Settings) (*Plan, error) {
 		crop := Rect{X: out.CropCx - out.CropW/2, Y: out.CropCy - out.CropH/2, W: out.CropW, H: out.CropH}
 		bb := rectOf(bbox)
 		em := rectOf(out.EMA)
+		dbg.line(i+1, int(sm.subjects), bbox, out.EMA, out.CropCx, out.CropCy, out.CropW, out.CropH, out.TargetH, out.WalkTgt)
 
 		records = append(records, FrameRecord{
 			Frame:       i + 1,

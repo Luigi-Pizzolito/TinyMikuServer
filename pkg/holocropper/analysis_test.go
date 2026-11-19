@@ -689,6 +689,32 @@ func TestReplayParityVsDebugCSV(t *testing.T) {
 			t.Fatalf("frame %d: replayed crop escapes the analysis frame: %+v", rec.Frame, rec.Crop)
 		}
 	}
+
+	// The HOLOCROPPER_DEBUG_BOXES shim on the replay path (story C3): the
+	// NewPlan above re-emitted the CSV (the env is still set), so the file
+	// now holds the replay's own lines. They must match the fused path's
+	// ground truth exactly the same way - this is the comparison C3 will
+	// run against golden CSVs once the fused path is gone.
+	shim := readDebugCSV(t, csvPath)
+	if len(shim) != len(rows) {
+		t.Fatalf("shim CSV has %d rows, ground truth %d", len(shim), len(rows))
+	}
+	for i, r := range rows {
+		s := shim[i]
+		if s.frame != r.frame || s.subjects != r.subjects ||
+			s.bboxX0 != r.bboxX0 || s.bboxY0 != r.bboxY0 || s.bboxW != r.bboxW || s.bboxH != r.bboxH ||
+			s.emaX0 != r.emaX0 || s.emaY0 != r.emaY0 || s.emaW != r.emaW || s.emaH != r.emaH {
+			t.Fatalf("shim CSV row %d disagrees with the fused ground truth: %+v vs %+v", i, s, r)
+		}
+		for _, pr := range [][2]float64{
+			{s.cropCx, r.cropCx}, {s.cropCy, r.cropCy}, {s.cropW, r.cropW}, {s.cropH, r.cropH},
+			{s.targetH, r.targetH}, {s.walkTgt, r.walkTgt},
+		} {
+			if absF(pr[0]-pr[1]) > tol {
+				t.Fatalf("shim CSV row %d: %.4f vs ground truth %.4f (drift > %.3f)", i, pr[0], pr[1], tol)
+			}
+		}
+	}
 }
 
 func absF(v float64) float64 {
