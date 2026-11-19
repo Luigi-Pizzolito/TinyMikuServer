@@ -493,3 +493,34 @@ Fourth visual review (owner screenshots): dissapearance landscape cut the top of
 **Visual verification.** Contact sheets per video at max-padding, max-bbox, worst-clip and normal frames: dissapearance arm-raised poses (f426/499/1683), kneeling (f2500) - full head-to-feet framing, fingertips clear the top edge; retrynow flash-scene and arm-spread frames fully framed; sweetdevil unchanged; tbaka group intact. Stage padding invisible on all four videos' dark backgrounds.
 
 Unit tests: 19 total (`TestAspectLockedTargetLandscapePadCap` replaced by `TestAspectLockedTargetLandscapeNoClipGuarantee`: a 429-tall grounded subject must produce the full-frame-height fit, head in frame, bottom pinned to the floor, side padding inside the cap; padding-bound assertions rewritten as per-side overflows bounded by the allowance).
+
+### 12.10 Post-review fix, landscape part 3: the mask misses dark boots - ground snap and a hard floor pin (2026-11-19)
+
+Fifth visual review (owner screenshot): at dissapearance 02:04 (~f2955-3010) Miku stands up from kneeling and her feet crop - despite §12.9 making vertical clipping structurally impossible. The guarantee was true *relative to the detected bbox*; the bbox was the problem.
+
+**Root cause.** On the black stage Miku's black boots are invisible to the mask: in her standing pose the bbox bottom stops at her twin-tail tips (y ≈ 427-470) while her feet are on the floor (y = 480). At 2:04 the fit saw a 329-tall EMA box, sized a 388-tall crop, and the feet anchor clamped its bottom to ~457-471 - her real feet fell 9-23 px below the crop bottom. Every metric (§12.8/§12.9 trueClip = crop shorter than bbox) was blind to this: the crop fully contained the phantom box; only the undetected body part was cut. Portrait had survived this failure class accidentally: its containment fit usually saturates at the frame-height clamp, pinning the crop to 480 regardless of the mask. Floor-gap census on the c2v2 corpus (distance of detected bbox bottom from the frame floor): dissapearance 68% at 0, 26% in 1-72 px, 6% above 72 (max 140); retrynow 92% in 1-72 (max 222); sweetdevil 82% in 1-72 (max 218); tbaka 74% at 0, 26% in 1-22. The 1-72 band is dark-boot mask miss while standing; the >72 clusters are genuine airborne moments (jumps, fades).
+
+**Fix 1 - ground snap (`landscapeGroundSnapFrac = 0.18`).** In `aspectLockedTarget` (aspect >= 2): when the bbox bottom is within 0.18 x frameH (86 analysis px) of the frame floor, the subject is treated as grounded and the bbox bottom is extended to the floor **before** the containment fit and anchor. The crop then sizes to the real body (her true height 382 -> crop 427 instead of 368) and its anchor clamps exactly to the floor. Over-snapping an airborne subject is provably harmless (the crop only grows, padding absorbs it); under-snapping was the observed failure, so the band is biased generous: 86 px covers every measured standing mask miss (10-70 px) and stays below the true airborne gaps (90-222 px).
+
+**Fix 2 - hard floor pin.** In the plant, grounded landscape frames (EMA bbox bottom in the band) set `cropCy = frameH - cropH/2` directly and reset `cmdY = 0` instead of chasing the floor-derived target through the pan-Y PID. The feet line becomes geometrically exact and cannot lag the zoom plant or the target EMA: measured crop-bottom overshoot is 0.0 px on **all 15,871 grounded frames** across the corpus, and vertical crop jitter falls (dY p99 2.13 -> 0.31 diss, 3.27 -> 1.53 retry, 0.68 -> 0.23 tbaka).
+
+**Sim fidelity.** The replay sim mirrored both changes predicted the 2:04 passage exactly (cropH 426-427, crop bottom 480.0 on every frame, 45 px headroom); shipped c2v3 measured 426.7-426.9 at 480.0. Predicted window trueClips 2/5/12/0, shipped 2/4/9/0 (sim slightly conservative).
+
+**Measured after the fix** (shipped-Go renders, sweep windows, output px; no-snap -> ground-snap):
+
+| | dissapearance | retrynow | sweetdevil | tbaka |
+|---|---|---|---|---|
+| true feet-clip | 3/395 -> **2/392** | 7/1157 -> **4/1157** | 22/1241 -> **9/1241** | 0 -> 0 |
+| worst cut | 8.7 -> 5.8 px | 81.3 -> 78.3 px | 9.5 -> 7.2 px | 0 |
+| visual loss | 0.35% -> **0.01%** | 0.61% -> **0.34%** | 0.35% -> **0.03%** | 0.31% -> **0.00%** |
+| vertical visibility p05 | 97.7 -> 100% | 98.7 -> 100% | 97.5 -> 100% | 98.0 -> 100% |
+| head-clip frames | 2 -> 4 | 19 -> 22 | 14 -> 16 | 0 -> 0 |
+| pan dY p99 | 2.13 -> **0.31** | 3.27 -> **1.53** | 2.05 -> 2.48 | 0.68 -> **0.23** |
+| coverage median | 85.3 -> 83.8 | 89.0 -> 88.0 | 87.9 -> 86.2 | 89.2 -> 88.9 |
+| max side padding | 358.7 (cap) | 158.2 -> 166.2 | 358.7 (cap) | 257.5 -> 263.8 |
+
+Residual trueClips are airborne zoom-lag transients (worst 7.3 px) and the retrynow hard-cut transitions (worst 78.3 px, identical frames to §12.9 - crop bottom now pinned, crop *top* lags the fade-bloated bbox until the zoom plant catches up). Head-clip deltas are zoom/EMA lag during fast upward stretches (hair tips, max 10 out px for ~0.5 s bursts) and `bboxTop = 0` fade-halo mask artifacts on flash frames; vision review confirmed no actual head is cut in those frames. Padding cost of the snap is at most 8 px per side.
+
+**Visual verification.** 3x contact sheets through 02:04 (f2955/2964/2976/2988/2995): both boots fully rendered on the bottom edge, ~21 output px headroom above the hair tips in every frame of the stand-up. Contact sheets for all four videos re-rendered at the exact frame sets of the §12.9-approved sheets: no regressions, and retrynow f301/f2068/f2896 - the §12.9 worst-clip frames - go from feet-amputated to fully framed. Group shots, kneeling poses and fade frames intact.
+
+Unit tests: 21 total (+`TestAspectLockedTargetLandscapeGroundSnap`: the dissapearance 02:04 geometry - a 139x329 box 53 px above the floor snaps to the 1.12 x (480-98) ≈ 428 fit, bottom pinned to 480, head clear of the crop top; +`TestAspectLockedTargetLandscapeAirborneNoSnap`: a 100 px floor gap gets no snap, keeping the bbox-based fit and feet-pad anchor; the containment test rewritten to the snapped fit).
