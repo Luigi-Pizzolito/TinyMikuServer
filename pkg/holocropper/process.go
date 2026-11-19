@@ -159,6 +159,18 @@ const (
 	emaBBoxAlpha         = 0.3
 	cutJumpFraction      = 0.25 // bbox jump > this fraction of frame => scene cut
 	subjectLostAreaFrac  = 0.001
+
+	// Walk mode (§14, landscape -> landscape): a continuous pan leash instead
+	// of subject centering. walkAspectLeniency gates it on the output aspect
+	// covering the source aspect (output AR wider or equal to the input's),
+	// with 10% leniency so slightly-narrower-than-source ratios still qualify
+	// (e.g. 1.20 for a 4:3 source, 1.60 for 16:9).
+	// walkLeashMarginFrac is the leash margin: the smoothed subject bbox is
+	// kept at least this fraction of the crop width from the crop's left or
+	// right edge, absorbing EMA/PID tracking lag so the subject visually
+	// never grazes or crosses a screen edge.
+	walkAspectLeniency  = 0.90
+	walkLeashMarginFrac = 0.10
 )
 
 func (hc *HoloCropper) calcVideo() {
@@ -192,6 +204,8 @@ func (hc *HoloCropper) calcVideo() {
 	// padding allowance per side for landscape outputs); landscapePad is the
 	// cx clamp allowance (§12.8, video_dsp.go).
 	var maxCropW, landscapePad float64
+	// walkActive gates the walk-mode pan leash for this render (§14).
+	var walkActive bool
 	initialized := false
 	frame := 0
 
@@ -234,6 +248,14 @@ func (hc *HoloCropper) calcVideo() {
 						cropFloor = math.Min(float64(hc.Height)*frameH/float64(hc.srcH), frameH)
 					}
 				}
+				// Walk mode (§14): landscape -> landscape pan leash, always on.
+				// Gate on the true source aspect (the analysis frame preserves it
+				// but rounds to even pixels).
+				gateW, gateH := frameW, frameH
+				if hc.srcW > 0 && hc.srcH > 0 {
+					gateW, gateH = float64(hc.srcW), float64(hc.srcH)
+				}
+				walkActive = walkModeActive(aspect, gateW, gateH)
 				initialized = true
 			}
 
@@ -322,7 +344,20 @@ func (hc *HoloCropper) calcVideo() {
 				cropW = maxCropW
 				cropH = cropW / aspect
 			}
-			cropCx = hc.applyAxisPID(panX, &cmdX, cropCx, tgtCx+velLeadFrames*vx, dt, cropW, panFloorX)
+			// Walk mode (§14): with a valid leash window the pan target is the
+			// deadzone target (freeze while the subject has slack, edge-chase
+			// when the walk exhausts it) and carries no velocity lead. Only a
+			// subject wider than the crop minus two margins - no room to leash
+			// - falls back to the centered target + lead, which keeps her
+			// in-bounds exactly as before.
+			tgtX := tgtCx + velLeadFrames*vx
+			walkTgt := 0.0
+			if walkActive && haveEMA && !lost {
+				if leash, ok := walkLeashTarget(cropCx, emaF, cropW); ok {
+					tgtX, walkTgt = leash, leash
+				}
+			}
+			cropCx = hc.applyAxisPID(panX, &cmdX, cropCx, tgtX, dt, cropW, panFloorX)
 			if grounded {
 				// Hard floor pin: with the ground snap the feet rest on the
 				// frame floor, so pin the crop bottom there exactly instead
@@ -342,7 +377,7 @@ func (hc *HoloCropper) calcVideo() {
 			cropCx = clampF(cropCx, cropW/2-landscapePad, frameW-cropW/2+landscapePad)
 			cropCy = clampF(cropCy, cropH/2, frameH-cropH/2)
 
-			dbg.line(frame, mask.Subj, bbox, ema, cropCx, cropCy, cropW, cropH, tgtH)
+			dbg.line(frame, mask.Subj, bbox, ema, cropCx, cropCy, cropW, cropH, tgtH, walkTgt)
 
 			// Send to next pipe
 			if hc.procFrameQueue4 != nil {
@@ -369,6 +404,40 @@ func (hc *HoloCropper) applyAxisPID(p *PIDController, cmd *float64, pos, target,
 	limit := clampF(panCropFrac*span+panErrGain*math.Abs(error), floorRate, panCapFrac*span)
 	*cmd = clampF(*cmd, -limit, limit)
 	return pos + *cmd
+}
+
+// walkModeActive decides when the walk-mode pan leash applies
+// (HIGH-ASPECT-RATIO-FIXES.md §14): landscape -> landscape only - the source
+// is landscape, the output is landscape, and the output aspect covers the
+// source aspect up to walkAspectLeniency, so the output X axis is wide enough
+// to show the source's full horizontal walk range. Portrait and square
+// outputs are never touched: their close crops have no slack to walk in anyway.
+func walkModeActive(aspect, srcW, srcH float64) bool {
+	if aspect <= 1 || srcW <= srcH {
+		return false
+	}
+	return aspect >= (srcW/srcH)*walkAspectLeniency
+}
+
+// walkLeashTarget is the continuous deadzone pan target of walk mode. The
+// crop may keep its current x as long as the subject bbox plus the leash
+// margin fits inside the crop: cropCx inside [lo, hi] yields target == cropCx,
+// freezing the crop so the walking subject visibly travels across the output.
+// Once the walk exhausts the slack the target becomes the binding window edge,
+// which moves continuously with the subject, so the crop follows her while the
+// margin keeps her clear of the crop edge. A subject wider than the crop minus
+// two margins invalidates the window (leashed=false): the caller then falls
+// back to the centered target with velocity lead. Leash targets never carry
+// the velocity lead - the window edge already tracks the subject, and a lead
+// on top of it would overshoot and drift the crop.
+func walkLeashTarget(cropCx float64, ema [4]float64, cropW float64) (target float64, leashed bool) {
+	m := walkLeashMarginFrac * cropW
+	lo := ema[2] + m - cropW/2 // cx must stay >= this to keep the subject's right edge (+margin) inside
+	hi := ema[0] - m + cropW/2 // cx must stay <= this to keep the subject's left edge (-margin) inside
+	if lo > hi {
+		return cropCx, false
+	}
+	return clampF(cropCx, lo, hi), true
 }
 
 // applyZoomPID drives crop height toward the target: PI output -> low-passed

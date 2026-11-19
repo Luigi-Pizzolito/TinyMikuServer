@@ -25,19 +25,19 @@ func newBoxDebugger() *boxDebugger {
 		fmt.Printf("holocropper: could not open debug boxes file %s: %v\n", path, err)
 		return nil
 	}
-	fmt.Fprintln(f, "frame,subjects,bbox_x0,bbox_y0,bbox_w,bbox_h,ema_x0,ema_y0,ema_w,ema_h,crop_cx,crop_cy,crop_w,crop_h,target_h")
+	fmt.Fprintln(f, "frame,subjects,bbox_x0,bbox_y0,bbox_w,bbox_h,ema_x0,ema_y0,ema_w,ema_h,crop_cx,crop_cy,crop_w,crop_h,target_h,walk_tgt")
 	return &boxDebugger{f: f}
 }
 
-func (d *boxDebugger) line(frame, subjects int, bbox, ema image.Rectangle, cropCx, cropCy, cropW, cropH, targetH float64) {
+func (d *boxDebugger) line(frame, subjects int, bbox, ema image.Rectangle, cropCx, cropCy, cropW, cropH, targetH, walkTgt float64) {
 	if d == nil || d.f == nil {
 		return
 	}
-	fmt.Fprintf(d.f, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f\n",
+	fmt.Fprintf(d.f, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
 		frame, subjects,
 		bbox.Min.X, bbox.Min.Y, bbox.Dx(), bbox.Dy(),
 		ema.Min.X, ema.Min.Y, ema.Dx(), ema.Dy(),
-		cropCx, cropCy, cropW, cropH, targetH)
+		cropCx, cropCy, cropW, cropH, targetH, walkTgt)
 }
 
 func (d *boxDebugger) close() {
