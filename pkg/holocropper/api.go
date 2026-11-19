@@ -51,6 +51,21 @@ type ValidationError struct {
 
 func (e ValidationError) Error() string { return e.Field + ": " + e.Reason }
 
+// SettingsError aggregates per-field validation failures (from Settings or
+// request Validate) so a settings form can highlight each input, instead of
+// receiving one opaque error string.
+type SettingsError struct {
+	Errors []ValidationError `json:"errors"`
+}
+
+func (e *SettingsError) Error() string {
+	parts := make([]string, len(e.Errors))
+	for i, ve := range e.Errors {
+		parts[i] = ve.Error()
+	}
+	return "holocropper: invalid settings: " + strings.Join(parts, "; ")
+}
+
 // Validate reports ALL violations at once (empty slice = valid).
 func (s Settings) Validate() []ValidationError {
 	var errs []ValidationError
@@ -78,6 +93,26 @@ func (s Settings) Validate() []ValidationError {
 	return errs
 }
 
+// defaultFPS is the frame rate used when Settings.FPS is unset: it feeds the
+// controller dt and every mux, never detection.
+const defaultFPS = 20.0
+
+// effectiveZoomMargin resolves the bbox -> crop padding factor (0 = default).
+func effectiveZoomMargin(s Settings) float64 {
+	if s.ZoomMargin > 0 {
+		return s.ZoomMargin
+	}
+	return defaultZoomMargin
+}
+
+// effectiveMaxZoom resolves the zoom-in policy cap (0 = default).
+func effectiveMaxZoom(s Settings) float64 {
+	if s.MaxZoom > 0 {
+		return s.MaxZoom
+	}
+	return defaultMaxZoom
+}
+
 // ParamSpec describes one Settings field for auto-generated forms.
 type ParamSpec struct {
 	Name    string `json:"name"`
@@ -95,8 +130,8 @@ func Schema() []ParamSpec {
 		{Name: "height", Type: "integer", Default: 240, Min: 16, Max: 4096, Help: "Output height in pixels (0 = default; rounded up to even)"},
 		{Name: "fps", Type: "float", Default: 20.0, Min: 1.0, Max: 120.0, Help: "Output frames per second (0 = default); controller time step and mux rate"},
 		{Name: "analysis_height", Type: "integer", Default: defaultAnalysisHeight, Min: 16, Help: "Internal analysis frame height (0 = default 480); renders require it >= output height. Larger than the source height costs detection time for no framing gain"},
-		{Name: "zoom_margin", Type: "float", Default: 1.12, Min: 1.0, Max: 10.0, Help: "Subject bbox to crop padding factor (0 = default); landscape and portrait fits enforce a 1.18 floor"},
-		{Name: "max_zoom", Type: "float", Default: 2.0, Min: 1.0, Max: 8.0, Help: "Maximum zoom-in factor (0 = default); never upscales past source resolution regardless"},
+		{Name: "zoom_margin", Type: "float", Default: defaultZoomMargin, Min: 1.0, Max: 10.0, Help: "Subject bbox to crop padding factor (0 = default); landscape and portrait fits enforce a 1.18 floor"},
+		{Name: "max_zoom", Type: "float", Default: defaultMaxZoom, Min: 1.0, Max: 8.0, Help: "Maximum zoom-in factor (0 = default); never upscales past source resolution regardless"},
 		{Name: "auto_orient", Type: "bool", Default: false, Help: "Pick WxH or HxW from the subjects' aspect ratios; skipped for 1:1 outputs"},
 	}
 }
@@ -104,14 +139,13 @@ func Schema() []ParamSpec {
 // Resolved reports the settings actually applied after defaults,
 // even-rounding and the auto-orient decision, plus the frame geometries.
 type Resolved struct {
-	Settings       `json:"settings"`
-	SourceW        int  `json:"source_w"`
-	SourceH        int  `json:"source_h"`
-	AnalysisW      int  `json:"analysis_w"`
-	AnalysisH      int  `json:"analysis_h"`
-	OutputW        int  `json:"output_w"`
-	OutputH        int  `json:"output_h"`
-	AnalysisReused bool `json:"analysis_reused"` // cached stream matched without re-analyze
+	Settings  `json:"settings"`
+	SourceW   int `json:"source_w"`
+	SourceH   int `json:"source_h"`
+	AnalysisW int `json:"analysis_w"`
+	AnalysisH int `json:"analysis_h"`
+	OutputW   int `json:"output_w"`
+	OutputH   int `json:"output_h"`
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +229,17 @@ type IntRange struct {
 	End   int `json:"end"`
 }
 
+// WalkSummary reports the walk-mode telemetry of a Plan (HIGH-ASPECT-RATIO-
+// FIXES.md §14): whether the render-level gate is active, how far the crop
+// center actually roamed while leashed (px, analysis space), and how many
+// frames fell back to subject centering because the subject was too wide to
+// leash (or lost).
+type WalkSummary struct {
+	Active         bool    `json:"active"`
+	RangePx        float64 `json:"range_px"`
+	FallbackFrames int     `json:"fallback_frames"`
+}
+
 // ---------------------------------------------------------------------------
 // Task status plane (spinner contract)
 
@@ -251,6 +296,16 @@ type Observer struct {
 	OnWarning func(string)        // ffmpeg stderr diagnostics
 }
 
+// AnalysisStatus is the aggregate snapshot that reconciles every UI spinner
+// in one cheap call: the live analyze Task for this Analysis's cache key
+// (nil when idle), the live render Task on the shared render slot (nil when
+// idle), and whether a complete cached stream exists.
+type AnalysisStatus struct {
+	Analysis *TaskInfo `json:"analysis,omitempty"`
+	Render   *TaskInfo `json:"render,omitempty"`
+	Cached   bool      `json:"cached"`
+}
+
 // ---------------------------------------------------------------------------
 // Requests
 
@@ -264,10 +319,30 @@ type AnalyzeRequest struct {
 	Observer       *Observer `json:"-"`
 }
 
-// PreviewRequest drives one output-resolution preview render.
+// Validate reports ALL field violations at once (filesystem existence is
+// checked when the pass resolves the request).
+func (r AnalyzeRequest) Validate() []ValidationError {
+	var errs []ValidationError
+	if r.Input == "" {
+		errs = append(errs, ValidationError{Field: "input", Reason: "input video path is required"})
+	}
+	if r.TempDir == "" {
+		errs = append(errs, ValidationError{Field: "temp_dir", Reason: "a scratch/cache parent directory is required"})
+	}
+	if r.AnalysisHeight != 0 && r.AnalysisHeight < 16 {
+		errs = append(errs, ValidationError{Field: "analysis_height", Reason: "must be 0 (default 480) or at least 16"})
+	}
+	return errs
+}
+
+// PreviewRequest drives one output-resolution preview render. It carries no
+// TempDir: previews are written inside the Analysis they were started from
+// (its cache dir under the TempDir that produced it), and their JPEG scratch
+// lives beside that cache.
 type PreviewRequest struct {
-	FFmpegPath string         `json:"ffmpeg_path"` // "" = "ffmpeg" from PATH
-	Options    PreviewOptions `json:"options"`
+	FFmpegPath  string         `json:"ffmpeg_path"`   // "" = "ffmpeg" from PATH
+	KeepWorkDir bool           `json:"keep_work_dir"` // debug: leave the preview JPEG scratch behind
+	Options     PreviewOptions `json:"options"`
 }
 
 // PreviewOptions selects which preview videos to render and what the
@@ -287,6 +362,19 @@ const (
 	PreviewCropOverlay PreviewKind = "crop_overlay"
 )
 
+// Validate reports ALL field violations at once. A preview needs no
+// directories: it writes inside the Analysis it was started from.
+func (r PreviewRequest) Validate() []ValidationError {
+	var errs []ValidationError
+	switch r.Options.Kind {
+	case "", PreviewCrop, PreviewOverlay, PreviewCropOverlay:
+	default:
+		errs = append(errs, ValidationError{Field: "options.kind",
+			Reason: fmt.Sprintf("must be crop, overlay or crop_overlay (got %q)", r.Options.Kind)})
+	}
+	return errs
+}
+
 // RenderRequest drives the final production render.
 type RenderRequest struct {
 	OutputDir   string    `json:"output_dir"`  // required, must exist
@@ -294,6 +382,19 @@ type RenderRequest struct {
 	FFmpegPath  string    `json:"ffmpeg_path"` // "" = PATH
 	KeepWorkDir bool      `json:"keep_work_dir"`
 	Observer    *Observer `json:"-"`
+}
+
+// Validate reports ALL field violations at once (directory existence is
+// checked when the render resolves the request).
+func (r RenderRequest) Validate() []ValidationError {
+	var errs []ValidationError
+	if r.OutputDir == "" {
+		errs = append(errs, ValidationError{Field: "output_dir", Reason: "an existing output directory is required"})
+	}
+	if r.TempDir == "" {
+		errs = append(errs, ValidationError{Field: "temp_dir", Reason: "a scratch parent directory is required"})
+	}
+	return errs
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +425,29 @@ type PreviewResult struct {
 	FPS              float64  `json:"fps"`
 	ElapsedSeconds   float64  `json:"elapsed_seconds"`
 	Removed          []string `json:"removed,omitempty"` // preview files the sweep deleted
+}
+
+// Result is what a finished RenderTask Wait() returns: the production file
+// plus everything that produced it, so the app can log, verify and show it.
+type Result struct {
+	InputPath  string `json:"input_path"`
+	OutputPath string `json:"output_path"`
+	WorkDir    string `json:"work_dir"` // render scratch; "" when it was cleaned up
+
+	SourceW   int `json:"source_w"`
+	SourceH   int `json:"source_h"`
+	AnalysisW int `json:"analysis_w"`
+	AnalysisH int `json:"analysis_h"`
+	OutputW   int `json:"output_w"`
+	OutputH   int `json:"output_h"`
+
+	AppliedSettings Resolved         `json:"applied_settings"`
+	Orientation     *OrientationStat `json:"orientation,omitempty"`
+
+	Frames         int      `json:"frames"`
+	FPS            float64  `json:"fps"`
+	ElapsedSeconds float64  `json:"elapsed_seconds"`
+	Warnings       []string `json:"warnings,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +491,9 @@ func ListInputs(dir string) ([]InputInfo, error) {
 // Errors
 
 var (
+	// ErrCancelled is what a cancelled Task's Wait() returns (Cancel() was
+	// called, or the pass was replaced - superseded carries its own error).
+	ErrCancelled = errors.New("holocropper: task cancelled")
 	// ErrAnalysisCacheMiss reports no valid cached analysis for the key
 	// (CachedAnalysis); re-run Analyze.
 	ErrAnalysisCacheMiss = errors.New("holocropper: no cached analysis for this input and analysis height")
