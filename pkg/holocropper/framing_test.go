@@ -221,22 +221,22 @@ func TestAspectLockedTargetPortraitSmallSubjectZoomsIn(t *testing.T) {
 }
 
 // TestAspectLockedTargetLandscapeContainment: the shipped landscape policy
-// (§12.8/§12.10). A 350x300 subject standing 2 px off the frame floor is
-// ground-snapped to 302, needing a 338-tall crop for full containment; the
-// crop may overflow the frame's left/right edges (bounded padding) and its
-// bottom pins to the frame floor.
+// (§12.8/§12.10, §14 padding floor). A 350x300 subject standing 2 px off the
+// frame floor is ground-snapped to 302, needing a 356-tall crop for full
+// containment plus side padding; the crop may overflow the frame's left/right
+// edges (bounded padding) and its bottom pins to the frame floor.
 func TestAspectLockedTargetLandscapeContainment(t *testing.T) {
 	hc := &HoloCropper{Height: 200, Width: 648, srcH: 1080}
 	bbox := image.Rect(252, 178, 602, 478) // 350x300, feet on the frame floor
 	w, h, cx, cy := hc.aspectLockedTarget(bbox, 854, 480, 648.0/200)
-	if h < 337 || h > 339 {
-		t.Fatalf("landscape crop height %.1f not ~338 (1.12x containment of 302)", h)
+	if h < 355 || h > 357 {
+		t.Fatalf("landscape crop height %.1f not ~356 (1.18x containment of 302)", h)
 	}
 	if h < float64(bbox.Dy())-0.5 {
 		t.Fatalf("crop height %.1f shorter than subject %d: feet would clip", h, bbox.Dy())
 	}
-	if w < 1094 || w > 1097 {
-		t.Fatalf("landscape crop width %.1f not ~1096 (aspect locked)", w)
+	if w < 1153 || w > 1156 {
+		t.Fatalf("landscape crop width %.1f not ~1155 (aspect locked)", w)
 	}
 	pad := (w - 854) / 2
 	if pad > landscapePadCapFrac*854+1 {
@@ -251,15 +251,15 @@ func TestAspectLockedTargetLandscapeContainment(t *testing.T) {
 }
 
 // TestAspectLockedTargetLandscapeFeetAnchor: short subject (500x150) in the
-// landscape containment regime. The containment fit (172.8) sits below the
+// landscape containment regime. The containment fit (182.1) sits below the
 // old maxZoom floor (240): for landscape the fit wins, and the feet stay
 // feetPadFraction*h above the crop bottom instead of the 25/75 slack split.
 func TestAspectLockedTargetLandscapeFeetAnchor(t *testing.T) {
 	hc := &HoloCropper{Height: 200, Width: 648, srcH: 1080}
 	bbox := image.Rect(177, 165, 677, 315) // 500x150
 	w, h, _, cy := hc.aspectLockedTarget(bbox, 854, 480, 648.0/200)
-	if h < 171 || h > 174 {
-		t.Fatalf("landscape crop height %.1f not ~173 (containment fit 1.12*154.3)", h)
+	if h < 181 || h > 183 {
+		t.Fatalf("landscape crop height %.1f not ~182 (containment fit 1.18*154.3)", h)
 	}
 	if h >= 480/2.0 {
 		t.Fatalf("crop height %.1f not relaxed below the maxZoom floor 240", h)
@@ -318,8 +318,8 @@ func TestAspectLockedTargetLandscapeGroundSnap(t *testing.T) {
 	hc := &HoloCropper{Height: 200, Width: 648, srcH: 1080}
 	bbox := image.Rect(341, 98, 480, 427) // 139x329, 53 px floor gap
 	w, h, _, cy := hc.aspectLockedTarget(bbox, 854, 480, 648.0/200)
-	if h < 426 || h > 429 {
-		t.Fatalf("crop height %.1f not the snapped fit 1.12*(480-98)~428", h)
+	if h < 449 || h > 452 {
+		t.Fatalf("crop height %.1f not the snapped fit 1.18*(480-98)~450.8", h)
 	}
 	if math.Abs(w-h*(648.0/200)) > 0.5 {
 		t.Fatalf("crop %.1fx%.1f not aspect locked", w, h)
@@ -339,12 +339,58 @@ func TestAspectLockedTargetLandscapeAirborneNoSnap(t *testing.T) {
 	hc := &HoloCropper{Height: 200, Width: 648, srcH: 1080}
 	bbox := image.Rect(341, 100, 480, 380) // 139x280, 100 px floor gap
 	_, h, _, cy := hc.aspectLockedTarget(bbox, 854, 480, 648.0/200)
-	if h < 313 || h > 314 {
-		t.Fatalf("crop height %.1f not 1.12*280~313.6: snap fired on an airborne subject", h)
+	if h < 330 || h > 331 {
+		t.Fatalf("crop height %.1f not 1.18*280~330.4: snap fired on an airborne subject", h)
 	}
 	bot := cy + h/2
 	if want := float64(bbox.Max.Y) + feetPadFraction*h; math.Abs(bot-want) > 0.5 {
 		t.Fatalf("crop bottom %.1f not bbox bottom + feet pad %.1f", bot, want)
+	}
+}
+
+// TestAspectLockedTargetLandscapeSidePadding169: §14 review - landscape
+// outputs must show empty stage padding on the left and right, "like the
+// headroom on top". A wide tbaka-style dance group (575 px) at a 16:9 output
+// from a 16:9 source used to fit the crop edge-to-edge: the moderate-landscape
+// width term was dx/aspect with no margin at all, so the dancers grazed the
+// screen edges. The landscape containment margin now sizes the crop
+// 1.18*dx/aspect, guaranteeing 7.6% of the crop width empty per side - well
+// over the 2% the owner asked for.
+func TestAspectLockedTargetLandscapeSidePadding169(t *testing.T) {
+	hc := &HoloCropper{Height: 288, Width: 512, srcH: 1080}
+	bbox := image.Rect(139, 215, 714, 473) // 575x258 group, feet near the frame floor
+	w, h, _, _ := hc.aspectLockedTarget(bbox, 854, 480, 512.0/288)
+	if h < 381 || h > 383 {
+		t.Fatalf("crop height %.1f not the padded width fit ~381.7 (1.18*575/1.778)", h)
+	}
+	if w < 677 || w > 680 {
+		t.Fatalf("crop width %.1f not ~678 (aspect locked)", w)
+	}
+	if frac := (w - 575) / 2 / w; frac < 0.075 {
+		t.Fatalf("empty side padding is %.1f%% of the crop width: below the 7.5%% floor", frac*100)
+	}
+}
+
+// TestAspectLockedTargetLandscapeSidePadding324: the same group at the 3.24
+// regime. The fit stays height-driven (ground-snapped to 480-215=265 ->
+// 1.18*265=312.7) and the padded crop is then far wider than the group:
+// every side keeps >= 2% of the crop width as empty stage, the crop bottom
+// still pins to the frame floor.
+func TestAspectLockedTargetLandscapeSidePadding324(t *testing.T) {
+	hc := &HoloCropper{Height: 200, Width: 648, srcH: 1080}
+	bbox := image.Rect(139, 215, 714, 473) // snapped: 265 tall, 575 wide
+	w, h, _, cy := hc.aspectLockedTarget(bbox, 854, 480, 648.0/200)
+	if h < 312 || h > 314 {
+		t.Fatalf("crop height %.1f not the snapped fit 1.18*(480-215)~312.7", h)
+	}
+	if w <= float64(bbox.Dx()) {
+		t.Fatalf("crop width %.1f not wider than subject %d: no side padding", w, bbox.Dx())
+	}
+	if frac := (w - 575) / 2 / w; frac < 0.02 {
+		t.Fatalf("side padding is %.1f%% of the crop width: below the 2%% floor", frac*100)
+	}
+	if math.Abs(cy+h/2-480) > 0.5 {
+		t.Fatalf("crop bottom %.1f not pinned to the frame floor 480", cy+h/2)
 	}
 }
 

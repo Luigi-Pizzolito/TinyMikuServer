@@ -280,13 +280,21 @@ func (hc *HoloCropper) aspectLockedTarget(bbox image.Rectangle, frameW, frameH, 
 		if float64(frameH)-float64(bbox.Max.Y) <= landscapeGroundSnapFrac*float64(frameH) {
 			bbox.Max.Y = int(math.Round(frameH))
 		}
-		h = math.Max(float64(bbox.Dy()), float64(bbox.Dx())/aspect) * margin
+		h = math.Max(float64(bbox.Dy()), float64(bbox.Dx())/aspect) * landscapeContainMargin(margin)
 	} else {
 		// Square outputs: dominant-axis fit. Cover the subject height and
 		// at least widthCoverFrac of its width; trailing limbs clip rather
-		// than the crop ballooning.
+		// than the crop ballooning. Landscape outputs (aspect > 1) carry the
+		// width fit at the landscape containment margin instead: subjects
+		// must never fill the crop edge-to-edge (§14 review - empty stage
+		// padding left/right "like the headroom on top"). Square 1:1 keeps
+		// the original look untouched.
 		h = float64(bbox.Dy()) * margin
-		if hw := float64(bbox.Dx()) * widthCoverFrac(aspect) / aspect; hw > h {
+		hw := float64(bbox.Dx()) * widthCoverFrac(aspect) / aspect
+		if aspect > 1 {
+			hw = float64(bbox.Dx()) * landscapeContainMargin(margin) / aspect
+		}
+		if hw > h {
 			h = hw
 		}
 	}
@@ -346,9 +354,21 @@ func (hc *HoloCropper) aspectLockedTarget(bbox image.Rectangle, frameW, frameH, 
 
 // portraitContainMargin is the padding floor used only by the tall-output
 // containment branch of aspectLockedTarget (sweep-tuned on the real corpus,
-// HIGH-ASPECT-RATIO-FIXES.md §12.7). Landscape/square fits keep the user's
-// hc.zoomMargin.
+// HIGH-ASPECT-RATIO-FIXES.md §12.7). Square 1:1 fits keep the user's
+// hc.zoomMargin; landscape fits use landscapeContainMargin below.
 const portraitContainMargin = 1.18
+
+// landscapeContainMargin is the padding floor for landscape subject fits:
+// applied to the containment fit (aspect >= 2) and to the width term for
+// moderate landscape ratios (1 < aspect < 2). A subject fit then leaves
+// >= 7.6% of the crop width empty on each side - the left/right stage
+// padding the owner asked for as "like the headroom on top" (§14 review);
+// the moderate-landscape width term previously fit the subject edge-to-edge
+// with zero slack. Square 1:1 fits are untouched. A higher user zoomMargin
+// always overrides the floor.
+func landscapeContainMargin(margin float64) float64 {
+	return math.Max(margin, 1.18)
+}
 
 // landscapePadCapFrac is the baseline side-padding allowance for the
 // landscape containment fit (§12.8/§12.9): 42% of the frame width per side
