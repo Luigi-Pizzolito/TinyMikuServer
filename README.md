@@ -29,9 +29,11 @@ TinyMikuServer/
 │   │   ├── MikVServer.go  # Server implementation
 │   │   └── server.go      # HTTP handlers
 │   └── holocropper/       # Video cropping utility
-│       ├── holocropper.go # Core cropping logic
+│       ├── analysis.go    # Analyze pass (prepare + detect, cached)
+│       ├── plan.go        # NewPlan: in-process framing replay
+│       ├── renders.go     # RenderPreview / RenderFinal passes
 │       └── cmd/
-│           └── holocropper/     # HoloCropper CLI
+│           └── holocropper/     # HoloCropper CLI (drives those passes)
 ├── bin/                   # Compiled binaries (generated)
 └── assets/                # Video assets (not tracked)
     ├── mp4/              # Processed MP4 files
@@ -139,17 +141,21 @@ Options:
 - `-zoom-margin`: Subject bbox padding factor (0 = default 1.12; landscape and portrait fits enforce a 1.18 padding floor)
 - `-max-zoom`: Maximum zoom-in factor (0 = default 2.0)
 - `-auto-orient`: Pick portrait (`HxW`) or landscape (`WxH`) output orientation from the subjects' aspect ratios; skipped for 1:1 outputs
+- `-temp-dir`: Scratch + analysis-cache parent (default: the system temp dir). Cached analyses make repeated renders of an unchanged video skip the detect pass entirely
+- `-ffmpeg-path`: Path to the ffmpeg binary (default: `ffmpeg` from `PATH`)
+
+Output keeps the legacy naming: `<input basename>.mp4` in `-o`, overwritten on re-render.
 
 Setting `HOLOCROPPER_DEBUG_BOXES=boxes.csv` writes a per-frame framing log (subject box, smoothed box, applied crop) for verification.
 
 #### Auto-orient (`-auto-orient`)
 
-Give any output resolution - e.g. `-w 648 -h 200` - and let the cropper pick the orientation for you. A preprocessing probe decodes up to 128 evenly spread frames of the input through the same subject-detection machinery the cropper uses, measures each frame's **master bounding box** (one box covering ALL detected subjects), and averages those aspect ratios. The requested `WxH` is compared with its transpose `HxW` by containment score and the better orientation is rendered.
+Give any output resolution - e.g. `-w 648 -h 200` - and let the cropper pick the orientation for you. The analysis pass already measures every frame's **master bounding box** (one box covering ALL detected subjects); the aspect ratios of those boxes are averaged and the requested `WxH` is compared with its transpose `HxW` by containment score, and the better orientation is rendered. The CLI prints the aggregates (frames with subjects, mean/geometric-mean/median AR, both coverage scores) for the decision it took.
 
 - Tall solo subjects flip a landscape request to portrait; side-by-side groups flip a portrait request to landscape.
 - The video is never rotated or flipped: only the crop orientation transposes, and the source always stays upright.
-- `1:1` outputs bypass the probe completely (there is no portrait/landscape choice to make).
-- The flag is opt-in. Without it `-w`/`-h` are used exactly as requested, so you can still render a portrait and a landscape version of the same video by hand. A probe failure or a subjectless video falls back to the requested orientation.
+- `1:1` outputs bypass the decision completely (there is no portrait/landscape choice to make).
+- The flag is opt-in. Without it `-w`/`-h` are used exactly as requested, so you can still render a portrait and a landscape version of the same video by hand. A subjectless video keeps the requested orientation.
 
 #### Walk mode (landscape to landscape)
 
@@ -163,41 +169,37 @@ When a landscape source video is cropped to a landscape output, the subject's le
 
 #### Architecture
 
-`pkg/holocropper` is a channel-connected pipeline: one goroutine per stage (the six `STEP`s), each consuming from the previous frame queue, so a video streams through in one pass. `cmd/holocropper` only sets parameters and calls `Crop`.
+`pkg/holocropper` runs as three passes (surface, contract and rationale: [HOLOCROPPER-API-PLAN.md](HOLOCROPPER-API-PLAN.md)). Each pass is a cancellable Task reporting phase and progress; every scratch file lives under a caller-supplied temp dir; the analysis cache lets repeated work on an unchanged video skip detection entirely. `cmd/holocropper` is a thin front end over the same surface an embedding app uses.
 
 ```mermaid
 flowchart LR
-  CLI["cmd/holocropper<br/>-w -h -fps flags"] --> CROP["HoloCropper.Crop"]
-  CROP --> ORIENT{"IF -auto-orient set?"}
-  ORIENT -- "yes: probe up to 128 frames,<br/>keep or flip W x H by subject AR" --> SCALE["ffmpeg pre-scale<br/>analysis video, height 480 default"]
-  ORIENT -- "no: use requested W x H" --> SCALE
-  SCALE --> S1["STEP 1 readVideo<br/>raw RGBA frames"]
-  S1 -- "raw frames" --> S2["STEP 2 grayscaleVideo"]
-  S2 -- "gray frames" --> S3["STEP 3 binaryVideo<br/>Otsu with +/-10 hysteresis<br/>connected components<br/>20% area filter + combineBounds"]
-  S3 -- "subject bboxes" --> S4["STEP 4 calcVideo<br/>framing controller<br/>(diagram below)"]
-  S4 -- "crop rectangles" --> S5["STEP 5 crop frames"]
-  S5 -- "cropped frames" --> S6["STEP 6 save JPEG frames"]
-  S6 -- "JPEG sequence" --> MUX["ffmpeg mux<br/>frames + source audio<br/>output mp4"]
-  S4 -. "debug hook: HOLOCROPPER_DEBUG_BOXES" .-> CSV["per-frame framing CSV"]
+  CLI["cmd/holocropper<br/>-w -h -fps flags"] --> AN["Analyze<br/>ffmpeg prepare: scale to the analysis<br/>frame, frame-passthrough<br/>then per-frame subject detection"]
+  AN --> CACHE[("analysis cache<br/>analysis.mp4 + stream.bin.gz<br/>+ meta.json")]
+  CACHE --> PLAN["NewPlan<br/>in-process replay of the framing<br/>controller: milliseconds, no video"]
+  PLAN --> RENDER["Analysis.RenderFinal<br/>crop + fill-resize at output<br/>resolution, source audio muxed"]
+  PLAN -. "RenderPreview: versioned<br/>output-resolution previews" .-> RENDER
+  PLAN -. "debug hook: HOLOCROPPER_DEBUG_BOXES" .-> CSV["per-frame framing CSV"]
 ```
 
-STEP 4 owns every per-frame framing decision: subject smoothing, the aspect-locked target geometry, and three plant controllers (pan X, pan Y, zoom):
+`Analyze` measures one **master bbox** per frame (covering all detected subjects) and caches it. `NewPlan` replays the framing controller over those bboxes - so changing `-w`, `-h`, `-zoom-margin` or `-auto-orient` costs a millisecond-scale replay, not a re-decode - and `RenderFinal`/`RenderPreview` execute the plan's crop rectangles against the cached analysis video. The replay is provably the old pipeline's decision stream: `TestReplayParityVsDebugCSV` pins it, frame for frame, against the fused pipeline's own golden CSV.
+
+The framing controller owns every per-frame decision: subject smoothing, the aspect-locked target geometry, and three plant controllers (pan X, pan Y, zoom):
 
 ```mermaid
 flowchart TD
   BBOX["master bbox over all subjects"] --> LOST{"IF subject area under 0.1% of the frame?"}
-  LOST -- "yes: subject lost - hold last crop,<br/>open zoom toward full frame at rate limits" --> ZOOM["zoom plant applyZoomPID<br/>PI at frame time 1/FPS, no D term<br/>low-passed actuator<br/>zoom-in 0.25 px/frame, zoom-out 4 px/frame"]
+  LOST -- "yes: subject lost - hold last crop,<br/>open zoom toward full frame at rate limits" --> ZOOM["zoom plant applyZoomPIDCalc<br/>PI at frame time 1/FPS, no D term<br/>low-passed actuator<br/>zoom-in 0.25 px/frame, zoom-out 4 px/frame"]
   LOST -- "no" --> CUT{"IF scene cut?<br/>bbox jumped over 25% of the frame<br/>or subject count changed by 3+"}
   CUT -- "no" --> EMA["update EMA subject bbox (alpha 0.3)<br/>and velocity EMA (alpha 0.5)"]
   CUT -- "yes: hard reset first<br/>EMA bbox, PIDs, targets" --> EMA
-  EMA --> GEOM["aspectLockedTarget geometry<br/>containment fit: portrait and landscape<br/>dominant-axis fit: square<br/>ground snap, zoom floors, width caps<br/>feet-priority anchor"]
+  EMA --> GEOM["aspectLockedTargetCalc geometry<br/>containment fit: portrait and landscape<br/>dominant-axis fit: square<br/>ground snap, zoom floors, width caps<br/>feet-priority anchor"]
   GEOM --> TGT["smoothed targets<br/>x and y 0.7, height 0.15"]
   TGT -- "pan targets" --> GATE{"IF walk mode active?<br/>landscape output from landscape source<br/>AND aspect at least 0.90 of source aspect"}
   TGT -- "zoom target" --> ZOOM
   GATE -- "no: portrait, square or output<br/>narrower than the source aspect" --> CENTER["centered target<br/>+ 3-frame velocity lead"]
   GATE -- "yes" --> LEASH{"IF leash window valid?<br/>subject + 2 leash margins narrower<br/>than the crop?"}
   LEASH -- "no: subject or group too wide" --> CENTER
-  LEASH -- "yes: deadzone leash<br/>freeze while slack,<br/>edge-chase when slack runs out" --> PAN["pan plants applyAxisPID for X and Y<br/>PI at frame time 1/FPS, anti-windup<br/>low-passed actuator<br/>crop-relative pan rate caps"]
+  LEASH -- "yes: deadzone leash<br/>freeze while slack,<br/>edge-chase when slack runs out" --> PAN["pan plants applyAxisPIDCalc for X and Y<br/>PI at frame time 1/FPS, anti-windup<br/>low-passed actuator<br/>crop-relative pan rate caps"]
   CENTER -- "pan targets" --> PAN
   PAN -- "crop center x, y" --> CLAMP["final clamps<br/>aspect lock: cropW = cropH x aspect<br/>cx inside frame plus stage pad, cy inside frame<br/>grounded floor pin: crop bottom = stage floor"]
   ZOOM -- "crop height" --> CLAMP
@@ -223,9 +225,9 @@ The original algorithm (https://github.com/Luigi-Pizzolito/1-1-Content-Aware-Vid
 - **Smoother tracking.** EMA subject bounding box with scene-cut reset, Otsu threshold hysteresis, and no unsharp filter on the analysis stream. Dropout holds the last framing and opens gradually instead of the original `panAdj = 0` hard snap (single-frame jumps up to 71 px in 1:1 mode).
 - **Tall ratios contain, anchored on the feet.** Portrait crops (e.g. 200x648) contain the whole subject and anchor it so the feet sit just above the bottom edge with a small pad and the slack above the head - a real-corpus sweep showed any tighter fit clips the feet on most floor-standing frames.
 - **Faster.** 25-30% faster on portrait and 1:1 despite larger analysis frames; landscape pays a small increase for the larger analysis frame that removes its structural padding.
-- **Auto-orient probe (`-auto-orient`).** Estimates the average master-bbox aspect ratio of the subjects and renders the requested resolution or its transpose, whichever keeps them best framed. Never rotates the video; bypassed for 1:1. The original had no equivalent - the output orientation was fixed by the caller.
+- **Auto-orient (`-auto-orient`).** From the analysis pass's own per-frame master bboxes, averages their aspect ratios and renders the requested resolution or its transpose, whichever keeps them best framed. Never rotates the video; bypassed for 1:1. The original had no equivalent - the output orientation was fixed by the caller.
 - **Walk mode (landscape to landscape).** A continuous deadzone pan leash: the crop holds its horizontal position so the subject walks left/right in the output exactly as she does in the source, panning smoothly only when the walk runs out of slack. The subject can never cross a screen edge. Active whenever the output aspect is at least as wide as the source aspect; portrait/square framing untouched. The original always centered the subject, which made dancing subjects appear stationary.
-- **Tooling the original had none of:** 36 unit tests on the framing controller, geometry, walk-mode leash, and the auto-orient estimator, a CSV instrumentation hook for ground-truth verification, and CLI-tunable framing parameters.
+- **Tooling the original had none of:** 100+ unit tests on the framing controller, geometry, walk-mode leash, the orientation estimator and the API passes, a golden decision-CSV parity test that pins the replay against the framing stream the corpus was tuned on, a CSV instrumentation hook for ground-truth verification, and CLI-tunable framing parameters.
 
 </details>
 
@@ -321,15 +323,32 @@ server.Stop()
 
 ### HoloCropper
 
+The embeddable passes - the same surface `cmd/holocropper` drives:
+
 ```go
-// Create cropper instance
-cropper := holocropper.NewHoloCropper()
+// Analyze: prepare (scaled analysis video) + detect (per-frame master bboxes),
+// cached under TempDir for the life of the input file.
+task, err := holocropper.Analyze(ctx, holocropper.AnalyzeRequest{
+	Input: "input.mp4", TempDir: "./tmp",
+})
+analysis, err := task.Wait()
 
-// Crop a video: height, width, fps, input, output directory
-cropper.Crop(648, 200, 24.0, "input.mp4", "output")
+// Plan: replay the framing controller in-process. Re-plan after every setting
+// change - milliseconds, no re-detection. Orientation rides on Settings.
+plan, err := holocropper.NewPlan(analysis.Stream(), holocropper.Settings{
+	Width: 648, Height: 200, FPS: 24, AutoOrient: true,
+})
+flip := plan.Orientation().Flip // chosen orientation + AR aggregates
 
-// Optional: let the cropper pick portrait or landscape from subject AR
-outW, outH, stats, err := cropper.AutoOrient("input.mp4", 648, 200) // chosen dims + probe stats
+// Preview (versioned, output resolution) and the final render. Both are
+// Tasks: Wait blocks, Observer/TaskInfo drive the spinner.
+pvTask, err := analysis.RenderPreview(ctx, plan, holocropper.PreviewRequest{})
+pv, err := pvTask.Wait() // <basename>-<WxH>-v<N>.mp4 inside the analysis cache
+
+finalTask, err := analysis.RenderFinal(ctx, plan, holocropper.RenderRequest{
+	OutputDir: "output", TempDir: "./tmp",
+})
+res, err := finalTask.Wait() // <basename>-<WxH>.mp4; OutputName overrides it
 ```
 
 ## Development
@@ -337,7 +356,8 @@ outW, outH, stats, err := cropper.AutoOrient("input.mp4", 648, 200) // chosen di
 ### Running Tests
 
 ```bash
-go test ./...
+go test ./...                          # server + MikV packages
+cd pkg/holocropper && go test ./...    # HoloCropper is a separate Go module
 ```
 
 ### Cleaning Build Artifacts
