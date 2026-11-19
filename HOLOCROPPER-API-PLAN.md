@@ -1,374 +1,370 @@
 # HoloCropper Embeddable API Plan
 
-Status: **scheme v3 — awaiting owner approval. No implementation starts before sign-off.**
-Consumer: the Wails app (Go backend, web UI via bindings). Owner rulings so far (2026-11-19): Go binding funcs only — no HTTP, no network; the app owns jobs (no queue/persistence in holocropper); all preview/framing data delivered in real time; **all disk scratch space lives in directories the caller passes in**; the surface must be well-designed and easy to build a UI against.
+Status: **scheme v4 — awaiting owner approval. No implementation starts before sign-off.**
+Consumer: the Wails app (Go backend, web UI via bindings). No HTTP layer, no queue: the app owns jobs and serves files itself; holocropper provides the data, previews, passes and progress through Go binding funcs.
 
-## 1. What the Wails app needs
+## 1. Owner requirements on record
 
-- **Settings**: read/set every render parameter (the CLI flag set), get a machine-readable schema for the settings form, and get *all* validation errors at once for per-field UI errors.
-- **Inputs**: list the videos in a directory the app chose; get a poster frame JPEG for any input.
-- **Probe**: run the auto-orient probe without rendering; get per-sample subject boxes + orientation scores for a pre-render preview.
-- **Live render**: phases with per-phase progress, batched framing records, live preview frames — while the render runs.
-- **Bbox visualisation**: every box precomputed in analysis px, normalized 0..1, and output px, so the UI draws anywhere with zero geometry math.
-- **Preview images**: annotated snapshots sampled during the render + a contact sheet, pulled as bytes.
-- **Control**: cancel anytime — must actually stop the ffmpeg children and clean up its scratch dirs (today `Cancel()` does neither).
-- **Result + metrics**: applied settings, orientation chosen, dims, output path; coverage/overshoot/slack/walk/dropout badges computed live, no offline pass.
-- **Scratch space on the app's terms**: the library needs two temp areas during a render (the downscaled analysis video, the output-size JPEG frame sequence). Today these are `os.MkdirTemp("", ...)` in the system temp with one of them *not even cleaned up on cancel*. New scheme: the app passes `TempDir`; the library creates uniquely-named subdirectories there, uses only those, and removes exactly those on completion/cancel (unless `KeepWorkDir` is set for debugging).
+Standing rulings (2026-11-19):
 
-## 2. Current seams to open
+1. Go public funcs only — no HTTP, no network; all data real time.
+2. The app tracks jobs; no queue/persistence inside holocropper.
+3. All scratch on disk lives in **caller-supplied directories** (`TempDir`); the library may return paths under it for the app to serve.
+4. The surface must be well-designed and easy to build a UI against.
 
-Audited from the actual code (`holocropper.go`, `pipeline.go`, `process.go`, `preprocess.go`, `file_io.go`, `box_debug.go`, `auto_orient.go`, CLI):
+Feature requirements added in approval review (owner, v4 drivers):
 
-- **S1 — no context.** `Crop` is uncancellable via `context.Context`; `resizeTiny` and `convertImagesToMP4` use plain `exec.Command`, so cancel closes pipeline channels while ffmpeg keeps running. Pipeline stages never close their own output channels (termination relies on `closePipes` from outside), so mid-render cancel can deadlock or panic on send-to-closed.
-- **S2 — stdout coupling.** Startup text, `cmd.String()` of every ffmpeg call, and terminal progress bars (three separate bars: scale, detect, mux) are hardcoded in the package.
-- **S3 — env-var telemetry only.** Framing records leave the package only via `HOLOCROPPER_DEBUG_BOXES` → CSV file.
-- **S4 — unguarded counters.** `currentFrame++` in the save stage is read unguarded by `tickPipeline`/`Progress()`/`Done()` (data race under `-race`).
-- **S5 — no structured result.** Applied dims, analysis dims, source dims, frame count, elapsed, actual output path — never returned.
-- **S6 — probe output too thin.** `OrientationStat` has aggregates only, no per-sample bboxes.
-- **S7 — nothing live.** No handle, no way to query a running render.
-- **S8 — wire-unfriendly types.** `image.Rectangle` and inline `fmt.Errorf("Error: ...")` strings; Wails serializes everything to JSON for JS.
-- **S9 — phase progress is conflated.** `totalFrames` is set by `resizeTiny` (source frame count) then overwritten by `startPipeline` (analysis video frame count); the scale bar, detect counter and mux bar each have their own notion of total. The API needs **phase-scoped progress**: `{phase, done, total}` per phase, with the library owning phase transitions.
-- **S10 — scratch dirs opaque and leaky.** Two `os.MkdirTemp` dirs the caller never sees; `rmTempDirs` removes only the analysis dir — the JPEG frames dir is removed only on the success path inside `convertImagesToMP4`. Cancel leaves it behind.
-- **S11 — ffmpeg path hardcoded.** Both calls exec `"ffmpeg"` from PATH; an embedded app (Wails packaged for distribution) may ship its own binary and must be able to point at it.
+5. **Full video previews from the API**: crop preview video, bbox-overlay video, and the original video — returned as servable file paths.
+6. **Changing any setting updates everything in real time.**
+7. **Final render output call** — explicit, separate from previews.
+8. **Real-time progress bars for every pass**: preprocessing analysis re-encode, the detection pass, the preview render, the final render conversion.
+9. A full end-to-end UI-ready data plane (the reference app proves it; the UI itself is app-side).
 
-`cmd/holocropper` (CLI + Makefile) and the env-var CSV remain untouched as the internal measurement toolchain for `HIGH-ASPECT-RATIO-FIXES.md`; they are **not** API surface.
+## 2. The architectural core: passes + cached detection + replay
 
-## 3. The complete API surface (the scheme)
+Requirement 6 forbids the current fused pipeline (one pass: scale → decode → detect → frame → crop → mux, re-running everything for every change). The controller facts that make the redesign possible:
 
-Grouped by the flow the UI will actually implement. All exported types carry `json:"..."` snake_case tags so anything returned crosses a Wails binding predictably. All live-query handle methods are safe to call from the Wails runtime goroutine while `Run` executes in the app's job goroutine.
+- The framing controller (STEP 4) is a **pure per-frame decision function over the detection stream** — `framing_test.go` already tunes it by replaying the controller against recorded corpus bbox streams (§12.7). Streaming and replay are the same arithmetic.
+- Detection depends only on the *analysis video* (resolution + frame alignment), **not** on output size, zoom margin, max zoom, or auto-orient. Those settings affect only the framing replay, which costs **milliseconds** for a full video (5 558 frames ≈ trivial arithmetic).
 
-### 3.1 Settings, validation, schema (the settings form)
+So the pipeline splits into addressable passes:
+
+```
+PREPARE ──► DETECT ──► [DetectionStream: cached, per-frame master bbox + subject count]
+   │           │
+   └─ ffmpeg    └─ decode + Otsu + components, one pass over the analysis video
+
+DETECTIONSTREAM × SETTINGS ──► PLAN  (in-process replay, ~ms, re-run on every setting change)
+   ├─► FrameRecords (analysis / normalized / output px)
+   ├─► orientation decision + probe stats (auto-orient = stream aggregates)
+   ├─► Metrics
+   └─► Resolved settings actually used
+
+PLAN ──► RENDER PREVIEW   (fast, low-res, servable mp4s: crop video + bbox-overlay video)
+PLAN ──► RENDER FINAL     (output-res crops from the cached analysis video + source audio, no re-detect)
+```
+
+Key consequences:
+
+- **Real-time setting changes**: output dims, zoom margin, max zoom, auto-orient, walk behaviour, preview size → re-`Plan` (instant) → UI redraws overlays, re-plans metrics → debounced `RenderPreview` refreshes the preview videos. Only **analysis height** (and fps, see §4) invalidates the cached detection stream.
+- **Final render skips detection**: crops execute against the cached analysis video using the planned records — the expensive part was already paid once.
+- **Determinism preserved**: preview, final and CLI all drive the *same* controller code path; replay output is byte-identical to streaming output (asserted by a new equivalence test against corpus CSVs).
+- The auto-orient `Probe` becomes a derived view of the same `DetectionStream` — no separate probe decode.
+
+## 3. Passes, progress contract, invalidation
+
+Progress contract (requirement 8): every async pass is a **Task** with `State()`, `Progress() ProgressState`, `Cancel()`, and typed `Wait()`; optionally an `Observer` pushes the same events. Phases are task-scoped, each with its own totals (fixes the current conflation where three different bars share `totalFrames`):
+
+| Pass | API | Phases (Done/Total = frames) | Progress source |
+|---|---|---|---|
+| Prepare (analysis re-encode) | part of `Analyze` | `prepare` | ffmpeg stderr frame counter |
+| Detect | part of `Analyze` | `detect` | decode loop counter |
+| Plan | `Plan(...)` — synchronous | none (expected < 100 ms for a 5-min video; benchmark test enforces) | — |
+| Render preview | `RenderPreview` | `preview_crop`, `preview_overlay`, `preview_mux` | Go crop loop counter, ffmpeg mux counter |
+| Render final | `RenderFinal` | `render_frames`, `render_mux` | Go crop loop counter, ffmpeg mux counter |
+
+Invalidation rules (what a settings change costs):
+
+| Changed setting | Re-run needed | Typical cost |
+|---|---|---|
+| output W/H, zoom margin, max zoom, auto-orient, fps | `Plan` only | ms |
+| preview max width / overlay options | `RenderPreview` only | seconds, low-res |
+| analysis height | `Analyze` (prepare + detect) | full detection pass once |
+| new input video | `Analyze` | full detection pass once |
+
+Cache: the detection stream + analysis video live in `<TempDir>/holocropper-analysis-<key>/` (key = input path + mtime + analysis height + stream frame-alignment mode). The app owns `TempDir`; `Analysis.Evict()` and `Analysis.Dir()` are exposed. Streams are compact (per frame: 4× int16 bbox + subject count → ~150 KB for 5 558 frames).
+
+## 4. Frame alignment fix (needed by the pass model)
+
+Today `resizeTiny` re-encodes the analysis video with `-r <fps>`, which can duplicate/drop frames relative to the source — harmless when everything is one fused pass, but the pass model requires **1:1 frame indices** between source, analysis video, detection stream, previews and the final mux (which maps *source* audio against the crop sequence). Prepare therefore encodes with frame passthrough (`-fps_mode passthrough`); output fps is applied at mux time, exactly as today. The detection stream is keyed by frame index. (Note for the corpus: sources are ≥24 fps; where source fps equals the old `-r` value the stream is unchanged, so existing measurements stay comparable.)
+
+## 5. Current seams to open (from the pipeline audit)
+
+- **S1 — no context**: `Crop` uncancellable; `resizeTiny`/`convertImagesToMP4` use plain `exec.Command`; stages never close their own output channels, so mid-render cancel can deadlock (send-to-closed panic). Fix: per-stage channel closing + drain-discard on cancel + `exec.CommandContext`.
+- **S2 — stdout coupling**: startup prints, `cmd.String()` per ffmpeg call, three terminal progress bars.
+- **S3 — env-var telemetry only** (`HOLOCROPPER_DEBUG_BOXES`): stays as internal tooling for `HIGH-ASPECT-RATIO-FIXES.md` measurement, not API.
+- **S4 — unguarded counters**: `currentFrame++` read unguarded by `tickPipeline`/`Progress()`/`Done()`.
+- **S5 — no structured result** (applied dims, analysis dims, output path, elapsed).
+- **S6 — probe aggregates only**, no per-sample boxes.
+- **S7 — nothing live**: no handle to query a running pass.
+- **S8 — wire-unfriendly types**: `image.Rectangle`, error strings, no JSON tags.
+- **S9 — phase progress conflated** (see §3).
+- **S10 — scratch dirs opaque and leaky**: `os.MkdirTemp` in system temp; cancel leaks the frames dir entirely.
+- **S11 — ffmpeg path hardcoded** (`"ffmpeg"` from PATH).
+- **S12 — fused pipeline**: every setting change re-runs detection (minutes) — incompatible with requirement 6. The pass split (§2) is the fix.
+- **S13 — `-r` resampling** risks frame-index drift between analysis video and source (see §4).
+
+`cmd/holocropper` CLI + Makefile stay as-is until the new surface is proven (then the CLI is reimplemented on `Analyze → Plan → RenderFinal`, keeping identical output).
+
+## 6. The complete API surface (the scheme)
+
+All exported types carry snake_case `json` tags for Wails. Live-query methods are safe from any goroutine while a Task runs.
+
+### 6.1 Settings, validation, schema (settings form)
 
 ```go
 type Settings struct {
-    Width, Height  int     `json:"width"`   // 0/default = 240; always rounded up to even
-    FPS            float64 `json:"fps"`     // 0 = 20
-    AnalysisHeight int     `json:"analysis_height"` // 0 = 480, never below Height
-    ZoomMargin     float64 `json:"zoom_margin"`     // 0 = 1.12
-    MaxZoom        float64 `json:"max_zoom"`        // 0 = 2.0
+    Width, Height  int     `json:"width"`            // 0 = 240; rounded up to even
+    FPS            float64 `json:"fps"`              // 0 = 20; controller dt + mux rate
+    AnalysisHeight int     `json:"analysis_height"`  // 0 = 480, never below Height
+    ZoomMargin     float64 `json:"zoom_margin"`      // 0 = 1.12
+    MaxZoom        float64 `json:"max_zoom"`         // 0 = 2.0
     AutoOrient     bool    `json:"auto_orient"`
 }
-
-// ValidationError names the field, so the UI highlights inputs individually.
 type ValidationError struct{ Field, Reason string }
-func (s Settings) Validate() []ValidationError   // ALL violations at once, empty = valid
-
-// ParamSpec powers auto-generated forms: defaults, ranges, help text.
-type ParamSpec struct {
-    Name, Type string   // "integer" | "float" | "bool"
-    Default any
-    Min, Max any        // nil = unbounded; nil Max on analysis_height means "source height"
-    Help string
-}
+func (s Settings) Validate() []ValidationError   // ALL violations at once
+type ParamSpec struct { Name, Type string; Default any; Min, Max any; Help string }
 func Schema() []ParamSpec                        // covers every Settings field
+type Resolved struct { Settings; SourceW, SourceH, AnalysisW, AnalysisH, OutputW, OutputH int }
 ```
 
-Ranges (enforced by `Validate`, advertised by `Schema`): `width`/`height` 16–4096; `fps` 1–120; `analysis_height` 0 or ≥ height (values above source height are allowed but `Probe`/`Result` report the supersampling cost); `zoom_margin` 1.0–10.0 (the 1.18 landscape/portrait padding floor still applies); `max_zoom` 1.0–8.0.
+Ranges (`Schema` advertises, `Validate` enforces): width/height 16–4096; fps 1–120; analysis_height 0 or ≥ height; zoom_margin 1.0–10.0 (1.18 landscape/portrait padding floor always applies); max_zoom 1.0–8.0.
 
-`Resolved` (returned inside `Result` and `ProbeReport`) is `Settings` after defaults + even-rounding + probe flip, plus `SourceW/H`, `AnalysisW/H` — what *actually* got used, for display.
-
-### 3.2 Inputs and poster (the input picker)
+### 6.2 Inputs and poster (input picker)
 
 ```go
-type InputInfo struct {
-    Name string   `json:"name"`   // base name, e.g. "sweet.mp4"
-    Path string   `json:"path"`   // absolute path
-    SizeBytes int64 `json:"size_bytes"`
-    ModTime time.Time `json:"mod_time"`
-}
-func ListInputs(dir string) ([]InputInfo, error)      // sorted, .mp4 only
-func PosterFrame(input string, maxWidth int) (jpeg []byte, err error) // first frame, downscaled
+type InputInfo struct { Name, Path string; SizeBytes int64; ModTime time.Time }
+func ListInputs(dir string) ([]InputInfo, error)   // sorted, .mp4 only
+func PosterFrame(input string, maxWidth int) (jpeg []byte, err error)
 ```
 
-No inputs *directory* concept is baked into the library — the app passes any dir/path it owns.
+The **original video** for the UI player is simply `InputInfo.Path` (or the app's own path) — the app serves it; the library never copies inputs.
 
-### 3.3 Probe (the pre-render preview)
+### 6.3 Analysis pass (prepare + detect, cached, live)
 
 ```go
-type ProbeSample struct {
-    FrameIdx int    `json:"frame_idx"`
-    Subjects int    `json:"subjects"`
-    BBox     Rect   `json:"bbox"` // analysis px
-    Norm     Rect   `json:"norm"` // 0..1 over the probe analysis frame - draws directly on PosterFrame
-    AR       float64 `json:"ar"`
+type AnalyzeRequest struct {
+    Input          string // input video path
+    TempDir        string // cache + scratch parent (required)
+    FFmpegPath     string // "" = "ffmpeg" from PATH
+    AnalysisHeight int    // 0 = 480; part of the analysis cache key
+    Observer       *Observer
 }
+func Analyze(ctx context.Context, req AnalyzeRequest) (*AnalysisTask, error)
+func CachedAnalysis(input, tempDir string, analysisHeight int) (*Analysis, error) // cache hit, no Task
 
-type ProbeReport struct {
-    OrientationStat                     // existing struct: mean/median/geo AR, keep/flip scores, Flip decision
-    SourceW, SourceH   int  `json:"source_w"`
-    AnalysisW, AnalysisH int
-    Samples            []ProbeSample `json:"samples"`
-    ElapsedSeconds     float64       `json:"elapsed_seconds"`
-    Settings           Resolved      `json:"settings"` // what a render with these settings would use
+type AnalysisTask struct{ /* unexported */ }
+func (t *AnalysisTask) State() TaskState              // queued|running|cancelling|completed|failed|cancelled
+func (t *AnalysisTask) Progress() ProgressState       // prepare phase, then detect phase
+func (t *AnalysisTask) Cancel()
+func (t *AnalysisTask) Wait() (*Analysis, error)
+func (t *AnalysisTask) PartialStream() DetectionStream // frames detected SO FAR - live while running
+
+type Analysis struct{ /* cached pass result */ }
+func (a *Analysis) Stream() DetectionStream  // immutable, safe for any number of concurrent Plans
+func (a *Analysis) AnalysisVideoPath() string // the cached analysis mp4 (TempDir - app may serve/inspect)
+func (a *Analysis) Dir() string               // its cache dir
+func (a *Analysis) Evict() error
+
+type DetectionStream struct{ /* frames + geometry */ }
+func (s DetectionStream) Frame(i int) DetectionFrame
+func (s DetectionStream) Len() int
+type DetectionFrame struct {
+    BBox     Rect `json:"bbox"`     // master subject box, analysis px (empty when subject lost)
+    Subjects int  `json:"subjects"`
 }
-
-func (hc *HoloCropper) Probe(ctx context.Context, input string, s Settings) (*ProbeReport, error)
+// Geometry exposed by the stream: SourceW/H, AnalysisW/H, frame alignment.
 ```
 
-`AutoOrient` delegates to `Probe` internally (existing CLI behaviour unchanged). Normalized sample rects scale to the poster JPEG's own dimensions, so the UI overlays them with no math.
+Live behaviour during Detect (requirement 8): `PartialStream()` returns the frames detected so far, so framing previews (§6.4) start while detection is still running — the UI shows overlays over the original video before the analysis pass finishes.
 
-### 3.4 Render request and scratch space (the core of the owner ruling)
+### 6.4 Plan (the real-time replay — requirement 6)
+
+```go
+func Plan(stream DetectionStream, s Settings) (*Plan, error)
+
+type Plan struct{ /* replayed framing, immutable */ }
+func (p *Plan) Records() []FrameRecord   // full per-frame stream, all three coordinate spaces
+func (p *Plan) Record(i int) FrameRecord
+func (p *Plan) Orientation() OrientationStat  // probe stats + flip decision computed from the stream
+func (p *Plan) Resolved() Resolved
+func (p *Plan) Metrics() *Metrics
+func (p *Plan) Walk() WalkSummary      // active? range px, fallback-frame count (§14 telemetry)
+func (p *Plan) DropoutFrames() []IntRange // subject-lost spans
+```
+
+`Plan` is pure and synchronous — the UI can call it on every slider tick (benchmark acceptance: < 100 ms for 5 558 frames; typical ~10 ms). `AutoOrient` is no longer a separate decode: the flip decision is `Plan`'s orientation aggregates. Preview == final == CLI framing are guaranteed identical because all three execute the same replay.
+
+### 6.5 Preview renders (full videos, servable paths — requirement 5)
+
+```go
+type PreviewOptions struct {
+    MaxWidth    int  `json:"max_width"`     // 0 = 480: preview render width
+    CropVideo   bool `json:"crop_video"`    // the framed/cropped preview
+    OverlayVideo bool `json:"overlay_video"`// analysis-res frames + drawn boxes
+    DrawSubject bool `json:"draw_subject"`  // overlay video: subject + EMA boxes
+    DrawCrop    bool `json:"draw_crop"`     // overlay video: crop window
+    Observer    *Observer
+}
+
+func (p *Plan) RenderPreview(ctx context.Context, req PreviewRequest) (*PreviewTask, error)
+// PreviewRequest{ TempDir, FFmpegPath, PreviewOptions, OutputName }
+
+type PreviewTask struct{ ... State/Progress/Cancel ... }
+func (t *PreviewTask) Wait() (*PreviewResult, error)
+
+type PreviewResult struct {
+    CropVideoPath   string `json:"crop_video_path"`   // under TempDir - servable; "" if not requested
+    OverlayVideoPath string `json:"overlay_video_path"`
+    Width, Height, Frames int
+    FPS float64
+    ElapsedSeconds float64
+}
+```
+
+Mechanics: crops execute from the cached analysis video via the same `cropToBBox`/`fillResize` code as STEP 5 at preview resolution; the overlay video composites boxes (from `Plan.Records()`, drawn in analysis px) onto analysis frames; both mux through ffmpeg `mjpeg` with progress. JPEG scratch lives in `<TempDir>/holocropper-render-<renderID>/frames/` (renderID-isolated, cancel-safe). `Snapshot`/`ContactSheet` (annotated stills + bytes, §6.8) remain for scrubber thumbs alongside the preview videos.
+
+### 6.6 Final render (the explicit output call — requirement 7)
 
 ```go
 type RenderRequest struct {
-    Input     string   `json:"input"`      // video file the app chose
-    OutputDir string   `json:"output_dir"` // must exist; final <basename>.mp4 lands here
-    TempDir   string   `json:"temp_dir"`   // REQUIRED for library mode: parent for all scratch
-    KeepWorkDir bool   `json:"keep_work_dir"` // debug: leave scratch dirs for inspection
-    FFmpegPath string  `json:"ffmpeg_path"` // "" = "ffmpeg" from PATH
-    Settings  Settings `json:"settings"`
-    Preview   PreviewOptions `json:"preview"`
-    Observer  *Observer `json:"-"`         // Go callbacks; nil = pull-only
+    OutputDir  string // required, exists; final <basename>.mp4 lands here
+    TempDir    string // required scratch parent
+    FFmpegPath string // "" = PATH
+    Observer   *Observer
 }
+func (p *Plan) RenderFinal(ctx context.Context, req RenderRequest) (*RenderTask, error)
 
-// RenderRequest.Validate() returns []ValidationError, covering input-file-exists,
-// output-dir-exists, TempDir (created via MkdirAll if absent), settings fields.
+type RenderTask struct{ ... State/Progress/Cancel ... }
+func (t *RenderTask) Wait() (*Result, error)
 
-// Scratch layout inside the app's TempDir (all created/removed by the library):
-//   <TempDir>/holocropper-<renderID>/analysis/   downscaled analysis video
-//   <TempDir>/holocropper-<renderID>/frames/     output-size JPEG sequence
-// renderID is a random suffix, so concurrent renders in one TempDir never collide.
-// Cleanup: removed on completion AND on cancel, unless KeepWorkDir. Result reports
-// WorkDir so the app can inspect kept dirs.
+// One-shot convenience (no cached analysis, no interactive flow) — wraps the three passes:
+func RenderWhole(ctx context.Context, req AnalyzeRequest, settings Settings, renderReq RenderRequest) (*Result, error)
 ```
 
-`Crop` (CLI path) keeps today's behavior; the new `StartRender` path requires `TempDir` (validation error if empty) — the library never writes outside `OutputDir` and its own scratch subdirs.
+`RenderFinal` executes planned crops against the cached analysis video, JPEG sequence into the render scratch dir, ffmpeg mux **with the source audio track** exactly as today, output at the requested WxH, and cleans scratch on completion/cancel (`Result.WorkDir` reported; a `KeepWorkDir` debug flag available). `Crop` (CLI) remains untouched until the CLI is ported to this surface.
 
-### 3.5 Render lifecycle (job control owned by the app)
-
-```go
-func (hc *HoloCropper) StartRender(req RenderRequest) (*RenderHandle, error) // validate + prepare, no pipeline yet
-
-type RenderHandle struct{ /* unexported */ }
-
-// Drive it in the app's job goroutine; blocks until terminal:
-func (h *RenderHandle) Run(ctx context.Context) (*Result, error)
-func (h *RenderHandle) Cancel() // equivalent to cancelling the Run ctx; safe from any goroutine
-
-// Live queries (callable before/during/after Run):
-func (h *RenderHandle) State() RenderState   // not_started | running | cancelling | completed | failed | cancelled
-func (h *RenderHandle) Progress() ProgressState
-func (h *RenderHandle) Records(from, to int) ([]FrameRecord, error)
-func (h *RenderHandle) LiveFrame() (*LiveFrame, error)
-func (h *RenderHandle) Snapshot(frame int) (*Snapshot, error)
-
-// Terminal-only:
-func (h *RenderHandle) ContactSheet() (*ContactSheet, error)
-func (h *RenderHandle) Metrics() (*Metrics, error)   // partial mid-render: Metrics.Complete=false
-```
-
-```go
-type Phase string // "probe" | "scale" | "detect" | "mux"
-
-type ProgressState struct {
-    Phase Phase `json:"phase"`
-    Done  int   `json:"done"`   // phase-scoped (fixes S9: each phase has its own total)
-    Total int   `json:"total"`
-    ElapsedSeconds float64 `json:"elapsed_seconds"`
-}
-```
-
-Pipeline teardown redesign (fixes S1 fully): every stage goroutine closes its own output channel when its input drains or ctx cancels; on cancel, stages **drain-and-discard** so no producer blocks on a dead consumer; both ffmpeg calls move to `exec.CommandContext` with the request's `FFmpegPath`; `Run` waits for all stages before removing scratch; `Cancel()` mid-scale and mid-mux kill ffmpeg children and return `context.Canceled`-based errors. The legacy `Cancel()`/`Progress()`/`Done()` on `HoloCropper` stay for CLI compatibility, marked deprecated.
-
-### 3.6 Frame records: push (Observer) and pull (Records)
+### 6.7 Records, observer, progress (the live data plane)
 
 ```go
 type Rect struct{ X, Y, W, H float64 }
 type SpaceRects struct{ BBox, EMA, Crop Rect }
-
 type FrameRecord struct {
-    Frame    int        `json:"frame"`
-    Subjects int        `json:"subjects"`
-    BBox  Rect          `json:"bbox"`  // master subject box, analysis px
-    EMA   Rect          `json:"ema"`   // smoothed subject box
-    Crop  Rect          `json:"crop"`  // applied crop rect
-    TargetH   float64   `json:"target_h"`
-    WalkTgt   float64   `json:"walk_tgt"`  // 0 = leash inactive
-    WalkActive bool     `json:"walk_active"`
-    Norm SpaceRects     `json:"norm"`  // all three rects, 0..1 over the analysis frame
-    Out  SpaceRects     `json:"out"`   // all three rects mapped into output-frame px
+    Frame int; Subjects int
+    BBox, EMA, Crop Rect      // analysis px
+    TargetH, WalkTgt float64; WalkActive bool
+    Norm, Out SpaceRects      // precomputed 0..1 and output-px spaces
 }
+
+type Phase string // prepare | detect | preview_crop | preview_overlay | preview_mux | render_frames | render_mux
+type ProgressState struct{ Task, Phase string; Done, Total int; ElapsedSeconds float64 }
 
 type Observer struct {
     OnPhase    func(ProgressState)
     OnProgress func(ProgressState)  // ≤ 4 Hz per phase
-    OnFrames   func([]FrameRecord)  // ≤ 24 records or 250 ms per batch
+    OnFrames   func([]FrameRecord)  // ≤ 24 records or 250 ms (Detect partials + live renders)
     OnWarning  func(string)         // ffmpeg stderr diagnostics
 }
-// Observer callbacks fire from pipeline goroutines and must not block
-// (app-side job: wailsruntime.EventsEmit or a buffered channel send).
+// Callbacks fire from pipeline goroutines; they must not block (app job: EventsEmit / buffered channel).
 ```
 
-Pull side: `Records(from, to)` answers from a bounded ring (`Preview.RecordRing`, default 4096) after clamping to what's retained; `Result.RecordsDropped` counts evictions. Both paths feed the same typed records — the app picks push, pull, or both.
-
-### 3.7 Live preview (images, real time, from the real render)
+### 6.8 Stills, contact sheets, metrics
 
 ```go
-type PreviewOptions struct {
-    LiveFrames    bool `json:"live_frames"`      // enable LiveFrame()
-    LiveMaxWidth  int  `json:"live_max_width"`   // 0 = 320
-    LiveRateHz    int  `json:"live_rate_hz"`     // 0 = 10
-    SampleEvery   int  `json:"sample_every"`     // 0 = auto: ~64 snapshots across the video
-    KeepSnapshots int  `json:"keep_snapshots"`   // 0 = 64
-    RecordRing    int  `json:"record_ring"`      // 0 = 4096
-}
-
-type LiveFrame struct { // current analysis frame + its framing
-    Frame int  `json:"frame"`
-    W, H  int  `json:"w"`
-    JPEG  []byte `json:"jpeg"`
-    Record FrameRecord `json:"record"`
-}
-
-type Snapshot struct { // actual output frame, boxes + legend composited during render
-    Frame int `json:"frame"`
-    W, H  int `json:"w"`
-    JPEG  []byte `json:"jpeg"`
-    Record FrameRecord `json:"record"`
-}
-
-type ContactSheet struct {
-    W, H int `json:"w"`
-    JPEG []byte `json:"jpeg"`
-    Tiles []SnapshotRef `json:"tiles"` // frame idx + tile rect within the sheet
-}
+func (p *Plan) Snapshot(frame int, maxWidth int) (*Snapshot, error)      // annotated output-space frame from the analysis video, in-memory
+func (p *Plan) ContactSheet(maxWidth int) (*ContactSheet, error)         // tiles + frame idx + walk markers, in-memory
+type Metrics struct { CoverageMeanPct, CoverageMedianPct float64; EdgeOvershootFrames int;
+    MinSlackPctPerSide, WalkRangePx float64; DropoutFrames, SceneCuts int }
+func ComputeMetrics(records []FrameRecord, geo Geometry) *Metrics         // Python-tooling port
 ```
 
-`LiveFrame` comes from the STEP 1 analysis frames (downscaled, JPEG, rate-capped); `Snapshot` from the STEP 5/6 output frames with subject/EMA/crop boxes and a legend composited in memory before encoding. Nothing written to disk (unless `KeepWorkDir` debug); all bytes delivered through bindings.
+Stills need no Task: they composite from the cached analysis video + `Plan` records on demand (fast: one video seek). All bytes cross bindings directly.
 
-### 3.8 Result and errors
+### 6.9 Result and errors
 
 ```go
 type Result struct {
-    InputPath, OutputPath string  `json:"output_path"` // <OutputDir>/<basename>.mp4 actually written
-    WorkDir string  `json:"work_dir"`      // scratch dir (deleted unless KeepWorkDir)
-    SourceW, SourceH int   `json:"source_w"`
-    AnalysisW, AnalysisH int
-    OutputW, OutputH int   `json:"output_w"` // after auto-orient + even rounding
-    AppliedSettings Resolved `json:"applied_settings"`
-    Frames int             `json:"frames"`
-    ElapsedSeconds float64 `json:"elapsed_seconds"`
-    Orientation *OrientationStat `json:"orientation,omitempty"`
-    RecordsAvailable int  `json:"records_available"`
-    RecordsDropped  int   `json:"records_dropped"`
-    Warnings []string     `json:"warnings"` // ffmpeg stderr tails, probe fallbacks
+    InputPath, OutputPath string; WorkDir string
+    SourceW, SourceH, AnalysisW, AnalysisH, OutputW, OutputH int
+    AppliedSettings Resolved; Orientation *OrientationStat
+    Frames int; FPS float64; ElapsedSeconds float64
+    Warnings []string
 }
 ```
 
-Error taxonomy (UI-mappable): `[]ValidationError` from every `Validate()`; sentinel errors `ErrRenderNotStarted`, `ErrRenderTerminal` (live query on a cancelled/failed render), `ErrArtifactNotReady` (Snapshot/ContactSheet/Metrics too early), `ErrRecordsEvicted` window semantics folded into clamping + `RecordsDropped`; cancel yields `context.Canceled`; ffmpeg failure wrapped as `*FFmpegError{Phase, Command, ExitCode, StderrTail}`. No bare `fmt.Errorf("Error: ...")` strings in the new surface.
+Error taxonomy: `[]ValidationError` (per-field, from every Validate); `context.Canceled`; sentinel `ErrAnalysisCacheMiss` (CachedAnalysis), `ErrStreamIncompatible` (Plan against a stream with mismatched geometry); `*FFmpegError{Phase, Command, ExitCode, StderrTail}`. No bare error strings in the new surface.
 
-### 3.9 Metrics (live quality badges)
+## 7. Coordinate mapping (analysis px → normalized → output px)
 
-```go
-func Analyze(records []FrameRecord, geo Geometry) *Metrics
-func (h *RenderHandle) Metrics() (*Metrics, error)
+Analysis frame: `AH` = analysis height (even), `AW = AH × srcW/srcH` (even, true source AR). Normalized: `u = x/AW`, `v = y/AH` — UI-stable across settings, scales onto any served original/preview video. Output px: crop rect is aspect-locked and fills the output exactly: `out = ((p.x - crop.X) × OutputW/CropW, (p.y - crop.Y) × OutputH/CropH)`; landscape stage-padding crops may legitimately produce out-of-bounds `Out` values (raw, clamped by the UI). Grounded crops: crop bottom == output bottom exactly. Every `FrameRecord` ships all three spaces, so drawing over the **original video** in the UI = scale normalized rects to the player size — zero client-side geometry.
 
-type Metrics struct {
-    Complete bool `json:"complete"`
-    CoverageMeanPct, CoverageMedianPct float64 `json:"coverage_mean_pct"`
-    EdgeOvershootFrames int    `json:"edge_overshoot_frames"`
-    MinSlackPctPerSide  float64 `json:"min_slack_pct_per_side"`
-    WalkRangePx float64 `json:"walk_range_px"`
-    DropoutFrames int   `json:"dropout_frames"`
-    SceneCuts int       `json:"scene_cuts"`
-}
+## 8. Concurrency, cache and real-time policy
+
+- **No queue in the library.** App owns scheduling. Per instance: one async Task at a time (detect or render); `Plan` is pure, concurrent-safe against an immutable `DetectionStream`, unlimited. Multiple instances may run Tasks concurrently (CPU-heavy; serial stays frame-deterministic run-to-run — the property the §13/§14 verification workflow depends on; the app decides).
+- Debounce guidance (app-side): slider drag → `Plan` each tick (ms), overlay redraw immediate; `RenderPreview` re-trigger debounced ~300–500 ms and skipped while a preview Task is still running (app cancels the stale one).
+- Cache lifecycle: analysis cache keyed by (input path+mtime+size, analysis height); lives under the app's `TempDir`; app may delete the whole dir tree any time. Render scratch (`renderID`-isolated) is removed on completion/cancel unless `KeepWorkDir`.
+- Memory ceilings: detection stream ~150 KB/5-min video; `Plan` records ~16 numbers/frame (numbers only); preview JPEGs streaming (one in flight) — per-flow memory stays tens of MB.
+- Live ceilings on the binding path: frame batches ≤ 24 recs/250 ms; progress ≤ 4 Hz/phase; no unbounded queues anywhere.
+
+## 9. End-to-end UI flow this surface enables (requirement 9)
+
+```
+Schema() ──────────► settings form (per-field errors from Validate())
+ListInputs(dir) ───► input picker;  PosterFrame / InputInfo.Path ► player + poster
+Analyze(...) ──────► progress bar (prepare, detect); PartialStream ► overlays start immediately
+Plan(stream, s) ───► canvas overlays (Norm rects over original video), Metrics badges,
+                     orientation decision, walk summary — re-run instantly on any setting change
+RenderPreview(...) ► progress bar; CropVideoPath ► "what the crop looks like" video
+                     OverlayVideoPath ► "why" video (boxes over analysis frames)
+RenderFinal(...) ──► progress bars (render_frames, render_mux); Result.OutputPath ► player
+Cancel on any Task ► progress bar stops, scratch cleaned, ErrCancelled surfaces
 ```
 
-Ported from the Python tooling (`/tmp/opencode/analysis/*.py`), pure in-process over records; callable mid-render on the ring.
+`examples/wails-bindings/` implements exactly this flow as the acceptance reference for the data plane.
 
-## 4. Coordinate mapping (analysis px → normalized → output px)
+## 10. Epics, milestones, stories
 
-Analysis frame: `AH` = analysis height (even), `AW = AH × srcW/srcH` (even, preserves true source AR).
+Estimates: story points (1,2,3,5,8). No implementation before approval.
 
-- **Normalized** `0..1`: `u = x/AW`, `v = y/AH` — the UI-stable space, comparable across renders/settings; scales to any delivered JPEG's own W×H.
-- **Source px**: × `srcW/AW` (uniform; < 1 px even-rounding error) — poster-frame overlays.
-- **Output px**: crop rect is aspect-locked and scales to fill the output exactly: `out = ((p.x - crop.X) × OutputW/CropW, (p.y - crop.Y) × OutputH/CropH)`. Stage-padding crops (landscape spill) map identically and may yield negative/out-of-bounds values — `Out` carries them raw, the UI clamps for display. Grounded crops: crop bottom == output bottom exactly.
-
-`FrameRecord` ships all three spaces precomputed (`BBox/EMA/Crop`, `Norm`, `Out`) so "draw it anywhere" needs zero client-side geometry.
-
-## 5. Concurrency and real-time ceilings
-
-- **No queue in the library.** App owns scheduling. One `HoloCropper` instance = one render at a time; the app may run multiple instances (documented as CPU-heavy: detection + 2 ffmpeg passes each). Serial renders stay frame-deterministic run-to-run (the property the verification workflow depends on); the app decides if it wants that.
-- **Probe** (≤ 128 decoded frames + one ffmpeg pass) may run concurrently with a render.
-- **Library-side ceilings** protecting the binding path: frame batches ≤ 24 recs / 250 ms; progress ≤ 4 Hz per phase; `LiveFrame` ≤ `LiveRateHz`; bounded rings (4096 records, 64 snapshots) → memory < ~50 MB per render regardless of video length; eviction counted, never silently lost.
-- Pipeline stays streaming; JPEG scratch only inside the app's scratch subdirs; annotated preview composited in memory.
-
-## 6. Wails integration shape (reference, app side)
-
-```go
-type App struct{ ctx context.Context; hc *holocropper.HoloCropper; h *holocropper.RenderHandle; runCtx context.Context }
-
-func (a *App) StartRender(req holocropper.RenderRequest) error {   // JS sends settings JSON
-    h, err := a.hc.StartRender(req)   // Observer here: OnFrames/OnProgress -> EventsEmit
-    if err != nil { return err }
-    a.h = h
-    a.runCtx, cancel = context.WithCancel(a.ctx)
-    go func() {
-        res, err := h.Run(a.runCtx)
-        if err != nil { wailsruntime.EventsEmit(a.ctx, "failed", err); return }
-        wailsruntime.EventsEmit(a.ctx, "completed", res)
-    }()
-    return nil
-}
-
-// Bound methods the JS UI calls:
-Schema() []holocropper.ParamSpec
-ListInputs(dir string) ([]holocropper.InputInfo, error)
-Probe(input string, s holocropper.Settings) (*holocropper.ProbeReport, error)
-Progress() holocropper.ProgressState
-LivePreview() (*holocropper.LiveFrame, error)
-Snapshot(n int) (*holocropper.Snapshot, error)
-CancelRender()
-```
-
-The UI flow maps 1:1: form from `Schema()` → per-field errors from `Validate()` → input picker from `ListInputs`/`PosterFrame` → pre-render overlay preview from `Probe` + poster → live canvas from `Observer` batches + `LiveFrame` → scrubber from `Snapshot`/`ContactSheet` → badges from `Metrics` → player from `Result.OutputPath`.
-
-## 7. Epics, milestones, stories
-
-Estimates: story points (1,2,3,5,8). No implementation before this scheme is approved.
-
-### Milestone A — embedded API core
+### Milestone A — passes, replay engine, real-time planning
 
 | ID | Story | Est | Depends on | Acceptance criteria |
 |---|---|---|---|---|
-| A1 | Context teardown: per-stage output-channel closing + drain-discard on cancel, `exec.CommandContext` (both calls) with configurable `FFmpegPath`, `Run` waits for stages, scratch fully removed on cancel | 5 | — | kill mid-scale/mid-detect/mid-mux: no zombie ffmpeg, no leaked scratch, `errors.Is(err, context.Canceled)` |
-| A2 | `Settings`/`Validate()` (all-errors)/`Schema()`/`Resolved`; `RenderRequest` + validation; **`TempDir` scratch under the caller's dir with renderID isolation + guaranteed cleanup (`KeepWorkDir` opt-out)**; fix S4 (atomic counters) | 5 | — | CLI `Crop` output unchanged on corpus; scratch dirs appear only under the passed `TempDir`; cancel removes them |
-| A3 | `RenderHandle` lifecycle: `StartRender`/`Run`/`Cancel`/`State`, phase-scoped `ProgressState`, phase transitions incl. probe/scale/detect/mux | 3 | A1, A2 | concurrent `Progress`/`Records` during render under `-race`; each phase reports its own done/total |
-| A4 | `FrameRecord` (wire types, precomputed `Norm`/`Out`) + ring + batched `Observer` + `Records(from,to)` + drop counters | 5 | A3 | tbaka 16:9: arbitrary mid-render windows answered; `Out` boxes match applied crop within < 1 px |
-| A5 | `Probe(ctx, input, settings)` + `ProbeReport` with per-sample boxes; `AutoOrient` delegates; `PosterFrame`; `ListInputs` | 3 | A2 | probe aggregates on corpus match current `OrientationStat` exactly |
-| A6 | `Result` (+ `WorkDir`, `Resolved`, ffmpeg stderr `Warnings`, `*FFmpegError` typing) | 2 | A1, A3 | `Result.OutputPath` on disk for all 4 corpus renders |
+| A1 | Teardown/context core: per-stage channel closing + drain-discard, `exec.CommandContext` with configurable `FFmpegPath`, cancel-safe scratch under caller `TempDir` (renderID isolation, `KeepWorkDir`), fix S4 atomics | 5 | — | kill mid-ffmpeg/mid-pipeline: no zombies, no leaked scratch, `context.Canceled` propagates; CLI corpus output unchanged |
+| A2 | `Settings`/`Validate`/`Schema`/`Resolved`, `AnalysisRequest`/`RenderRequest`/`PreviewRequest` validation, typed error taxonomy | 3 | — | all invalid inputs surface as per-field `ValidationError` lists |
+| A3 | **Replay engine**: extract the STEP 4 controller into a replayable per-frame decider; streaming calcVideo delegates to it; corpus equivalence test (replay of recorded bbox streams == streamed CSV framing, < 1 px drift) | 8 | A1 | existing 36 tests green; equivalence test passes on tbaka/sweet streams |
+| A4 | Analysis pass: `Analyze` Task (prepare with `-fps_mode passthrough`, detect), cache under `TempDir`, `CachedAnalysis`, `PartialStream()`, progress phases | 5 | A1, A2 | re-`CachedAnalysis` hit skips the whole pass; partial stream grows during detect; stream ~150 KB for 5-min video |
+| A5 | `Plan`: replay → `FrameRecord` list (Norm/Out precomputed), orientation/probe aggregates (replaces separate probe decode), `Resolved`, `Walk`, dropout; benchmark < 100 ms @ 5 558 frames | 5 | A3 | auto-orient decision matches current CLI probe decisions on the corpus |
+| A6 | `ComputeMetrics` port from the Python tooling + `Plan.Metrics` | 5 | A5 | reproduces §14/§14.1 numbers (tbaka overshoot 47, slack ≥ 3.5 %/side) |
 
-### Milestone B — live preview and metrics
+### Milestone B — preview and final renders
 
 | ID | Story | Est | Depends on | Acceptance criteria |
 |---|---|---|---|---|
-| B1 | `LiveFrame` stream (STEP 1 frames downscaled + JPEG, `LiveRateHz`-capped, pull + push) | 5 | A4 | < 500 ms behind pipeline on 1080p; rate ceiling holds |
-| B2 | `Snapshot` compositor (subject/EMA/crop + legend on real output frames, `SampleEvery`, ring-kept) | 8 | A4 | tbaka 16:9 → ~64 snapshots; drawn boxes match `Record.Out` |
-| B3 | `ContactSheet` composer from retained snapshots | 3 | B2 | single JPEG ≤ ~4 MB for a 5-min video |
-| B4 | `Analyze` metrics port + `Metrics()` with `Complete` flag | 5 | A4 | reproduces §14/§14.1 numbers (tbaka overshoot 47, slack ≥ 3.5 %/side) from live records |
+| B1 | `RenderPreview` Task: crop preview video + bbox-overlay video from cached analysis + Plan, ffmpeg mux with progress, servable paths under TempDir | 8 | A4, A5 | 5-min 1080p source → preview pair in < ~30 s at 480 px; boxes in overlay video match `Plan.Records` |
+| B2 | `RenderFinal` Task: crop sequence + audio mux from cached analysis + Plan; `RenderWhole` one-shot; parity test vs `Crop` output (same framing decisions, frame-deterministic) | 5 | A4, A5 | final mp4 frame count/AR correct; parity test green |
+| B3 | `Snapshot`/`ContactSheet` from cached analysis + Plan (in-memory compositing) | 3 | A5 | tbaka 16:9 contact sheet ≤ ~4 MB, boxes match `Record.Out` |
+| B4 | Progress/Observer plumbing across all Tasks (rate ceilings, batching, warnings from ffmpeg stderr) | 3 | A1–A5 | live progress ≤ 4 Hz, frames ≤ 24/250 ms observed on a corpus run |
 
 ### Milestone C — integration proof
 
 | ID | Story | Est | Depends on | Acceptance criteria |
 |---|---|---|---|---|
-| C1 | `examples/wails-bindings/` reference app exercising the §6 flow end to end | 5 | A1–A6, B1–B3 | live overlays visible against one corpus video in Wails |
-| C2 | Golden end-to-end test on a tiny fixture video: Result + Metrics + ring/Records behaviour, cancel case included; no corpus needed in CI | 3 | C1 | suite green in CI |
+| C1 | `examples/wails-bindings/` reference app implementing the §9 flow end to end (live detect progress, instant re-plan on slider changes, preview videos, final render, cancel) | 8 | A1–A6, B1–B4 | interactive setting changes visibly update overlays/metrics immediately; previews and final render work from the same analysis |
+| C2 | CI test suite: golden pipeline test on a tiny fixture video (no corpus), replay equivalence, Task cancel cases, benchmark gate | 5 | C1 | suite green without corpus videos; benchmark gate enforced |
+| C3 | Port `cmd/holocropper` CLI onto the new surface (`Analyze → Plan → RenderFinal`), delete the fused one-shot path; env-var CSV kept as internal debug shim inside the detect pass | 3 | B2 | CLI corpus renders match current framing decision streams |
 
 ### Deferred (explicitly out of scope)
 
-The Wails UI itself; uploads; anything HTTP/network; job persistence/history; supersampling above source height as a default.
+The Wails UI itself; uploads; HTTP/network of any kind; job persistence/history; supersampling above source height as a default.
 
-## 8. What changed across scheme versions
+## 11. What changed v3 → v4
 
-- v1 → v2 (owner ruling): HTTP layer, server package, job queue/workspaces/CSV persistence removed; Go bindings + real-time handle model; the env-var CSV stays as internal tooling only.
-- v2 → v3 (this revision, per owner notes): **caller-supplied `TempDir`** with renderID isolation and cancel-safe cleanup (new story A2); configurable `FFmpegPath`; phase-scoped `ProgressState` (S9); all-at-once `Validate() []ValidationError` + `Schema()` for form building; typed errors instead of error strings; `ListInputs`/`PosterFrame` helpers; `KeepWorkDir` debug option; `ContactSheet` returns tiles metadata, not just bytes.
+- **Pass model replaces the fused pipeline** (S12): Prepare/Detect cached → Plan replay → Preview/Final renders. Real-time setting changes are replays, not re-renders.
+- `StartRender/Run` monolith replaced by Task-per-pass with `State/Progress/Cancel/Wait` on each.
+- Full **preview videos** (crop + bbox overlay) as servable TempDir paths replace JPEG-only live preview as the primary preview plane; `LiveFrame` folded away — during-detect feedback comes from `PartialStream` + the UI drawing over the original video.
+- `Probe` folded into the model: the detection stream is the probe; orientation is a `Plan` aggregate.
+- Frame-alignment fix (`-fps_mode passthrough`, S13) added as story A4.
+- New milestones: A3 (replay engine, the keystone), C3 (CLI port onto the new surface).
+- Kept from v3: TempDir ownership, FFmpegPath, Validate-all-errors + Schema, typed errors, wire-friendly records with three coordinate spaces, no queue in the library, the env-var CSV as internal tooling.
 
-## 9. Remaining tunables (defaults proposed; not blocking approval)
+## 12. Remaining tunables (defaults; not blocking approval)
 
-- Live preview 320 px @ 10 Hz, ~64 snapshots, 4096-record ring — retune with the UI.
-- Push/pull both provided; batching ceilings apply to both.
-- Snapshots memory-only by default; `KeepWorkDir` is the only disk debug path.
+- Preview width 480; overlay video at analysis resolution; debounce 300–500 ms (app-side).
+- Analysis cache key granularity (mtime-based; content-hash later if needed).
+- Frame batch ceilings (24 recs / 250 ms) retuned with the UI.
 
-## 10. Sequencing (starts only after approval)
+## 13. Sequencing (starts only after approval)
 
-`A1 → A2 → A3 → {A4, A5} → A6 → {B1, B2, B4} → B3 → {C1, C2}`. Milestone A alone makes the package embeddable for settings/probe/render/cancel/result flows; nothing depends on Wails until C1.
+`A1 → A2 → A3 → A4 → A5 → {A6, B1, B2} → {B3, B4} → C1 → C2 → C3`.
+A3 is the architectural keystone: everything in B and the interactive flow stands on the replay engine. First deliverable checkpoint: A5 (interactive re-planning proven on corpus streams, before any video is re-rendered).
