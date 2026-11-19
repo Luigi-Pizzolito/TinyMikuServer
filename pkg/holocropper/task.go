@@ -59,7 +59,7 @@ type taskBase struct {
 
 	observer *Observer
 	lastEmit time.Time
-	warnings []string // ffmpeg diagnostics surfaced by Result.Warnings
+	warnings []string // ffmpeg diagnostics: OnWarning events live, Warnings() on the Task, results embed them
 	terminal chan struct{}
 }
 
@@ -100,6 +100,22 @@ func (tb *taskBase) State() TaskState {
 // the current Phase), never blocking. Completed Tasks keep their final
 // snapshot until the owning Analysis is dropped.
 func (tb *taskBase) Progress() TaskInfo { return tb.snapshot() }
+
+// Warnings returns a copy of the ffmpeg diagnostics this Task has recorded
+// (Observer.OnWarning mirrors them live). It never blocks and works during
+// a run, after completion, and after a cancel or supersede - so an app can
+// surface diagnostics for a Task even when Wait() returned an error.
+// Bounded: a chatty ffmpeg cannot grow it without limit.
+func (tb *taskBase) Warnings() []string {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if len(tb.warnings) == 0 {
+		return nil
+	}
+	out := make([]string, len(tb.warnings))
+	copy(out, tb.warnings)
+	return out
+}
 
 // Cancel requests cancellation. The Task reaches the cancelled terminal
 // state when its runner observes the cancellation; completed Tasks ignore

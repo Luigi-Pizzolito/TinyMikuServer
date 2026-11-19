@@ -305,6 +305,7 @@ func previewWork(ctx context.Context, a *Analysis, task *PreviewTask, p *Plan, o
 		return nil, err
 	}
 	out.Removed = removed
+	out.Warnings = tb.Warnings()
 	out.ElapsedSeconds = time.Since(start).Seconds()
 	return out, nil
 }

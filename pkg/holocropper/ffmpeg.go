@@ -13,9 +13,11 @@ import (
 /* Shared ffmpeg execution for the embeddable passes (story A1/A4/B1/B2).
 Every pass runs under the Task context (exec.CommandContext kills the
 subprocess on cancel/supersede), feeds ffmpeg's `frame= N` stats tokens into
-the Task's phase progress, surfaces error tokens through Observer.OnWarning,
-and wraps failures in a *FFmpegError carrying a stderr tail. The fused CLI
-path (resizeTiny/convertImagesToMP4) is untouched until story C3. */
+the Task's phase progress, surfaces error and warning tokens through
+Observer.OnWarning and Task.Warnings (results embed them via their
+Warnings field), and wraps failures in a *FFmpegError carrying a stderr
+tail. The fused CLI path (resizeTiny/convertImagesToMP4) is untouched until
+story C3. */
 
 // resolveFFmpegPath maps the configurable FFmpegPath setting ("" = PATH).
 func resolveFFmpegPath(p string) string {
@@ -68,11 +70,10 @@ func runFFmpegProgress(ctx context.Context, ffmpegPath string, args []string, ph
 			getF = true
 			continue
 		}
-		if strings.Contains(tok, "rror") { // "Error" / "error" tokens
+		if isDiagnosticWord(tok) {
 			tb.warn(tok)
 		}
 	}
-
 	if err := cmd.Wait(); err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
@@ -85,4 +86,27 @@ func runFFmpegProgress(ctx context.Context, ffmpegPath string, args []string, ph
 		return &FFmpegError{Phase: phase, Command: cmd.String(), ExitCode: code, StderrTail: strings.Join(tail, " ")}
 	}
 	return nil
+}
+
+// isDiagnosticWord reports whether one stderr word is a pure ffmpeg
+// error/warning marker. Word matching must be on the marker itself (after
+// trimming the punctuation ffmpeg glues onto it) - a whole output-file
+// path that merely *contains* "error" is not a diagnostic, and mux
+// summary lines echo those paths every pass.
+func isDiagnosticWord(tok string) bool {
+	start, end := 0, len(tok)
+	isLetter := func(b byte) bool {
+		return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+	}
+	for start < end && !isLetter(tok[start]) {
+		start++
+	}
+	for end > start && !isLetter(tok[end-1]) {
+		end--
+	}
+	switch tok[start:end] {
+	case "Error", "error", "Errors", "errors", "Warning", "warning", "Warnings", "warnings", "failed", "Failed":
+		return true
+	}
+	return false
 }

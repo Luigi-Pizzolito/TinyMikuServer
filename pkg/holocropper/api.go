@@ -424,7 +424,8 @@ type PreviewResult struct {
 	Frames           int      `json:"frames"`
 	FPS              float64  `json:"fps"`
 	ElapsedSeconds   float64  `json:"elapsed_seconds"`
-	Removed          []string `json:"removed,omitempty"` // preview files the sweep deleted
+	Removed          []string `json:"removed,omitempty"`  // preview files the sweep deleted
+	Warnings         []string `json:"warnings,omitempty"` // ffmpeg stderr diagnostics from this pass
 }
 
 // Result is what a finished RenderTask Wait() returns: the production file
