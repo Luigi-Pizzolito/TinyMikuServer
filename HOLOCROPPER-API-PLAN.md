@@ -364,6 +364,45 @@ Cancel on any Task ► spinner clears, scratch cleaned, cancelled state surfaces
 
 `examples/wails-bindings/` implements exactly this flow as the acceptance reference for the data plane.
 
+### 9.1 UI implementation suggestions (app side — the Wails frontend)
+
+Concrete patterns for building the tuning UI on this surface. These are recommendations for the app, not API contracts.
+
+**Layout (one screen, three zones):**
+
+- **Left rail — settings form**, generated from `Schema()`: sliders for `zoom_margin`/`max_zoom`, number inputs for W/H/fps/analysis height, a switch for `auto_orient`. Inline per-field errors from `Validate()` (no modal dialogs). Output-dims presets as chips (1:1, portrait 200×648, landscape 648×200…) plus the orientation decision readout (keep-vs-flip score bars from `Plan.Orientation()`, with a "flipped to 200×648" badge when auto-orient transposes).
+- **Center — video stack with one canvas:** the **original video** player with a canvas overlay drawing `FrameRecord.Norm` rects (subject bbox, EMA, crop window) — the primary tuning view. Tabs switch the source between original (canvas ON), the **crop preview** player (canvas OFF — boxes already baked into the overlay preview tab), and the **bbox-overlay preview** (canvas OFF — boxes baked). Tabs swap `video.src` only; nothing else changes.
+- **Bottom — timeline strip:** frame-index scrubber over `Plan.Records()`: dropout spans shaded (`Plan.DropoutFrames()`), scene-cut ticks, walk-active segments highlighted (`Walk()`). Thumbnails from `ContactSheet()` tiles; clicking a tile seeks the player (`currentTime = frame / FPS`) and opens a record popover (bbox numbers, crop geometry, walk state). Right of it: `Metrics()` badges (coverage %, overshoot count, min slack) that recompute live on every re-plan.
+
+**JS state model (small on purpose):**
+
+```
+state = { input, settings, plan, previews: {crop: PreviewRef, overlay: PreviewRef},
+          tasks: Map<taskID, TaskInfo>, spinners: Set<taskID> }
+```
+
+Everything the UI renders comes from those five fields — the API was shaped so no other bookkeeping is needed.
+
+**Overlay drawing:** `requestVideoFrameCallback` maps player position to a frame index (`frame = round(currentTime × FPS)`), look up `Plan.Record(frame)` once per video frame, scale `Norm` rects (0..1) to the canvas display size. That's the entire geometry story — never derive boxes client-side. During drag-scrubbing (no frame callbacks), interpolate against `Record(i)`/`Record(i+1)`.
+
+**Real-time tuning loop:**
+
+1. Slider `input` event → binding call `Plan(stream, settings)` (~10 ms) → redraw overlays + metrics immediately. This is the frame-rate path; nothing heavier runs here.
+2. Debounce ~400 ms after the last change → check `Previews()` for a `SettingsHash` match; if none, call `RenderPreview` (supersede semantics make firing it mid-render safe — just fire, the old one dies).
+3. On `OnTask` `completed` for the preview task: **preload then swap** — set `video.src = new -vN path` on the active player only after the new file's first frame loads (a hidden `<video preload="metadata">` or `fetch` HEAD); players keep playing the old version until the swap succeeds, so a superseded render never blanks the UI. Deleted `Removed` paths are simply dropped from state.
+
+**Spinners and busy states (from §6.7 only):** spinner overlay per zone (analyze strip across timeline + timeline disabled while detect runs; preview corner spinner on the video stack; full-width bar for final render). All driven by `TaskInfo` via `OnTask`; on app start or hot reload call `Status()` once and restore spinners from it. `superseded` never shows an error — move the spinner to `NewTaskID`. Gate preview renders while the analysis slot is `running`: partial overlays/timeline yes (via `AnalysisTask.Plan`), preview *video* renders no (the analysis mp4 isn't finalized yet) — show a "partial analysis" badge instead.
+
+**Progress bars:** each zone's bar binds to `TaskInfo.Done/Total` for its current slot task — prepare/detect for the analyze zone, preview_frames/preview_mux for previews, render_frames/render_mux for final. Phase name maps to label text; nothing needs to know *why* totals change — phases carry their own totals.
+
+**File serving:** serve only the two roots the app owns — `TempDir` and `OutputDir` — through a custom Wails URL scheme (e.g. `app://previews/...` mapped onto `Analysis.Previews()` paths, `app://outputs/...` onto `Result.OutputPath`). Versioned filenames are natural cache-busting: serve preview files with `Cache-Control: immutable`. Never expose the whole TempDir — map only paths the API returned.
+
+**Final render flow:** explicit button (not automatic) → spinner zone + progress bar → on completion add `Result.OutputPath` to a "renders" list under the input, player-able instantly and openable in the OS via the app. Dimension-tagged names make the list survive re-renders at different targets.
+
+**Errors:** validation → inline field errors; `*FFmpegError` → toast with the `StderrTail`; `cancelled`/`superseded` → silent (they're normal flow); `ErrStreamIncompatible` → prompt "analysis outdated for these settings — re-analyze" action.
+
+**Keyboard/quality-of-life:** space = play/pause player, `[`/`]` = step frame (`Record(i)` popover follows), `r` = re-plan+preview shortcut. Keep all Plan-driven views (canvas, timeline, metrics) subscribed to the *current Plan object* — swapping the Plan pointer is the single re-render trigger for the whole tuning UI.
+
 ## 10. Epics, milestones, stories
 
 Estimates: story points (1,2,3,5,8). No implementation before approval.
@@ -420,6 +459,7 @@ The Wails UI itself; uploads; HTTP/network of any kind; job persistence/history;
 - **Unified status plane**: one `TaskInfo` across all Tasks (`ID/State/Phase/Done/Total/Err`), `Analysis.Status()` snapshot for startup/reload spinner reconciliation, single `Observer.OnTask` event feed, explicit spinner recipe spelled out in §6.7.
 - `RenderPreview`/`RenderFinal` become **`Analysis` methods** (they need the cached analysis video); `Analyze` supersedes by cache key; `AnalysisTask.Plan(settings)` replays framing over partial streams while detection still runs.
 - Final output naming dimension-tagged (`<basename>-<WxH>.mp4`): re-rendering a video at a new target never clobbers a previous production file.
+- Added §9.1: UI implementation suggestions for the Wails frontend (layout, JS state model, `requestVideoFrameCallback` overlay loop, preload-then-swap preview refresh, spinner wiring, file serving, final render flow) — app-side guidance, not API contract.
 
 ## 12. Remaining tunables (defaults; not blocking approval)
 
