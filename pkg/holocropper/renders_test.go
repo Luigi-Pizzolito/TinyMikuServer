@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -817,25 +818,34 @@ func TestPreviewFileNameCoversKinds(t *testing.T) {
 	cases := []struct {
 		kind    PreviewKind
 		version int
+		mux     PreviewMux
 		want    string
 	}{
-		{PreviewCrop, 1, "clip-648x200-v1.mp4"},
-		{PreviewCropOverlay, 7, "clip-648x200-v7.mp4"},
-		{PreviewOverlay, 2, "clip-648x200-overlay-v2.mp4"},
+		{PreviewCrop, 1, "", "clip-648x200-v1.mp4"},
+		{PreviewCropOverlay, 7, PreviewMuxMJPEG, "clip-648x200-v7.mp4"},
+		{PreviewOverlay, 2, PreviewMuxMJPEG, "clip-648x200-overlay-v2.mp4"},
+		// The extension is the mux's, and it is not cosmetic: it is what
+		// tells ffmpeg (and every player) which container the bytes are.
+		{PreviewCrop, 3, PreviewMuxVP9WebM, "clip-648x200-v3.webm"},
+		{PreviewOverlay, 4, PreviewMuxVP9WebM, "clip-648x200-overlay-v4.webm"},
 	}
 	for _, c := range cases {
-		if got := previewFileName("clip", 648, 200, c.kind, c.version); got != c.want {
-			t.Errorf("kind %s: got %s, want %s", c.kind, got, c.want)
+		if got := previewFileName("clip", 648, 200, c.kind, c.version, c.mux); got != c.want {
+			t.Errorf("kind %s mux %q: got %s, want %s", c.kind, c.mux, got, c.want)
 		}
 	}
-	// Version numbering is per kind and per target size.
+	// Version numbering is per kind and per target size - and per kind across
+	// muxes, so a mux change lands as the next version, never over a file a
+	// player may be streaming.
 	dir := t.TempDir()
 	writePreviewSidecar(PreviewRef{Version: 1, Kind: PreviewCrop, Path: filepath.Join(dir, "clip-240x240-v1.mp4")})
 	writePreviewSidecar(PreviewRef{Version: 4, Kind: PreviewOverlay, Path: filepath.Join(dir, "clip-240x240-overlay-v4.mp4")})
+	writePreviewSidecar(PreviewRef{Version: 2, Kind: PreviewCrop, MuxVideo: PreviewMuxVP9WebM, Path: filepath.Join(dir, "clip-240x240-v2.webm")})
 	os.WriteFile(filepath.Join(dir, "clip-240x240-v1.mp4"), []byte("x"), 0o644)
 	os.WriteFile(filepath.Join(dir, "clip-240x240-overlay-v4.mp4"), []byte("x"), 0o644)
-	if v := nextPreviewVersion(dir, "clip", 240, 240, PreviewCrop); v != 2 {
-		t.Errorf("crop version numbering: got %d, want 2", v)
+	os.WriteFile(filepath.Join(dir, "clip-240x240-v2.webm"), []byte("x"), 0o644)
+	if v := nextPreviewVersion(dir, "clip", 240, 240, PreviewCrop); v != 3 {
+		t.Errorf("crop version numbering: got %d, want 3 (the webm preview counts)", v)
 	}
 	if v := nextPreviewVersion(dir, "clip", 240, 240, PreviewOverlay); v != 5 {
 		t.Errorf("overlay version numbering: got %d, want 5", v)
@@ -843,9 +853,149 @@ func TestPreviewFileNameCoversKinds(t *testing.T) {
 	if v := nextPreviewVersion(dir, "clip", 648, 200, PreviewCrop); v != 1 {
 		t.Errorf("a new target size must start its own sequence, got %d", v)
 	}
-	// A sidecar whose video is gone is dropped, not counted.
+	// Both sidecar shapes are read, and a sidecar whose video is gone is
+	// dropped rather than counted.
+	if refs, err := readPreviewRefs(dir); err != nil || len(refs) != 3 {
+		t.Fatalf("readPreviewRefs saw %d refs (%v), want all three muxes", len(refs), err)
+	}
 	os.Remove(filepath.Join(dir, "clip-240x240-v1.mp4"))
-	if refs, err := readPreviewRefs(dir); err != nil || len(refs) != 1 {
+	if refs, err := readPreviewRefs(dir); err != nil || len(refs) != 2 {
 		t.Errorf("stale sidecar cleanup: %d refs (%v)", len(refs), err)
+	}
+}
+
+// probeMediaShape reports what ffprobe reads from a media file: the container
+// format name, the first video stream's codec, and the first audio stream's
+// codec ("" when the file carries no audio at all). The mux tests pin all
+// three - a codec in the wrong container is as broken as the wrong codec.
+func probeMediaShape(t *testing.T, path string) (format, videoCodec, audioCodec string) {
+	t.Helper()
+	ffprobe, err := exec.LookPath("ffprobe")
+	if err != nil {
+		t.Fatalf("ffprobe is not on PATH and this test pins what the mux wrote: %v", err)
+	}
+	out, err := exec.Command(ffprobe, "-v", "error",
+		"-show_entries", "format=format_name",
+		"-show_entries", "stream=codec_type,codec_name",
+		"-of", "json", path).Output()
+	if err != nil {
+		t.Fatalf("ffprobe %s: %v", path, err)
+	}
+	var parsed struct {
+		Format struct {
+			FormatName string `json:"format_name"`
+		} `json:"format"`
+		Streams []struct {
+			CodecType string `json:"codec_type"`
+			CodecName string `json:"codec_name"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(out, &parsed); err != nil {
+		t.Fatalf("ffprobe json for %s: %v (%s)", path, err, out)
+	}
+	for _, s := range parsed.Streams {
+		switch s.CodecType {
+		case "video":
+			if videoCodec == "" {
+				videoCodec = s.CodecName
+			}
+		case "audio":
+			if audioCodec == "" {
+				audioCodec = s.CodecName
+			}
+		}
+	}
+	if videoCodec == "" {
+		t.Fatalf("%s has no video stream", path)
+	}
+	return parsed.Format.FormatName, videoCodec, audioCodec
+}
+
+// TestRenderPreviewMuxChoice pins the preview mux plane (Options.MuxVideo):
+// the default stays the engine's own mjpeg-in-MP4 video-only file, vp9-webm
+// writes VP9 video with the source's audio as Opus in a WebM container - the
+// pairing every browser decodes - and every retained preview records which of
+// the two it is, because a UI that skips a render on SettingsHash must also
+// want the codec and container the retained file holds.
+func TestRenderPreviewMuxChoice(t *testing.T) {
+	ffmpeg := requireFFmpeg(t)
+	a, p := setupRenderFixture(t, ffmpeg, 240, 240)
+
+	// vp9-mp4 is NOT a choice: VP9's home in this engine is WebM, the container
+	// the codec spike measured as decodable in WebKitGTK and Chromium alike.
+	if errs := (PreviewRequest{Options: PreviewOptions{MuxVideo: "vp9-mp4"}}).Validate(); len(errs) != 1 ||
+		errs[0].Field != "options.mux_video" {
+		t.Errorf("mux_video validation said %+v, want one error on options.mux_video", errs)
+	}
+
+	// The default: unchanged for every existing caller - mjpeg in an MP4, no audio.
+	defTask, err := a.RenderPreview(context.Background(), p, PreviewRequest{
+		FFmpegPath: ffmpeg,
+		Options:    PreviewOptions{Kind: PreviewCrop},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	def, err := defTask.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if def.MuxVideo != PreviewMuxMJPEG {
+		t.Errorf("default preview mux = %q, want %q", def.MuxVideo, PreviewMuxMJPEG)
+	}
+	if ext := filepath.Ext(def.CropVideoPath); ext != ".mp4" {
+		t.Errorf("default preview name %s ends %s, want .mp4", def.CropVideoPath, ext)
+	}
+	if format, codec, audio := probeMediaShape(t, def.CropVideoPath); !strings.Contains(format, "mp4") ||
+		codec != "mjpeg" || audio != "" {
+		t.Errorf("default preview %s: format %q codec %q audio %q, want an mjpeg-only MP4",
+			def.CropVideoPath, format, codec, audio)
+	}
+
+	// vp9-webm: a clip every browser plays, carrying the source's sound, as a
+	// NEW versioned file next to the default one.
+	vp9Task, err := a.RenderPreview(context.Background(), p, PreviewRequest{
+		FFmpegPath: ffmpeg,
+		Options:    PreviewOptions{Kind: PreviewCrop, MuxVideo: PreviewMuxVP9WebM},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vp9, err := vp9Task.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if vp9.MuxVideo != PreviewMuxVP9WebM {
+		t.Errorf("vp9 preview mux = %q, want %q", vp9.MuxVideo, PreviewMuxVP9WebM)
+	}
+	if ext := filepath.Ext(vp9.CropVideoPath); ext != ".webm" {
+		t.Errorf("vp9 preview name %s ends %s, want .webm", vp9.CropVideoPath, ext)
+	}
+	if vp9.Version <= def.Version {
+		t.Errorf("vp9 preview landed as version %d after version %d: the mux choice must not overwrite a retained file",
+			vp9.Version, def.Version)
+	}
+	format, codec, audio := probeMediaShape(t, vp9.CropVideoPath)
+	if !strings.Contains(format, "webm") {
+		t.Errorf("vp9 preview %s: container %q, want WebM", vp9.CropVideoPath, format)
+	}
+	if codec != "vp9" {
+		t.Errorf("vp9 preview %s: video codec %q, want vp9", vp9.CropVideoPath, codec)
+	}
+	if audio != "opus" {
+		t.Errorf("vp9 preview %s: audio codec %q, want the source's track as Opus", vp9.CropVideoPath, audio)
+	}
+
+	// The retained list carries the choice per file.
+	refs := a.Previews()
+	if len(refs) != 2 {
+		t.Fatalf("Previews() returned %d refs, want both muxes retained: %+v", len(refs), refs)
+	}
+	seen := map[PreviewMux]int{}
+	for _, ref := range refs {
+		seen[ref.MuxVideo]++
+	}
+	if seen[PreviewMuxMJPEG] != 1 || seen[PreviewMuxVP9WebM] != 1 {
+		t.Errorf("Previews() mux labels = %+v, want one mjpeg and one vp9-webm", seen)
 	}
 }

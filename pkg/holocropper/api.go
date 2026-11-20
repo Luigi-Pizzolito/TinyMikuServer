@@ -366,8 +366,29 @@ type PreviewOptions struct {
 	Kind        PreviewKind `json:"kind"` // "" = crop_overlay
 	DrawSubject bool        `json:"draw_subject"`
 	DrawCrop    bool        `json:"draw_crop"`
-	Observer    *Observer   `json:"-"`
+	// MuxVideo picks the codec the preview sequences are muxed with. "" or
+	// mjpeg is the engine default: the JPEG sequence is put into an MP4 the
+	// way the CLI mux does it, video only. vp9-webm encodes VP9 video and
+	// brings the analyzed input's audio track along as Opus, in a WebM
+	// container - the pairing every browser decodes, at the cost of a real
+	// video encode, so it is opt-in. The file extension follows the mux.
+	MuxVideo PreviewMux `json:"mux_video"`
+	Observer *Observer  `json:"-"`
 }
+
+// PreviewMux is a preview mux choice.
+type PreviewMux string
+
+const (
+	// PreviewMuxMJPEG copies the rendered JPEG sequence into an MP4 - the
+	// engine default, and the codec the PC render writes.
+	PreviewMuxMJPEG PreviewMux = "mjpeg"
+	// PreviewMuxVP9WebM encodes VP9 video, plus the source's audio as Opus
+	// when the source has one, in a WebM container. MJPEG-in-MP4 is what the
+	// UMP PC player reads and what WebKitGTK decodes, but Chromium refuses
+	// it; VP9+Opus in WebM is the pairing every browser plays.
+	PreviewMuxVP9WebM PreviewMux = "vp9-webm"
+)
 
 type PreviewKind string
 
@@ -386,6 +407,12 @@ func (r PreviewRequest) Validate() []ValidationError {
 	default:
 		errs = append(errs, ValidationError{Field: "options.kind",
 			Reason: fmt.Sprintf("must be crop, overlay or crop_overlay (got %q)", r.Options.Kind)})
+	}
+	switch r.Options.MuxVideo {
+	case "", PreviewMuxMJPEG, PreviewMuxVP9WebM:
+	default:
+		errs = append(errs, ValidationError{Field: "options.mux_video",
+			Reason: fmt.Sprintf("must be %q, %q or \"\" for the mjpeg default (got %q)", PreviewMuxMJPEG, PreviewMuxVP9WebM, r.Options.MuxVideo)})
 	}
 	return errs
 }
@@ -425,11 +452,15 @@ func validOutputFileName(name string) bool {
 // ---------------------------------------------------------------------------
 // Preview results
 
-// PreviewRef describes one retained preview video file (servable).
+// PreviewRef describes one retained preview video file (servable). MuxVideo is
+// what the file actually holds: a UI that reuses a preview on its
+// SettingsHash must also want the same mux, or it will serve a clip it did not
+// ask for.
 type PreviewRef struct {
 	Version      int         `json:"version"`
 	Kind         PreviewKind `json:"kind"`
 	Path         string      `json:"path"`
+	MuxVideo     PreviewMux  `json:"mux_video"`
 	SettingsHash string      `json:"settings_hash"`
 	CreatedAt    time.Time   `json:"created_at"`
 	Width        int         `json:"width"`
@@ -440,17 +471,18 @@ type PreviewRef struct {
 
 // PreviewResult is what a finished PreviewTask Wait() returns.
 type PreviewResult struct {
-	Version          int      `json:"version"`
-	SettingsHash     string   `json:"settings_hash"`
-	CropVideoPath    string   `json:"crop_video_path"`    // "" when kind=overlay
-	OverlayVideoPath string   `json:"overlay_video_path"` // "" when kind=crop
-	Width            int      `json:"width"`              // OUTPUT target resolution
-	Height           int      `json:"height"`
-	Frames           int      `json:"frames"`
-	FPS              float64  `json:"fps"`
-	ElapsedSeconds   float64  `json:"elapsed_seconds"`
-	Removed          []string `json:"removed,omitempty"`  // preview files the sweep deleted
-	Warnings         []string `json:"warnings,omitempty"` // ffmpeg stderr diagnostics from this pass
+	Version          int        `json:"version"`
+	SettingsHash     string     `json:"settings_hash"`
+	CropVideoPath    string     `json:"crop_video_path"`    // "" when kind=overlay
+	OverlayVideoPath string     `json:"overlay_video_path"` // "" when kind=crop
+	MuxVideo         PreviewMux `json:"mux_video"`          // the codec both preview files hold
+	Width            int        `json:"width"`              // OUTPUT target resolution
+	Height           int        `json:"height"`
+	Frames           int        `json:"frames"`
+	FPS              float64    `json:"fps"`
+	ElapsedSeconds   float64    `json:"elapsed_seconds"`
+	Removed          []string   `json:"removed,omitempty"`  // preview files the sweep deleted
+	Warnings         []string   `json:"warnings,omitempty"` // ffmpeg stderr diagnostics from this pass
 }
 
 // Result is what a finished RenderTask Wait() returns: the production file

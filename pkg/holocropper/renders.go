@@ -43,6 +43,15 @@ const renderJPEGQuality = 90
 // previewRetention is how many versions per kind the sweep keeps (§12 tunable).
 const previewRetention = 3
 
+// The vp9-webm preview mux: constant quality with a real-time-leaning encode.
+// A preview is a framing check, so the encode spends its time on keeping the
+// pass quick rather than on squeezing the last bit of detail out of a JPEG
+// sequence that was already lossy.
+const (
+	previewVP9CRF     = 30
+	previewVP9CPUUsed = 4
+)
+
 const previewsSubdir = "previews"
 
 // ---------------------------------------------------------------------------
@@ -301,6 +310,26 @@ func previewWork(ctx context.Context, a *Analysis, task *PreviewTask, p *Plan, o
 	}
 
 	start := time.Now()
+
+	// The mux decides what the preview files hold, and for vp9-webm whether
+	// the analyzed input's audio comes along as Opus.
+	mux := opts.MuxVideo
+	if mux == "" {
+		mux = PreviewMuxMJPEG
+	}
+	audioSource := ""
+	if mux == PreviewMuxVP9WebM {
+		hasAudio, err := sourceHasAudio(ctx, ffmpegPath, a.meta.Input)
+		if err != nil {
+			return nil, err
+		}
+		if hasAudio {
+			audioSource = a.meta.Input
+		} else {
+			tb.warn("source has no audio track: the VP9 previews are muxed without sound")
+		}
+	}
+
 	frames, err := runCropLoop(ctx, tb, a, p, cropDir, overlayDir, opts, PhasePreviewFrames)
 	if err != nil {
 		return nil, err
@@ -313,6 +342,7 @@ func previewWork(ctx context.Context, a *Analysis, task *PreviewTask, p *Plan, o
 
 	out := &PreviewResult{
 		SettingsHash: p.SettingsHash(),
+		MuxVideo:     mux,
 		Width:        r.OutputW,
 		Height:       r.OutputH,
 		Frames:       frames,
@@ -325,9 +355,9 @@ func previewWork(ctx context.Context, a *Analysis, task *PreviewTask, p *Plan, o
 	// half file.
 	if wantCrop {
 		v := nextPreviewVersion(a.PreviewsDir(), basename, r.OutputW, r.OutputH, PreviewCrop)
-		final := filepath.Join(a.PreviewsDir(), previewFileName(basename, r.OutputW, r.OutputH, PreviewCrop, v))
-		tmp := filepath.Join(task.scratch, "crop.mp4")
-		if err := muxFrameSequence(ctx, ffmpegPath, cropDir, "", out.FPS, tmp, PhasePreviewMux, tb, frames); err != nil {
+		final := filepath.Join(a.PreviewsDir(), previewFileName(basename, r.OutputW, r.OutputH, PreviewCrop, v, mux))
+		tmp := filepath.Join(task.scratch, "crop"+previewFileExt(mux))
+		if err := muxFrameSequence(ctx, ffmpegPath, cropDir, audioSource, out.FPS, tmp, mux, PhasePreviewMux, tb, frames); err != nil {
 			return nil, err
 		}
 		if err := moveFile(tmp, final); err != nil {
@@ -336,7 +366,7 @@ func previewWork(ctx context.Context, a *Analysis, task *PreviewTask, p *Plan, o
 		out.Version = v
 		out.CropVideoPath = final
 		if err := writePreviewSidecar(PreviewRef{
-			Version: v, Kind: PreviewCrop, Path: final, SettingsHash: out.SettingsHash,
+			Version: v, Kind: PreviewCrop, Path: final, MuxVideo: mux, SettingsHash: out.SettingsHash,
 			CreatedAt: time.Now().UTC(), Width: r.OutputW, Height: r.OutputH, FPS: out.FPS, Frames: frames,
 		}); err != nil {
 			return nil, err
@@ -344,9 +374,9 @@ func previewWork(ctx context.Context, a *Analysis, task *PreviewTask, p *Plan, o
 	}
 	if wantOverlay {
 		v := nextPreviewVersion(a.PreviewsDir(), basename, r.OutputW, r.OutputH, PreviewOverlay)
-		final := filepath.Join(a.PreviewsDir(), previewFileName(basename, r.OutputW, r.OutputH, PreviewOverlay, v))
-		tmp := filepath.Join(task.scratch, "overlay.mp4")
-		if err := muxFrameSequence(ctx, ffmpegPath, overlayDir, "", out.FPS, tmp, PhasePreviewMux, tb, frames); err != nil {
+		final := filepath.Join(a.PreviewsDir(), previewFileName(basename, r.OutputW, r.OutputH, PreviewOverlay, v, mux))
+		tmp := filepath.Join(task.scratch, "overlay"+previewFileExt(mux))
+		if err := muxFrameSequence(ctx, ffmpegPath, overlayDir, audioSource, out.FPS, tmp, mux, PhasePreviewMux, tb, frames); err != nil {
 			return nil, err
 		}
 		if err := moveFile(tmp, final); err != nil {
@@ -357,7 +387,7 @@ func previewWork(ctx context.Context, a *Analysis, task *PreviewTask, p *Plan, o
 		}
 		out.OverlayVideoPath = final
 		if err := writePreviewSidecar(PreviewRef{
-			Version: v, Kind: PreviewOverlay, Path: final, SettingsHash: out.SettingsHash,
+			Version: v, Kind: PreviewOverlay, Path: final, MuxVideo: mux, SettingsHash: out.SettingsHash,
 			CreatedAt: time.Now().UTC(), Width: r.OutputW, Height: r.OutputH, FPS: out.FPS, Frames: frames,
 		}); err != nil {
 			return nil, err
@@ -506,10 +536,14 @@ func copyRGBA(dst, src *image.RGBA) {
 	copy(dst.Pix, src.Pix)
 }
 
-// muxFrameSequence turns a numbered JPEG sequence into an mp4 (mjpeg, the
-// codec the CLI mux uses). audioSource != "" copies that file's audio track
-// through untouched.
-func muxFrameSequence(ctx context.Context, ffmpegPath, framesDir, audioSource string, fps float64, outPath string, phase Phase, tb *taskBase, total int) error {
+// muxFrameSequence turns a numbered JPEG sequence into a video file. The mux
+// picks what the container holds: mjpeg (the engine default, and the PC
+// render's own codec - the sequence is put into an MP4 the way the CLI mux does
+// it) or vp9-webm (VP9 video in WebM, the pairing every browser decodes).
+// audioSource != "" brings that file's audio track along: copied through
+// untouched for mjpeg, re-encoded as Opus for vp9-webm, which is the audio
+// codec a WebM container - and every browser reading it - accepts.
+func muxFrameSequence(ctx context.Context, ffmpegPath, framesDir, audioSource string, fps float64, outPath string, mux PreviewMux, phase Phase, tb *taskBase, total int) error {
 	args := []string{
 		"-hide_banner",
 		"-r", strconv.FormatFloat(fps, 'f', -1, 64),
@@ -519,9 +553,23 @@ func muxFrameSequence(ctx context.Context, ffmpegPath, framesDir, audioSource st
 	if audioSource != "" {
 		args = append(args, "-i", audioSource)
 	}
-	args = append(args, "-map", "0:v:0", "-c:v", "mjpeg", "-q:v", "6")
+	args = append(args, "-map", "0:v:0")
+	if mux == PreviewMuxVP9WebM {
+		// Constant-quality VP9 with a deadline the preview pass can actually
+		// afford: a preview is a framing check, not an archive master.
+		args = append(args, "-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p",
+			"-crf", strconv.Itoa(previewVP9CRF), "-b:v", "0",
+			"-deadline", "good", "-cpu-used", strconv.Itoa(previewVP9CPUUsed))
+	} else {
+		args = append(args, "-c:v", "mjpeg", "-q:v", "6")
+	}
 	if audioSource != "" {
-		args = append(args, "-map", "1:a:0", "-c:a", "copy")
+		args = append(args, "-map", "1:a:0")
+		if mux == PreviewMuxVP9WebM {
+			args = append(args, "-c:a", "libopus", "-b:a", "128k")
+		} else {
+			args = append(args, "-c:a", "copy")
+		}
 	}
 	args = append(args, outPath, "-y")
 
@@ -532,14 +580,26 @@ func muxFrameSequence(ctx context.Context, ffmpegPath, framesDir, audioSource st
 // ---------------------------------------------------------------------------
 // Preview naming, bookkeeping, sweep
 
+// previewFileExt is the container extension a mux writes. ffmpeg picks the
+// muxer from the output file's extension, so the name is not cosmetic: it is
+// what decides the container.
+func previewFileExt(mux PreviewMux) string {
+	if mux == PreviewMuxVP9WebM {
+		return ".webm"
+	}
+	return ".mp4"
+}
+
 // previewFileName is the versioned servable name. Crop keeps the bare
 // -v<N> suffix, the overlay video carries -overlay-v<N>; both are dimension-
-// tagged so different output targets never collide.
-func previewFileName(basename string, w, h int, kind PreviewKind, version int) string {
+// tagged so different output targets never collide, and both carry the mux's
+// extension so the file on disk says what it holds.
+func previewFileName(basename string, w, h int, kind PreviewKind, version int, mux PreviewMux) string {
+	ext := previewFileExt(mux)
 	if kind == PreviewOverlay {
-		return fmt.Sprintf("%s-%dx%d-overlay-v%d.mp4", basename, w, h, version)
+		return fmt.Sprintf("%s-%dx%d-overlay-v%d%s", basename, w, h, version, ext)
 	}
-	return fmt.Sprintf("%s-%dx%d-v%d.mp4", basename, w, h, version)
+	return fmt.Sprintf("%s-%dx%d-v%d%s", basename, w, h, version, ext)
 }
 
 func previewSidecarPath(videoPath string) string { return videoPath + ".meta.json" }
@@ -573,9 +633,16 @@ func writePreviewSidecar(ref PreviewRef) error {
 // readPreviewRefs decodes every sidecar in a previews dir. Sidecars that do
 // not parse, or that describe a deleted video, are dropped with their file.
 func readPreviewRefs(dir string) ([]PreviewRef, error) {
-	matches, err := filepath.Glob(filepath.Join(dir, "*.mp4.meta.json"))
-	if err != nil {
-		return nil, err
+	// A sidecar is named after the video it describes, so it carries that
+	// mux's extension: <name>.mp4.meta.json, or <name>.webm.meta.json for the
+	// vp9-webm mux.
+	var matches []string
+	for _, pattern := range []string{"*.mp4.meta.json", "*.webm.meta.json"} {
+		got, err := filepath.Glob(filepath.Join(dir, pattern))
+		if err != nil {
+			return nil, err
+		}
+		matches = append(matches, got...)
 	}
 	var out []PreviewRef
 	for _, sidecar := range matches {
@@ -771,7 +838,9 @@ func renderFinalWork(ctx context.Context, a *Analysis, task *RenderTask, p *Plan
 	basename := getBasenameWithoutExt(a.meta.Input)
 	outPath := filepath.Join(outDir, renderOutputName(basename, r.OutputW, r.OutputH, req.OutputName))
 	tmp := filepath.Join(task.scratch, "final.mp4")
-	if err := muxFrameSequence(ctx, req.FFmpegPath, framesDir, a.meta.Input, planFPS(p), tmp, PhaseRenderMux, tb, frames); err != nil {
+	// The PC product keeps the CLI's mux: mjpeg video with the source audio
+	// copied through. That pairing IS the format the UMP PC player takes.
+	if err := muxFrameSequence(ctx, req.FFmpegPath, framesDir, a.meta.Input, planFPS(p), tmp, PreviewMuxMJPEG, PhaseRenderMux, tb, frames); err != nil {
 		return nil, err
 	}
 	if err := moveFile(tmp, outPath); err != nil {
