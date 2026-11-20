@@ -6,9 +6,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"image"
+	"image/jpeg"
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"time"
 
 	vidio "github.com/AlexEidt/Vidio"
@@ -49,40 +51,80 @@ import (
  * - Offset 9 (2 bytes):	Audio sample rate							[ uint16 ]
  * - Offset 11 (1 byte):	Audio channels								[ uint8 ]
  * - Offset 12 (1 byte):	Audio bits per sample						[ uint8 ]
- * - Offset 13 (3 bytes):	Reserved (padding)							[ [3]byte ]
+ * - Offset 13 (1 byte):	Video encoding ID							[ uint8 ]
+ * - Offset 14 (1 byte):	Audio encoding ID							[ uint8 ]
+ * - Offset 15 (1 byte):	Reserved (padding)							[ uint8 ]
+ *
+ * Video encoding (header byte 13):
+ * - 0x00	EncodingDeflateRGB565: DEFLATE-compressed RGB565 frame data.
+ *		This byte was reserved padding in the original spec and every
+ *		writer until then stored 0 there, so 0x00 is the legacy default
+ *		by construction: pre-existing files stay valid unchanged.
+ * - 0x01	EncodingJPEG: the video frame payload is one complete JPEG
+ *		image, stored raw (no DEFLATE layer) - effectively MJPEG inside
+ *		MikV (the frame data the holocropper render passes already
+ *		produce, packed without a re-encode).
+ * Audio encoding (header byte 14):
+ * - 0x00	EncodingRawPCM: raw interleaved PCM audio frames - the original
+ *		fixed-length chunks described below.
+ * - 0x01	EncodingOGGOpus: the audio track is one OGG-Opus stream cut at
+ *		Ogg page boundaries into per-video-frame segments. Chunk k holds
+ *		the complete Ogg pages whose packets finish within frame k's time
+ *		window (48000/FPS samples, in Ogg granule units); chunks may be
+ *		empty (codec preroll, or a page that covers several frames), and
+ *		concatenating every audio chunk in file order reproduces the
+ *		original .ogg stream byte for byte - a decoder that already has
+ *		an Ogg demuxer consumes the chunks sequentially as a plain byte
+ *		stream. Opus packet duration is picked for the fps (40 ms at
+ *		24 fps), the stream's OpusHead is authoritative for sample rate
+ *		and channels, and the header audio fields carry the nominal
+ *		values written (48000 Hz for this encoding).
+ * A reader MUST reject a file whose encoding ID is neither 0x00 nor 0x01
+ * rather than misread its frames. Files written with 0x00/0x00 are byte-
+ * compatible with the original format: header, frame layout and payloads
+ * are exactly what the original writer produced.
  *
  * 2. FRAME (variable size)
  * ------------------------
  * Each frame consists of a **video** frame followed by an **audio** chunk:
- * - Offset 0 (4 bytes):		Video frame length (compressed)				[ uint32 ]
- * - Offset 4 (N bytes):		Compressed video frame data (DEFLATE)		[ []byte ]
- * - Offset 4+N (4 bytes):		Audio frame length (uncompressed)			[ uint32 ]
- * - Offset 4+N+4 (M bytes):	Uncompressed audio frame data (PCM)			[ []byte ]
+ * - Offset 0 (4 bytes):		Video frame length (payload)					[ uint32 ]
+ * - Offset 4 (N bytes):		Video frame payload (per the header encoding ID: DEFLATE RGB565 for 0x00, raw JPEG for 0x01)	[ []byte ]
+ * - Offset 4+N (4 bytes):		Audio frame length (PCM: fixed; OGG-Opus: variable)	[ uint32 ]
+ * - Offset 4+N+4 (M bytes):	Audio frame payload (PCM, or Ogg page segments - see the encoding legend)	[ []byte ]
  * Where:
  * - N = Video frame length (compressed)
  * - M = Audio frame length (uncompressed)
  *
  * Example Binary Layout:
  * ----------------------
- *  0x0000:  4D 69 6B 56 14 00 F0 00 F0 00 80 3E 01 10 00 00 00  (Header: "MikV", FPS=20, 240x240, 16kHz, 1ch, 16-bit)
+ *  0x0000:  4D 69 6B 56 14 F0 00 F0 00 80 3E 01 10 00 00 00  (Header: "MikV", FPS=20, 240x240, 16kHz, 1ch, 16-bit, video encoding 0x00, audio encoding 0x00, reserved 0x00)
  *  0x0010:  70 2F 00 00 [...12144 bytes compressed video data...] 40 06 00 00 [...1600 bytes PCM audio data...]
  *  0x4000:  EC 2E 00 00 [...12012 bytes compressed video data...] 40 06 00 00 [...1600 bytes PCM audio data...]
  *  0x8000:  28 2D 00 00 [...11560 bytes compressed video data...] 40 06 00 00 [...1600 bytes PCM audio data...]
  *  ...
  *
  * Notes:
- * - The video frame data is stored as DEFLATE compressed RGB565 data (uint16/2bytes per pixel).
- * - The audio frame data is stored as raw PCM data (int16/2bytes per sample).
+ * - The video frame payload depends on header byte 13. Encoding 0x00: DEFLATE
+ *   compressed RGB565 data (uint16/2bytes per pixel); the bytes are stored
+ *   byte-swapped (high byte first) before DEFLATE, exactly as the original
+ *   writer produced them. Encoding 0x01: one complete JPEG image per frame,
+ *   stored raw.
+ * - The audio frame payload depends on header byte 14. Encoding 0x00: raw PCM
+ *   data (int16/2bytes per sample), fixed length:
  * - The audio frame length is fixed and depends on the audio sample rate, channels, and bits per sample.
  * - The audio frame length is calculated as (AudioSampleRate/FPS)*AudioChannels*AudioBitsPerSample/8.
+ *   Encoding 0x01: OGG-Opus page segments (see the audio encoding legend);
+ *   the chunk length is variable and the uint32 prefix already allows it.
  * - The video frame length is variable and depends on the video frame size and compression ratio.
  * - ZLib's DEFLATE implementation is used, not libdeflate or other compression libraries.
- * todo: add compression for raw audio samples too
  * - All fields are saved in LittleEndian byte order.
- * - The reserved bytes in the header are used for future expansion.
+ * - Header byte 13 is the video encoding ID and byte 14 the audio encoding
+ *   ID (see the encoding legends above); byte 15 is reserved padding and is
+ *   always written as zero.
  * - The magic number "MikV" is used to identify the file format.
  * - The audio frame data is interleaved for multiple channels.
- * - Audio data is typically stored as 16-bit signed PCM data, but support for compressed formats may be added.
+ * - Audio data for encoding 0x00 is 16-bit signed PCM; encoding 0x01 stores
+ *   the compressed OGG-Opus page segments described in the audio legend.
  *
  * Example Usage:
  * -------------
@@ -129,10 +171,53 @@ import (
  *
  */
 
+// Video encoding IDs, stored in header byte 13 (see the format spec above).
+const (
+	// EncodingDeflateRGB565 (0x00): zlib-DEFLATEd RGB565 frame data.
+	// The legacy default - the byte was reserved padding in the original
+	// spec and old writers always stored 0 there, so old files are
+	// encoding-0 files by construction.
+	EncodingDeflateRGB565 uint8 = 0x00
+
+	// EncodingJPEG (0x01): one complete JPEG image per video frame, stored
+	// raw with no DEFLATE layer - effectively MJPEG inside MikV.
+	EncodingJPEG uint8 = 0x01
+)
+
+// Audio encoding IDs, stored in header byte 14 (same reserved-padding
+// origin story as byte 13: 0x00 is the legacy encoding by construction).
+const (
+	// EncodingRawPCM (0x00): raw interleaved PCM audio frames - the legacy
+	// default, fixed-length as the original spec describes.
+	EncodingRawPCM uint8 = 0x00
+
+	// EncodingOGGOpus (0x01): the audio track is one OGG-Opus stream, cut
+	// at page boundaries into per-video-frame segments. Each frame's audio
+	// chunk holds whole Ogg pages (possibly none); concatenating every
+	// audio chunk in file order reproduces the original .ogg byte for byte.
+	// Chunk lengths are therefore variable (the uint32 prefix already
+	// allows it) and the Ogg stream itself (OpusHead) is authoritative for
+	// sample rate/channels - the header audio fields stay filled with the
+	// nominal values used when writing.
+	EncodingOGGOpus uint8 = 0x01
+)
+
+// DefaultJPEGQuality is used for JPEG-encoded frames when
+// MikVFormat.JPEGQuality is unset.
+const DefaultJPEGQuality = 90
+
 // Frame represents a single video and audio frame
 type MikVFrame struct {
 	Video []byte
 	Audio []byte
+	// VideoEncoding is the encoding ID of the Video payload (EncodingDeflateRGB565
+	// or EncodingJPEG). It rides on the file header, not on each frame:
+	// Load/readFrame stamp it from the header and AddFrame from the
+	// writer's setting, so consumers of Stream()/Frames always know how to
+	// read Video without a second lookup. AudioEncoding likewise tags the
+	// Audio payload (raw PCM or Ogg page segments).
+	VideoEncoding uint8
+	AudioEncoding uint8
 }
 
 // MikVFormat is a struct that represents a video/audio file
@@ -144,10 +229,26 @@ type MikVFormat struct {
 	AudioSampleRate    uint16
 	AudioChannels      uint8
 	AudioBitsPerSample uint8
-	Verbose            bool
+	// VideoEncoding is the encoding ID written to (or read from) header
+	// byte 13: EncodingDeflateRGB565 (0, the default) or EncodingJPEG (1).
+	VideoEncoding uint8
+	// AudioEncoding is the encoding ID written to (or read from) header
+	// byte 14: EncodingRawPCM (0, the default) or EncodingOGGOpus (1).
+	AudioEncoding uint8
+	// JPEGQuality applies to JPEG-encoded frames (AddFrame/LoadFromMP4);
+	// 0 selects DefaultJPEGQuality.
+	JPEGQuality int
+	// OpusBitrateKbps is the -b:a value (kbps) passed to ffmpeg's libopus
+	// encoder in LoadFromMP4's EncodingOGGOpus audio path; 0 leaves the
+	// bitrate choice to libopus's own default.
+	OpusBitrateKbps int
+	Verbose         bool
 }
 
-// Header structure
+// Header structure (16 bytes; byte 13 is the video encoding ID, byte 14
+// the audio encoding ID, byte 15 the reserved padding). Kept as a
+// reference template - Load and Save work on per-call copies so
+// concurrent file IO cannot race through this package-level value.
 var MikVHeader = struct {
 	Magic              [4]byte
 	FPS                uint8
@@ -156,10 +257,24 @@ var MikVHeader = struct {
 	AudioSampleRate    uint16
 	AudioChannels      uint8
 	AudioBitsPerSample uint8
-	Reserved           [3]byte
+	VideoEncoding      uint8
+	AudioEncoding      uint8
+	Reserved           uint8
 }{
 	Magic:    [4]byte{'M', 'i', 'k', 'V'},
-	Reserved: [3]byte{0, 0, 0}, // Default reserved bytes
+	Reserved: 0, // Reserved padding is always zero
+}
+
+// validVideoEncoding reports whether id is a video encoding this
+// reader/writer understands.
+func validVideoEncoding(id uint8) bool {
+	return id == EncodingDeflateRGB565 || id == EncodingJPEG
+}
+
+// validAudioEncoding reports whether id is an audio encoding this
+// reader/writer understands.
+func validAudioEncoding(id uint8) bool {
+	return id == EncodingRawPCM || id == EncodingOGGOpus
 }
 
 // Constructor
@@ -250,7 +365,28 @@ func (m *MikVFormat) Stream(frameChan chan<- MikVFrame, stopChan <-chan struct{}
 // Conversion functions
 
 // -- AddFrame function
+// rawImage is an RGB565 frame buffer for EncodingDeflateRGB565 (byte order
+// is swapped for the DEFLATE stream, as the original writer did) and a
+// complete JPEG image for EncodingJPEG (stored untouched, no DEFLATE).
 func (m *MikVFormat) AddFrame(rawImage []byte, audioSamples []byte) error {
+	if !validVideoEncoding(m.VideoEncoding) {
+		return fmt.Errorf("Unsupported video encoding 0x%02X", m.VideoEncoding)
+	}
+	if !validAudioEncoding(m.AudioEncoding) {
+		return fmt.Errorf("Unsupported audio encoding 0x%02X", m.AudioEncoding)
+	}
+
+	if m.VideoEncoding == EncodingJPEG {
+		frame := MikVFrame{
+			Video:         rawImage,
+			Audio:         audioSamples,
+			VideoEncoding: EncodingJPEG,
+			AudioEncoding: m.AudioEncoding,
+		}
+		m.Frames = append(m.Frames, frame)
+		return nil
+	}
+
 	// Swap byte order for zlib
 	for i := 0; i < len(rawImage); i += 2 {
 		rawImage[i], rawImage[i+1] = rawImage[i+1], rawImage[i]
@@ -280,8 +416,10 @@ func (m *MikVFormat) AddFrame(rawImage []byte, audioSamples []byte) error {
 
 	// Create a new frame with compressed video data and raw audio data
 	frame := MikVFrame{
-		Video: compressedFrame.Bytes(),
-		Audio: audioSamples,
+		Video:         compressedFrame.Bytes(),
+		Audio:         audioSamples,
+		VideoEncoding: EncodingDeflateRGB565,
+		AudioEncoding: m.AudioEncoding,
 	}
 
 	// Append the frame to the MikVFormat
@@ -308,6 +446,19 @@ func (m *MikVFormat) LoadFromMP4(filename string) error {
 		return fmt.Errorf("Audio parameters not set")
 	}
 
+	// Encodings must be valid - and OGG-Opus needs its declared
+	// parameters - before any decode work starts.
+	if !validVideoEncoding(m.VideoEncoding) {
+		return fmt.Errorf("Unsupported video encoding 0x%02X", m.VideoEncoding)
+	}
+	if !validAudioEncoding(m.AudioEncoding) {
+		return fmt.Errorf("Unsupported audio encoding 0x%02X", m.AudioEncoding)
+	}
+	if m.AudioEncoding == EncodingOGGOpus && (m.AudioSampleRate != OGGOpusSampleRate || m.AudioChannels > 2) {
+		return fmt.Errorf("OGG-Opus audio requires sample rate %d and 1-2 channels (got %d Hz, %d ch)",
+			OGGOpusSampleRate, m.AudioSampleRate, m.AudioChannels)
+	}
+
 	// 1. Use VidIO to extract video frames
 	video, err := vidio.NewVideo(filename)
 	if err != nil {
@@ -328,30 +479,46 @@ func (m *MikVFormat) LoadFromMP4(filename string) error {
 		vbar = progressbar.Default(int64(video.Frames()), "Converting video frames")
 	}
 
-	for video.Read() {
-		// 2. Convert the frames to RGB565 format
-		rgb565buf := make([]uint16, m.Width*m.Height)
+	jpegQuality := m.JPEGQuality
+	if jpegQuality == 0 {
+		jpegQuality = DefaultJPEGQuality
+	}
 
-		for y := 0; y < int(m.Height); y++ {
-			for x := 0; x < int(m.Width); x++ {
-				r, g, b, _ := vbuffer.At(x, y).RGBA()
-				r5 := uint16((r >> 11) & 0x1F)
-				g6 := uint16((g >> 10) & 0x3F)
-				b5 := uint16((b >> 11) & 0x1F)
-				rgb565buf[y*int(m.Width)+x] = (r5 << 11) | (g6 << 5) | b5
+	for video.Read() {
+		// 2. Encode the frame per the video encoding ID: RGB565 packed the
+		// way AddFrame expects for the DEFLATE path, or a complete JPEG
+		// image per frame for EncodingJPEG (stored untouched).
+		var frameBytes []byte
+		if m.VideoEncoding == EncodingJPEG {
+			var jpegBuf bytes.Buffer
+			if err := jpeg.Encode(&jpegBuf, vbuffer, &jpeg.Options{Quality: jpegQuality}); err != nil {
+				return fmt.Errorf("Error encoding JPEG frame: %v", err)
 			}
-		}
-		rawImage := make([]byte, len(rgb565buf)*2)
-		for i, v := range rgb565buf {
-			rawImage[i*2] = byte(v)
-			rawImage[i*2+1] = byte(v >> 8)
+			frameBytes = jpegBuf.Bytes()
+		} else {
+			rgb565buf := make([]uint16, m.Width*m.Height)
+
+			for y := 0; y < int(m.Height); y++ {
+				for x := 0; x < int(m.Width); x++ {
+					r, g, b, _ := vbuffer.At(x, y).RGBA()
+					r5 := uint16((r >> 11) & 0x1F)
+					g6 := uint16((g >> 10) & 0x3F)
+					b5 := uint16((b >> 11) & 0x1F)
+					rgb565buf[y*int(m.Width)+x] = (r5 << 11) | (g6 << 5) | b5
+				}
+			}
+			frameBytes = make([]byte, len(rgb565buf)*2)
+			for i, v := range rgb565buf {
+				frameBytes[i*2] = byte(v)
+				frameBytes[i*2+1] = byte(v >> 8)
+			}
 		}
 
 		if m.Verbose {
 			vbar.Add(1)
 		}
 
-		imageBytes[currentFrameI] = rawImage
+		imageBytes[currentFrameI] = frameBytes
 		// imageBytes = append(imageBytes, rawImage)
 		currentFrameI++
 	}
@@ -360,52 +527,87 @@ func (m *MikVFormat) LoadFromMP4(filename string) error {
 		vbar.Finish()
 	}
 
-	// 3. Use ffmpeg to convert the audio to the right format
-	audioFrameLength := int((int(m.AudioSampleRate) / int(m.FPS)) * int(m.AudioChannels) * int(m.AudioBitsPerSample) / 8)
+	// 3. Audio pipeline, per header byte 14.
+	// EncodingOGGOpus: ONE ordinary OGG-Opus stream, encoded at the frame
+	// duration that matches the fps, then cut at page boundaries into one
+	// chunk per video frame (see ogg_opus.go).
+	// EncodingRawPCM: the legacy raw PCM track.
+	var audioChunks [][]byte // OGG-Opus: exactly len(imageBytes) chunks
+	var audioBytes []byte    // raw PCM: the full interleaved track
+	audioFrameLength := 0
 
-	var abar *progressbar.ProgressBar
-	if m.Verbose {
-		abar = progressbar.Default(int64(len(imageBytes)*audioFrameLength), "Transcoding audio")
-	}
-	var audioFormat string
-	if m.AudioBitsPerSample == 16 {
-		audioFormat = "s16le"
-	} else if m.AudioBitsPerSample == 8 {
-		audioFormat = "u8"
-	}
-	cmd := exec.Command("ffmpeg", "-i", filename, "-ar", fmt.Sprintf("%d", m.AudioSampleRate), "-f", audioFormat, "-ac", fmt.Sprintf("%d", m.AudioChannels), "pipe:1")
-	audioReader, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("Error creating audio pipe: %v", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("Error starting ffmpeg: %v", err)
-	}
-	// 3.1 Read audio frames from the pipe
-	var audioBytes []byte
-	stdoutBuffer := make([]byte, 4096)
-	for {
-		n, err := audioReader.Read(stdoutBuffer)
-		if n > 0 {
-			audioBytes = append(audioBytes, stdoutBuffer[:n]...)
-
-			if m.Verbose {
-				abar.Add(n)
-			}
-		}
+	if m.AudioEncoding == EncodingOGGOpus {
+		frameDurMs, err := OGGOpusFrameDurationMs(m.FPS)
 		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return fmt.Errorf("Error reading audio data: %v", err)
+			return fmt.Errorf("Error setting up OGG-Opus audio: %v", err)
 		}
-	}
-	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("Error waiting for ffmpeg: %v", err)
-	}
+		if m.Verbose {
+			fmt.Printf("Encoding OGG-Opus audio (%.1f ms packets at %d fps)\n", frameDurMs, m.FPS)
+		}
+		args := []string{"-i", filename, "-vn",
+			"-ar", fmt.Sprintf("%d", OGGOpusSampleRate),
+			"-ac", fmt.Sprintf("%d", m.AudioChannels),
+			"-c:a", "libopus",
+			"-frame_duration", strconv.FormatFloat(frameDurMs, 'f', -1, 64)}
+		if m.OpusBitrateKbps > 0 {
+			args = append(args, "-b:a", fmt.Sprintf("%dk", m.OpusBitrateKbps))
+		}
+		args = append(args, "-f", "ogg", "pipe:1")
+		cmd := exec.Command("ffmpeg", args...)
+		oggBytes, err := cmd.Output()
+		if err != nil {
+			return fmt.Errorf("Error encoding OGG-Opus audio: %v", err)
+		}
+		audioChunks, err = SplitOGGOpus(oggBytes, m.FPS, len(imageBytes))
+		if err != nil {
+			return fmt.Errorf("Error segmenting OGG-Opus audio: %v", err)
+		}
+	} else {
+		audioFrameLength = int((int(m.AudioSampleRate) / int(m.FPS)) * int(m.AudioChannels) * int(m.AudioBitsPerSample) / 8)
 
-	if m.Verbose {
-		abar.Finish()
+		var abar *progressbar.ProgressBar
+		if m.Verbose {
+			abar = progressbar.Default(int64(len(imageBytes)*audioFrameLength), "Transcoding audio")
+		}
+		var audioFormat string
+		if m.AudioBitsPerSample == 16 {
+			audioFormat = "s16le"
+		} else if m.AudioBitsPerSample == 8 {
+			audioFormat = "u8"
+		}
+		cmd := exec.Command("ffmpeg", "-i", filename, "-ar", fmt.Sprintf("%d", m.AudioSampleRate), "-f", audioFormat, "-ac", fmt.Sprintf("%d", m.AudioChannels), "pipe:1")
+		audioReader, err := cmd.StdoutPipe()
+		if err != nil {
+			return fmt.Errorf("Error creating audio pipe: %v", err)
+		}
+		if err := cmd.Start(); err != nil {
+			return fmt.Errorf("Error starting ffmpeg: %v", err)
+		}
+		// 3.1 Read audio frames from the pipe
+		stdoutBuffer := make([]byte, 4096)
+		for {
+			n, err := audioReader.Read(stdoutBuffer)
+			if n > 0 {
+				audioBytes = append(audioBytes, stdoutBuffer[:n]...)
+
+				if m.Verbose {
+					abar.Add(n)
+				}
+			}
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				return fmt.Errorf("Error reading audio data: %v", err)
+			}
+		}
+		if err := cmd.Wait(); err != nil {
+			return fmt.Errorf("Error waiting for ffmpeg: %v", err)
+		}
+
+		if m.Verbose {
+			abar.Finish()
+		}
 	}
 
 	// 4. Add the  frames to the MikVFormat
@@ -414,20 +616,25 @@ func (m *MikVFormat) LoadFromMP4(filename string) error {
 		mbar = progressbar.Default(int64(len(imageBytes)), "Adding frames to MikV")
 	}
 
-	for i, rawImage := range imageBytes {
-		start := i * audioFrameLength
-		end := start + audioFrameLength
-		if end > len(audioBytes) {
-			end = len(audioBytes)
-		}
-		if start > len(audioBytes) {
-			fmt.Println("Audio data shorter than video, leaving tail as silence")
-			break
-		}
+	for i, frameBytes := range imageBytes {
+		var audioFrame []byte
+		if m.AudioEncoding == EncodingOGGOpus {
+			audioFrame = audioChunks[i]
+		} else {
+			start := i * audioFrameLength
+			end := start + audioFrameLength
+			if end > len(audioBytes) {
+				end = len(audioBytes)
+			}
+			if start > len(audioBytes) {
+				fmt.Println("Audio data shorter than video, leaving tail as silence")
+				break
+			}
 
-		audioFrame := make([]byte, audioFrameLength)
-		copy(audioFrame, audioBytes[start:end])
-		if err := m.AddFrame(rawImage, audioFrame); err != nil {
+			audioFrame = make([]byte, audioFrameLength)
+			copy(audioFrame, audioBytes[start:end])
+		}
+		if err := m.AddFrame(frameBytes, audioFrame); err != nil {
 			return fmt.Errorf("Error adding frame: %v", err)
 		}
 
@@ -447,24 +654,36 @@ func (m *MikVFormat) LoadFromMP4(filename string) error {
 
 // -- readHeader function
 func (m *MikVFormat) readHeader(file *os.File) error {
-	// Read the header from the file
-	err := binary.Read(file, binary.LittleEndian, &MikVHeader)
+	// Read the header from the file into a per-call copy of the template
+	h := MikVHeader
+	err := binary.Read(file, binary.LittleEndian, &h)
 	if err != nil {
 		return fmt.Errorf("Error reading header: %v", err)
 	}
 
 	// Check magic number
-	if MikVHeader.Magic != [4]byte{'M', 'i', 'k', 'V'} {
+	if h.Magic != [4]byte{'M', 'i', 'k', 'V'} {
 		return fmt.Errorf("Invalid file format")
 	}
 
+	// Encoding IDs must be known before any frame is touched: a payload
+	// read under the wrong encoding is silent garbage.
+	if !validVideoEncoding(h.VideoEncoding) {
+		return fmt.Errorf("Unsupported video encoding 0x%02X", h.VideoEncoding)
+	}
+	if !validAudioEncoding(h.AudioEncoding) {
+		return fmt.Errorf("Unsupported audio encoding 0x%02X", h.AudioEncoding)
+	}
+
 	// Assign to struct fields
-	m.FPS = MikVHeader.FPS
-	m.Height = MikVHeader.Height
-	m.Width = MikVHeader.Width
-	m.AudioSampleRate = MikVHeader.AudioSampleRate
-	m.AudioChannels = MikVHeader.AudioChannels
-	m.AudioBitsPerSample = MikVHeader.AudioBitsPerSample
+	m.FPS = h.FPS
+	m.Height = h.Height
+	m.Width = h.Width
+	m.AudioSampleRate = h.AudioSampleRate
+	m.AudioChannels = h.AudioChannels
+	m.AudioBitsPerSample = h.AudioBitsPerSample
+	m.VideoEncoding = h.VideoEncoding
+	m.AudioEncoding = h.AudioEncoding
 
 	return nil
 }
@@ -497,24 +716,48 @@ func (m *MikVFormat) readFrame(file *os.File) (*MikVFrame, error) {
 		return nil, fmt.Errorf("Error reading audio frame data: %v", err)
 	}
 
+	// The encodings ride on the header; stamp them onto the frame so a
+	// consumer can interpret both payloads from the frame alone.
+	frame.VideoEncoding = m.VideoEncoding
+	frame.AudioEncoding = m.AudioEncoding
+
 	return &frame, nil
 
 }
 
 // -- writeHeader function
 func (m *MikVFormat) writeHeader(file *os.File) error {
-	// Set header values dynamically from MikVFormat
-	MikVHeader.Magic = [4]byte{'M', 'i', 'k', 'V'}
-	MikVHeader.FPS = m.FPS
-	MikVHeader.Height = m.Height
-	MikVHeader.Width = m.Width
-	MikVHeader.AudioSampleRate = m.AudioSampleRate
-	MikVHeader.AudioChannels = m.AudioChannels
-	MikVHeader.AudioBitsPerSample = m.AudioBitsPerSample
-	MikVHeader.Reserved = [3]byte{0, 0, 0}
+	if !validVideoEncoding(m.VideoEncoding) {
+		return fmt.Errorf("Unsupported video encoding 0x%02X", m.VideoEncoding)
+	}
+	if !validAudioEncoding(m.AudioEncoding) {
+		return fmt.Errorf("Unsupported audio encoding 0x%02X", m.AudioEncoding)
+	}
+	if m.AudioEncoding == EncodingOGGOpus {
+		// The frame-window arithmetic is granule-based: this encoding only
+		// works with the 48 kHz Ogg granule clock and Opus's channel limit.
+		if m.AudioSampleRate != OGGOpusSampleRate || m.AudioChannels < 1 || m.AudioChannels > 2 {
+			return fmt.Errorf("OGG-Opus audio requires sample rate %d and 1-2 channels (got %d Hz, %d ch)",
+				OGGOpusSampleRate, m.AudioSampleRate, m.AudioChannels)
+		}
+	}
+
+	// Set header values dynamically from MikVFormat, on a per-call copy of
+	// the template
+	h := MikVHeader
+	h.Magic = [4]byte{'M', 'i', 'k', 'V'}
+	h.FPS = m.FPS
+	h.Height = m.Height
+	h.Width = m.Width
+	h.AudioSampleRate = m.AudioSampleRate
+	h.AudioChannels = m.AudioChannels
+	h.AudioBitsPerSample = m.AudioBitsPerSample
+	h.VideoEncoding = m.VideoEncoding
+	h.AudioEncoding = m.AudioEncoding
+	h.Reserved = 0
 
 	// Write the header to the file in little-endian format
-	if err := binary.Write(file, binary.LittleEndian, MikVHeader); err != nil {
+	if err := binary.Write(file, binary.LittleEndian, h); err != nil {
 		return fmt.Errorf("Error writing header: %v", err)
 	}
 
