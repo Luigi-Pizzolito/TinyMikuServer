@@ -24,11 +24,26 @@ build-holocropper:
 	@echo "Building holocropper..."
 	cd $(HOLOCROPPER_DIR) && $(GO_BUILD) -o ../../../../$(BIN_DIR)/holocropper
 
+# Mirrors .github/workflows/ci.yml: build+vet for the server and mikv modules,
+# the full -race suite for holocropper (lavfi fixtures + golden CSV only, no
+# corpus videos needed).
+test: test-mikv test-holocropper
+
+test-mikv:
+	@echo "Building and vetting server + mikv packages..."
+	$(GO_BUILD) ./... && $(GO) vet ./...
+	cd pkg/mikvformat && $(GO_BUILD) ./... && $(GO) vet ./...
+	cd pkg/mikvserver && $(GO_BUILD) ./... && $(GO) vet ./...
+
+test-holocropper:
+	@echo "Testing holocropper (-race, corpus-free)..."
+	cd pkg/holocropper && $(GO) test -count=1 -race -timeout 600s ./...
+
 clean:
 	@echo "Cleaning up binaries..."
 	find $(BIN_DIR) -type f ! -name '.gitkeep' -delete
 
-.PHONY: all build-server build-mikv-converter clean
+.PHONY: all build-server build-mikv-converter build-holocropper test test-mikv test-holocropper clean
 
 convert-assets:
 	@echo "Converting assets..."

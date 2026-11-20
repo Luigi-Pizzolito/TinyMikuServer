@@ -1,0 +1,110 @@
+name: CI
+
+# Corpus-free by design: every fixture in pkg/holocropper is synthesized with
+# ffmpeg's lavfi sources (buildFixture), and framing parity is held by the
+# committed golden CSV (pkg/holocropper/testdata). No asset video is needed or
+# read. HOLOCROPPER_REQUIRE_FFMPEG makes a missing ffmpeg a FAILURE rather than
+# a silent skip of the fixture tests.
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  holocropper:
+    name: holocropper (-race, golden parity, CLI smoke)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pkg/holocropper
+    env:
+      HOLOCROPPER_REQUIRE_FFMPEG: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: pkg/holocropper/go.mod
+          cache-dependency-path: pkg/holocropper/go.sum
+
+      - name: Install ffmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends ffmpeg
+          fi
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-clean:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      - name: Build CLI
+        run: go build -o "$RUNNER_TEMP/holocropper" ./cmd/holocropper
+
+      - name: Test
+        run: go test -count=1 -race -timeout 600s ./...
+
+      # Backwards-compatibility smoke: legacy flags in, legacy file name out.
+      # Also proves the second render of an unchanged input hits the analysis
+      # cache and still writes the same legacy-named file.
+      - name: CLI renders the fixture with legacy naming
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/ci-cli && mkdir -p /tmp/ci-cli/in /tmp/ci-cli/out /tmp/ci-cli/tmp
+          ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i "color=c=black:s=960x540:d=4:r=24" \
+            -f lavfi -i "color=c=white:s=120x60:d=4:r=24" \
+            -f lavfi -i "sine=frequency=440:duration=4" \
+            -filter_complex "[0:v][1:v]overlay=x='60+90*t':y=240,format=yuv420p[v]" \
+            -map "[v]" -map "2:a" -c:v libx264 -preset ultrafast -c:a aac -shortest \
+            /tmp/ci-cli/in/dance.mp4
+          "$RUNNER_TEMP/holocropper" -i /tmp/ci-cli/in -o /tmp/ci-cli/out \
+            -temp-dir /tmp/ci-cli/tmp -w 240 -h 240 -fps 20
+          test -f /tmp/ci-cli/out/dance.mp4 || { echo "legacy output name dance.mp4 missing"; exit 1; }
+          test "$(ls /tmp/ci-cli/out | wc -l)" -eq 1 || { echo "unexpected extra outputs"; ls -l /tmp/ci-cli/out; exit 1; }
+          ffprobe -hide_banner -v error -select_streams v:0 \
+            -show_entries stream=width,height -of csv=p=0 /tmp/ci-cli/out/dance.mp4 | grep -qx 240,240
+          # re-render at another target: same legacy name, still one file
+          "$RUNNER_TEMP/holocropper" -i /tmp/ci-cli/in -o /tmp/ci-cli/out \
+            -temp-dir /tmp/ci-cli/tmp -w 420 -h 240 -fps 20
+          test "$(ls /tmp/ci-cli/out | wc -l)" -eq 1 || { echo "re-render clobbered the naming"; ls -l /tmp/ci-cli/out; exit 1; }
+          ffprobe -hide_banner -v error -select_streams v:0 \
+            -show_entries stream=width,height -of csv=p=0 /tmp/ci-cli/out/dance.mp4 | grep -qx 420,240
+
+  rest-of-repo:
+    name: server + mikv (build, vet)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            pkg/mikvformat/go.sum
+            pkg/mikvserver/go.sum
+
+      - name: Build and vet the main module
+        run: go build ./... && go vet ./...
+
+      - name: Build and vet pkg/mikvformat
+        working-directory: pkg/mikvformat
+        run: go build ./... && go vet ./...
+
+      - name: Build and vet pkg/mikvserver
+        working-directory: pkg/mikvserver
+        run: go build ./... && go vet ./...

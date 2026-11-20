@@ -37,3 +37,5 @@ vids-cropped2/
 vids-cropped-new/
 vids-cropped2-new/
 vids-cropped-1x1-new/
+# Root build output (go build ./...)
+/TinyMikuServer

@@ -32,10 +32,18 @@ const (
 	fixtureSeconds     = 4
 )
 
+// requireFFmpeg resolves ffmpeg for the fixture-driven tests. The fixtures are
+// synthesized with lavfi, so the suite needs no corpus videos - but it does
+// need ffmpeg. With HOLOCROPPER_REQUIRE_FFMPEG set (what CI exports) a missing
+// ffmpeg FAILS the run instead of skipping it, so a CI job can never go green
+// by quietly skipping every fixture test.
 func requireFFmpeg(t *testing.T) string {
 	t.Helper()
 	path, err := exec.LookPath("ffmpeg")
 	if err != nil {
+		if os.Getenv("HOLOCROPPER_REQUIRE_FFMPEG") != "" {
+			t.Fatalf("ffmpeg not on PATH, and HOLOCROPPER_REQUIRE_FFMPEG is set: the fixture tests must run, not skip")
+		}
 		t.Skip("analysis pass tests need ffmpeg on PATH")
 	}
 	return path
