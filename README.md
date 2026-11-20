@@ -8,10 +8,10 @@ TinyMikuServer is a specialized video streaming server designed to serve content
 
 ## Features
 
-- **Custom MikV Format**: A lightweight binary format optimized for storing synchronized video and audio frames - DEFLATEd RGB565 video with raw PCM audio by default, with header-recorded payload encodings for JPEG video (MJPEG-in-MikV) and OGG-Opus audio
+- **Custom MikV Format**: A lightweight binary format optimized for storing synchronized video and audio frames - DEFLATEd RGB565 video with raw PCM audio by default, with header-recorded payload encodings for JPEG video (MJPEG-in-MikV) and OGG-Opus audio. A container's sound is exactly as long as its frames, and reading is strict: a file cut inside a frame record is refused, not reported as a shorter valid video
 - **Streaming Server**: HTTP-based server for real-time streaming of MikV content
 - **Video Converter**: Tool to convert MP4 files to the MikV format, including `-jpeg` and `-opus` payload encodings
-- **HoloCropper**: Content-aware video cropping tool for preparing hologram-style videos at any output aspect ratio (1:1, portrait, landscape), with auto-orient and walk mode - plus a **fit mode** (`-fit`) for non-hologram videos: whole-frame scale-to-fit with black bars - and **MikV output** (`-mikv`) that writes the firmware container straight from the render, MJPEG+OGG-Opus pairing included
+- **HoloCropper**: Content-aware video cropping tool for preparing hologram-style videos at any output aspect ratio (1:1, portrait, landscape), with auto-orient and walk mode - plus a **fit mode** (`-fit`) for non-hologram videos: whole-frame scale-to-fit with black bars - **MikV output** (`-mikv`) that writes the firmware container straight from the render, MJPEG+OGG-Opus pairing included - and previews that render at the plan's frame rate with an optional **VP9 + Opus WebM mux** (`Options.MuxVideo: "vp9-webm"`) for watchable previews in a browser
 - **Optimized for Edge Devices**: Designed for efficient streaming to embedded systems and IoT devices
 
 ## Project Structure
@@ -190,7 +190,9 @@ The last step of the asset pipeline is usually `mikv-converter`. `-mikv` folds t
 
 - The default output carries the original encodings (header bytes 13/14 = `0x00`/`0x00`): DEFLATEd RGB565 video, raw PCM at 16000 Hz mono 16-bit - exactly what the firmware reads today.
 - `-mikv-jpeg` stores one complete JPEG per frame (video encoding `0x01`); `-mikv-opus` stores the audio as one ordinary OGG-Opus stream cut at page boundaries into one chunk per frame (audio encoding `0x01`). Concatenating a file's audio chunks reproduces a plain `.ogg` - a decoder needs no MikV knowledge to play it.
+- **The audio is as long as the picture.** PCM is cut to `sampleRate/fps` samples per frame; OGG-Opus keeps only the packets that complete inside a frame window. Whatever of the source's track runs past the last frame is dropped, so the container never plays sound with no picture to play it against - and the pass warns when it cut a tail.
 - MikV stores an integral frame rate: `-fps` must be whole. Raw PCM chunks are fixed-length (`sampleRate/fps` samples), so with PCM audio the sample rate must divide the fps; the recommended compressed pairing is **24 fps + 48 kHz**, where everything divides (40 ms Opus packets).
+- The frame count follows `-fps`, not the source's frame rate: a 12 fps source rendered at `-fps 24` writes 24 frames per second of source footage (nearest-frame duplicate/drop, never reordered or blended), so the picture measures the same seconds the audio does. See the frame clock under [Architecture](#architecture).
 - The API entry point is `analysis.RenderMikV(ctx, plan, MikVRequest{...})` with `MikVOptions` selecting the encodings; it shares the render slot with previews and the mp4 render. See [HOLOCROPPER-API-PLAN.md](HOLOCROPPER-API-PLAN.md) §6.11.
 
 #### Walk mode (landscape to landscape)
@@ -218,6 +220,10 @@ flowchart LR
 ```
 
 `Analyze` measures one **master bbox** per frame (covering all detected subjects) and caches it. `NewPlan` replays the framing controller over those bboxes - so changing `-w`, `-h`, `-zoom-margin` or `-auto-orient` costs a millisecond-scale replay, not a re-decode - and `RenderFinal`/`RenderPreview` execute the plan's crop rectangles against the cached analysis video. The replay is provably the old pipeline's decision stream: `TestReplayParityVsDebugCSV` pins it, frame for frame, against the fused pipeline's own golden CSV - one golden per ffmpeg major version, since the decision stream follows that build's encode/decode behavior.
+
+**The frame clock.** The cached analysis video preserves the **source's** frame rate (prepare re-encodes with `-fps_mode passthrough`), while a Plan replays its framing at `Settings.FPS` / `-fps`. Every output pass therefore plays the plan out on a schedule: output frame *i* replays analysis frame `floor(i × analysisFPS / renderFPS)`, and the pass writes `seconds × -fps` frames. A faster render clock repeats analysis frames, a slower one drops them, order never changes and nothing is blended - so a 12 fps source at `-fps 24` produces 4 seconds of 24 fps output, not 48 frames masquerading as 2 seconds under a 4 second audio track. The clock it maps from is the analysis cache's recorded fps; a pass that resamples, or whose cache disagrees with the video file it decodes, says so in its `Warnings`. A cache that never recorded a clock keeps one frame per analysis record rather than guessing.
+
+**Preview mux.** `RenderPreview` also chooses what the preview files hold (`PreviewOptions.MuxVideo`): the default `mjpeg` writes the rendered JPEG sequence into an MP4 exactly as the CLI and the final render do, video only; `vp9-webm` encodes VP9 video and brings the source's audio along as Opus in a WebM container, which is the pairing a browser plays with sound - MJPEG-in-MP4 is what the UMP PC player and WebKitGTK read, but Chromium refuses it outright. The extension follows the mux (`…-v<N>.webm`), because the name is what tells ffmpeg and every player which container the bytes are. The choice is recorded per retained file (`PreviewRef.MuxVideo`, `PreviewResult.MuxVideo`), because an app that reuses a preview on its `SettingsHash` must also want the codec that file holds. The final render's mux is fixed - mjpeg video with the source audio copied through - because that pairing is what the UMP PC player takes.
 
 The framing controller owns every per-frame decision: subject smoothing, the aspect-locked target geometry, and three plant controllers (pan X, pan Y, zoom):
 
@@ -330,7 +336,9 @@ Original MikV files wrote zeros into the reserved padding, so offsets 13-15 read
 | Audio encoding (byte 14) | Payload                                            |
 |--------------------------|----------------------------------------------------|
 | `0x00`                   | Raw interleaved PCM, `sampleRate / FPS` samples per frame (legacy default) |
-| `0x01`                   | OGG-Opus page segments: the audio track is ONE ordinary Ogg Opus stream, cut at page boundaries into one chunk per video frame (variable-length; chunks may be empty). Concatenating every audio chunk in file order reproduces the original `.ogg` byte for byte |
+| `0x01`                   | OGG-Opus page segments: the audio track is ONE ordinary Ogg Opus stream, cut at page boundaries into one chunk per video frame (variable-length; chunks may be empty). Concatenating every audio chunk in file order reproduces a valid `.ogg` - the one that covers the frames this file ships with |
+
+**The container's sound is exactly as long as its frames.** Encoding `0x00` budgets `sampleRate / FPS` samples per frame; encoding `0x01` keeps only the Opus packets that complete inside a frame window and drops what runs past the last frame. A reader therefore never plays audio with no picture to play it against, and a shorter joined `.ogg` than the source track is the expected result when the source's audio outlived its video.
 
 #### Frame Structure
 
@@ -340,6 +348,8 @@ Each frame contains:
 - **Audio Size** (4 bytes): uint32 - Size of the encoded audio data
 - **Audio Data** (variable): the payload per byte 14 of the header
 
+**Reading is strict.** A file that ends exactly where the next frame record's size field belongs is complete; one that ends *inside* a frame record - or whose declared payload is bigger than the rest of the file - is a partial product. `mikvformat.Load` refuses it as `mikvformat.ErrTruncatedRecord` (matchable with `errors.Is`) and reports no frames, instead of returning the frames that survived as if the file were a shorter valid container. A browser-side reader should apply the same rule: stop at the last record that closes cleanly, and treat a cut record as an incomplete file.
+
 ## API Reference
 
 ### MikVFormat
@@ -348,8 +358,10 @@ Each frame contains:
 // Create a new MikV format instance
 mikv := mikvformat.NewMikVFormat()
 
-// Load from file (header encoding IDs are validated; frames carry
-// VideoEncoding/AudioEncoding stamps)
+// Load from file. The header's encoding IDs are validated, frames carry
+// VideoEncoding/AudioEncoding stamps, and reading is strict: a file cut
+// inside a frame record returns mikvformat.ErrTruncatedRecord (errors.Is)
+// and no frames.
 mikv.Load("path/to/file.mikv")
 
 // Save to file
@@ -361,7 +373,10 @@ mikv.VideoEncoding = mikvformat.EncodingJPEG    // MJPEG-in-MikV
 mikv.AudioEncoding = mikvformat.EncodingOGGOpus // 48 kHz granule clock
 mikv.LoadFromMP4("path/to/video.mp4")
 
-// Split one OGG-Opus stream into per-video-frame chunks (and back):
+// Split one OGG-Opus stream into per-video-frame chunks (and back).
+// frames is the number of video frames the container holds: packets that
+// complete past the last frame window are dropped, so the joined track is
+// as long as the picture.
 chunks, err := mikvformat.SplitOGGOpus(oggBytes, fps, frames)
 ogg := mikvformat.JoinOGGChunks(chunks)
 
@@ -416,9 +431,14 @@ fitPlan, err := holocropper.NewFitPlan(analysis.Stream(), holocropper.Settings{
 })
 
 // Preview (versioned, output resolution) and the final render. Both are
-// Tasks: Wait blocks, Observer/TaskInfo drive the spinner.
-pvTask, err := analysis.RenderPreview(ctx, plan, holocropper.PreviewRequest{})
-pv, err := pvTask.Wait() // <basename>-<WxH>-v<N>.mp4 inside the analysis cache
+// Tasks: Wait blocks, Observer/TaskInfo drive the spinner. A preview holds
+// seconds x Settings.FPS frames whatever the source's frame rate was.
+pvTask, err := analysis.RenderPreview(ctx, plan, holocropper.PreviewRequest{
+	Options: holocropper.PreviewOptions{
+		MuxVideo: holocropper.PreviewMuxVP9WebM, // "" = mjpeg in .mp4; vp9-webm = VP9 + the source's audio as Opus in .webm
+	},
+})
+pv, err := pvTask.Wait() // <basename>-<WxH>-v<N>.mp4 (or .webm) inside the analysis cache
 
 finalTask, err := analysis.RenderFinal(ctx, plan, holocropper.RenderRequest{
 	OutputDir: "output", TempDir: "./tmp",

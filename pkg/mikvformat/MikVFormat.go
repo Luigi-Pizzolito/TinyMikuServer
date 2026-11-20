@@ -128,6 +128,17 @@ import (
  * - The audio frame data is interleaved for multiple channels.
  * - Audio data for encoding 0x00 is 16-bit signed PCM; encoding 0x01 stores
  *   the compressed OGG-Opus page segments described in the audio legend.
+ * - The container's sound is exactly as long as its frames. Encoding 0x00 cuts
+ *   the track to (AudioSampleRate/FPS) samples per frame; encoding 0x01 keeps
+ *   only the packets that complete inside a frame window and drops what runs
+ *   past the last frame. A file therefore never plays audio with no picture to
+ *   play it against, and a shorter joined .ogg is the expected result when the
+ *   source's track outlived its video.
+ * - Reading is strict: a file that ends exactly at a frame boundary is a
+ *   complete container, and one that ends INSIDE a frame record is a partial
+ *   product that a reader must refuse (mikvformat.ErrTruncatedRecord) rather
+ *   than report as a shorter valid file. A declared payload length bigger than
+ *   the rest of the file is the same refusal.
  *
  * Example Usage:
  * -------------
