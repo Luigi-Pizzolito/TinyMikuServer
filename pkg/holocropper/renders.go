@@ -22,8 +22,9 @@ import (
 previews and the final production render, both executed from a cached
 Analysis video plus a Plan - no detection, no re-decode of the source.
 
-Both passes share one crop loop (cropToBBoxCalc + fillResizeTo, the same
-functions the CLI pipeline's STEP 5 uses) against the cached analysis video,
+Both passes share one frame loop - cropToBBoxCalc + fillResizeTo for the
+content-aware modes, fitResizeTo (whole frame scaled onto black bars) for
+fit mode (§6.10) - against the cached analysis video,
 writing a JPEG sequence into Task-ID-isolated scratch under the caller's
 TempDir, then ffmpeg-muxing it with progress. Previews mux video only; the
 final render copies the source audio track through, exactly as the CLI does.
@@ -347,8 +348,15 @@ func runCropLoop(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, cropDi
 				count+1, len(p.records))
 		}
 		rec := p.records[count]
-		cropped := cropToBBoxCalc(buf, p.cropRectAt(count))
-		out := fillResizeTo(cropped, r.OutputW, r.OutputH)
+		var out *image.RGBA
+		if p.settings.FitWithBars {
+			// Fit mode (§6.10): no crop - the whole analysis frame is
+			// scaled aspect-preserving into the output on black bars.
+			out = fitResizeTo(buf, r.OutputW, r.OutputH)
+		} else {
+			cropped := cropToBBoxCalc(buf, p.cropRectAt(count))
+			out = fillResizeTo(cropped, r.OutputW, r.OutputH)
+		}
 
 		if cropDir != "" {
 			if err := writeJPEG(cropDir, count+1, out); err != nil {

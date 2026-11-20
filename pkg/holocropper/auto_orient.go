@@ -117,3 +117,24 @@ func orientationStats(subjectARs []float64, w, h int) (outW, outH int, stat Orie
 	}
 	return w, h, stat
 }
+
+// fitOrientationStats is the auto-orient decision of fit mode (§6.10).
+// There is no subject containment to optimize - the quality measure is the
+// black-bar area: a containment score evaluated on the SOURCE frame's own
+// aspect ratio equals the fraction of the output the fitted image fills
+// (1.0 = no bars). So keep/flip compare WxH against HxW purely on output-
+// vs-source geometry, and the decision is identical whether or not the
+// clip has subjects. The AR aggregates report the source aspect; the frame
+// counts are carried for reporting only.
+func fitOrientationStats(srcAR float64, w, h, framesExamined, framesWithSubjects int) (outW, outH int, stat OrientationStat) {
+	stat.FramesExamined = framesExamined
+	stat.FramesWithSubjects = framesWithSubjects
+	stat.MeanAR, stat.MedianAR, stat.GeoMeanAR = srcAR, srcAR, srcAR
+
+	flip, keep, flipped := pickOrientation(w, h, []float64{srcAR})
+	stat.KeepScore, stat.FlipScore, stat.Flip = keep, flipped, flip
+	if flip {
+		return h, w, stat
+	}
+	return w, h, stat
+}

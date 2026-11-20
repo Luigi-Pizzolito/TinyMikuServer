@@ -189,11 +189,17 @@ var errStillsNoVideo = errors.New("holocropper: this Plan is not tied to a cache
 
 // composeFrame cuts idx's crop rect out of an analysis frame, fill-resizes
 // it to tw x th and draws that record's overlay boxes - identical geometry
-// to the render passes, at the requested size.
+// to the render passes, at the requested size. Fit-mode plans instead
+// fit-resize the full frame onto bars, matching their render passes.
 func (p *Plan) composeFrame(idx int, analysisFrame *image.RGBA, tw, th int) *image.RGBA {
 	rec := p.records[idx]
-	cropped := cropToBBoxCalc(analysisFrame, p.cropRectAt(idx))
-	out := fillResizeTo(cropped, tw, th)
+	var out *image.RGBA
+	if p.settings.FitWithBars {
+		out = fitResizeTo(analysisFrame, tw, th)
+	} else {
+		cropped := cropToBBoxCalc(analysisFrame, p.cropRectAt(idx))
+		out = fillResizeTo(cropped, tw, th)
+	}
 	drawOverlayBoxes(out, scaleRecordToFrame(rec, p.resolved.OutputW, p.resolved.OutputH, tw, th),
 		PreviewOptions{DrawSubject: true, DrawCrop: true}, defaultOverlayStyle())
 	return out

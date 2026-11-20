@@ -535,3 +535,31 @@ func fillResizeTo(img *image.RGBA, outW, outH int) *image.RGBA {
 	}
 	return out
 }
+
+// fitResizeTo scales img ASPECT-PRESERVING to fit inside outW x outH and
+// centers it on black: the leftover columns or rows are the bars
+// (pillarbox/letterbox). This is the fit-mode resize (§6.10, non-hologram
+// videos) - the whole frame survives, nothing is cropped or zoomed. When
+// the aspects match it degenerates to an exact resize with no bars.
+func fitResizeTo(img *image.RGBA, outW, outH int) *image.RGBA {
+	iw, ih := img.Bounds().Dx(), img.Bounds().Dy()
+	scale := math.Min(float64(outW)/float64(iw), float64(outH)/float64(ih))
+	sw := int(math.Round(float64(iw) * scale))
+	sh := int(math.Round(float64(ih) * scale))
+	if sw < 1 {
+		sw = 1
+	}
+	if sh < 1 {
+		sh = 1
+	}
+
+	out := image.NewRGBA(image.Rect(0, 0, outW, outH)) // black bars
+	scaled := img
+	if sw != iw || sh != ih {
+		scaled = fillResizeTo(img, sw, sh)
+	}
+	offX := (outW - sw) / 2
+	offY := (outH - sh) / 2
+	draw.Draw(out, image.Rect(offX, offY, offX+sw, offY+sh), scaled, image.Point{}, draw.Over)
+	return out
+}

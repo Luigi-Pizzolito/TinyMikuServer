@@ -51,7 +51,8 @@ func main() {
 	analysisHeight := flag.Int("analysis-height", 0, "Height of the internal analysis frame (0 = default 480; never below -h)")
 	zoomMargin := flag.Float64("zoom-margin", 0, "Subject bbox to crop padding factor (0 = default 1.12)")
 	maxZoom := flag.Float64("max-zoom", 0, "Maximum zoom-in factor (0 = default 2.0)")
-	autoOrient := flag.Bool("auto-orient", false, "Probe the input's subject aspect ratios and automatically pick portrait (HxW) or landscape (WxH) output orientation; skipped for 1:1 outputs")
+	autoOrient := flag.Bool("auto-orient", false, "Probe the input's subject aspect ratios and automatically pick portrait (HxW) or landscape (WxH) output orientation; skipped for 1:1 outputs. With -fit it instead picks the orientation with the least bars")
+	fitBars := flag.Bool("fit", false, "Fit mode for non-hologram videos: scale the WHOLE frame to fit the output resolution, centered on black bars - no content-aware crop or zoom (works for normal 4:3/16:9 sources destined for other shapes, e.g. square social/MV output)")
 	tempDir := flag.String("temp-dir", os.TempDir(), "Scratch + analysis-cache parent directory (cached analyses make repeated corpus renders skip the detect pass)")
 	ffmpegPath := flag.String("ffmpeg-path", "", "Path to the ffmpeg binary (default: ffmpeg from PATH)")
 
@@ -103,6 +104,7 @@ func main() {
 	fmt.Printf("Analysis Height: %d (0 = auto)\n", *analysisHeight)
 	fmt.Printf("Zoom Margin: %.2f / Max Zoom: %.2f (0 = auto)\n", *zoomMargin, *maxZoom)
 	fmt.Printf("Auto Orient: %t\n", *autoOrient)
+	fmt.Printf("Fit Mode (bars, no cropping): %t\n", *fitBars)
 	fmt.Printf("Temp Dir: %s\n", *tempDir)
 	fmt.Printf("FFmpeg Path: %s\n", orDefault(*ffmpegPath, "ffmpeg (PATH)"))
 
@@ -114,7 +116,7 @@ func main() {
 		wg.Add(1)
 		go func(file string) {
 			defer wg.Done()
-			cropFile(file, *width, *height, *fps, *analysisHeight, *zoomMargin, *maxZoom, *autoOrient, *outputDir, *tempDir, *ffmpegPath)
+			cropFile(file, *width, *height, *fps, *analysisHeight, *zoomMargin, *maxZoom, *autoOrient, *fitBars, *outputDir, *tempDir, *ffmpegPath)
 			fmt.Printf("Processing complete for %s\n", file)
 		}(inputFile)
 	}
@@ -126,10 +128,11 @@ func main() {
 }
 
 // cropFile runs the full API chain for one input video: Analyze (prepare +
-// detect, cached), NewPlan (in-process framing replay), RenderFinal (crop
-// sequence + audio mux at output resolution).
+// detect, cached), NewPlan (in-process framing replay) or NewFitPlan (fit
+// mode, bars for non-hologram videos), RenderFinal (frame sequence + audio
+// mux at output resolution).
 func cropFile(file string, width, height int, fps float64, analysisHeight int,
-	zoomMargin, maxZoom float64, autoOrient bool, outputDir, tempDir, ffmpegPath string) {
+	zoomMargin, maxZoom float64, autoOrient, fitBars bool, outputDir, tempDir, ffmpegPath string) {
 
 	// Legacy input checks with the legacy messages, so scripted invocations
 	// keep the same failure surface.
@@ -167,7 +170,11 @@ func cropFile(file string, width, height int, fps float64, analysisHeight int,
 		},
 	}
 
-	fmt.Printf("Starting crop processing for %s\n", file)
+	if fitBars {
+		fmt.Printf("Starting fit (bars) processing for %s\n", file)
+	} else {
+		fmt.Printf("Starting crop processing for %s\n", file)
+	}
 
 	analyzeTask, err := holocropper.Analyze(context.Background(), holocropper.AnalyzeRequest{
 		Input:          file,
@@ -191,18 +198,24 @@ func cropFile(file string, width, height int, fps float64, analysisHeight int,
 	// stream already holds every frame's subject aspect ratio - strictly
 	// more evidence than the old probe sampled). 1:1 outputs bypass it.
 	settings := holocropper.Settings{
-		Width:      width,
-		Height:     height,
-		FPS:        fps,
-		ZoomMargin: zoomMargin,
-		MaxZoom:    maxZoom,
-		AutoOrient: autoOrient,
+		Width:       width,
+		Height:      height,
+		FPS:         fps,
+		ZoomMargin:  zoomMargin,
+		MaxZoom:     maxZoom,
+		AutoOrient:  autoOrient,
+		FitWithBars: fitBars,
 	}
 	if autoOrient && width == height {
 		fmt.Printf("Auto-orient: 1:1 output for %s - orientation probe bypassed\n", file)
 	}
 
-	plan, err := holocropper.NewPlan(analysis.Stream(), settings)
+	var plan *holocropper.Plan
+	if fitBars {
+		plan, err = holocropper.NewFitPlan(analysis.Stream(), settings)
+	} else {
+		plan, err = holocropper.NewPlan(analysis.Stream(), settings)
+	}
 	if err != nil {
 		log.Printf("Error during cropping for file %s: %v", file, err)
 		return
@@ -215,9 +228,17 @@ func cropFile(file string, width, height int, fps float64, analysisHeight int,
 		if st.Flip {
 			decision = fmt.Sprintf("FLIPPING to %dx%d", r.OutputW, r.OutputH)
 		}
-		fmt.Printf("Auto-orient %s: subjects in %d/%d sampled frames, master bbox AR mean %.2f (geo %.2f, median %.2f); coverage %.3f at %dx%d vs %.3f at %dx%d -> %s\n",
-			file, st.FramesWithSubjects, st.FramesExamined, st.MeanAR, st.GeoMeanAR, st.MedianAR,
-			st.KeepScore, width, height, st.FlipScore, height, width, decision)
+		if fitBars {
+			// Fit mode: geometry-only decision - bar coverage of the
+			// source aspect at each orientation (1.000 = no bars at all).
+			fmt.Printf("Auto-orient (fit) %s: source %dx%d; bar coverage %.3f at %dx%d vs %.3f at %dx%d -> %s\n",
+				file, r.SourceW, r.SourceH,
+				st.KeepScore, width, height, st.FlipScore, height, width, decision)
+		} else {
+			fmt.Printf("Auto-orient %s: subjects in %d/%d sampled frames, master bbox AR mean %.2f (geo %.2f, median %.2f); coverage %.3f at %dx%d vs %.3f at %dx%d -> %s\n",
+				file, st.FramesWithSubjects, st.FramesExamined, st.MeanAR, st.GeoMeanAR, st.MedianAR,
+				st.KeepScore, width, height, st.FlipScore, height, width, decision)
+		}
 	}
 
 	// Legacy output naming: <basename>.mp4 in the output dir, overwritten on

@@ -40,6 +40,16 @@ type Settings struct {
 	ZoomMargin     float64 `json:"zoom_margin"`     // 0 = 1.12
 	MaxZoom        float64 `json:"max_zoom"`        // 0 = 2.0
 	AutoOrient     bool    `json:"auto_orient"`     // pick WxH vs HxW from subject AR
+	// FitWithBars selects the fit mode for non-hologram videos: the WHOLE
+	// source frame is scaled to fit inside the output resolution, centered,
+	// with the remainder filled with black bars - no content-aware crop, no
+	// zoom, no subject-driven framing. Detection still runs (records and
+	// overlays stay populated) but the framing controller never touches the
+	// image. With AutoOrient, the keep/flip decision compares the output
+	// aspect against the source aspect and picks whichever gets the least
+	// bars (pure geometry - it works on subjectless clips too). NewFitPlan
+	// is the explicit entry point; see HOLOCROPPER-API-PLAN.md §6.10.
+	FitWithBars bool `json:"fit_with_bars"`
 }
 
 // ValidationError names the offending field so a settings form can highlight
@@ -132,7 +142,8 @@ func Schema() []ParamSpec {
 		{Name: "analysis_height", Type: "integer", Default: defaultAnalysisHeight, Min: 16, Help: "Internal analysis frame height (0 = default 480); renders require it >= output height. Larger than the source height costs detection time for no framing gain"},
 		{Name: "zoom_margin", Type: "float", Default: defaultZoomMargin, Min: 1.0, Max: 10.0, Help: "Subject bbox to crop padding factor (0 = default); landscape and portrait fits enforce a 1.18 floor"},
 		{Name: "max_zoom", Type: "float", Default: defaultMaxZoom, Min: 1.0, Max: 8.0, Help: "Maximum zoom-in factor (0 = default); never upscales past source resolution regardless"},
-		{Name: "auto_orient", Type: "bool", Default: false, Help: "Pick WxH or HxW from the subjects' aspect ratios; skipped for 1:1 outputs"},
+		{Name: "auto_orient", Type: "bool", Default: false, Help: "Pick WxH or HxW from the subjects' aspect ratios; skipped for 1:1 outputs. In fit mode it instead picks the orientation with the least bars (pure output-vs-source geometry)"},
+		{Name: "fit_with_bars", Type: "bool", Default: false, Help: "Fit mode (non-hologram videos): scale the whole frame to fit the output, centered on black bars; no content-aware crop or zoom"},
 	}
 }
 

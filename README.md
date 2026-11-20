@@ -11,7 +11,7 @@ TinyMikuServer is a specialized video streaming server designed to serve content
 - **Custom MikV Format**: A lightweight binary format optimized for storing synchronized video and audio frames with DEFLATE compression
 - **Streaming Server**: HTTP-based server for real-time streaming of MikV content
 - **Video Converter**: Tool to convert MP4 files to the MikV format
-- **HoloCropper**: Content-aware video cropping tool for preparing hologram-style videos at any output aspect ratio (1:1, portrait, landscape), with auto-orient and walk mode
+- **HoloCropper**: Content-aware video cropping tool for preparing hologram-style videos at any output aspect ratio (1:1, portrait, landscape), with auto-orient and walk mode - plus a **fit mode** (`-fit`) for non-hologram videos: whole-frame scale-to-fit with black bars
 - **Optimized for Edge Devices**: Designed for efficient streaming to embedded systems and IoT devices
 
 ## Project Structure
@@ -123,12 +123,13 @@ Options:
 
 ### 3. Cropping Videos with HoloCropper
 
-HoloCropper performs content-aware cropping suitable for holographic displays. Any output aspect ratio works - 1:1, tall portrait `200x648`, wide landscape `648x200` - framing is aspect-locked to the requested output:
+HoloCropper performs content-aware cropping suitable for holographic displays. Any output aspect ratio works - 1:1, tall portrait `200x648`, wide landscape `648x200` - framing is aspect-locked to the requested output. For **non-hologram videos** (normal full-frame 4:3/16:9 sources like MVs) the `-fit` flag replaces the content-aware crop with a whole-frame scale-to-fit on black bars:
 
 ```bash
 ./bin/holocropper -i input.mp4 -o ./output -w 240 -h 240 -fps 20    # 1:1
 ./bin/holocropper -i input.mp4 -o ./output -w 200 -h 648 -fps 24    # portrait
 ./bin/holocropper -i input.mp4 -o ./output -w 648 -h 200 -fps 24 -auto-orient
+./bin/holocropper -i mv.mp4 -o ./output -w 240 -h 240 -fps 24 -fit  # non-hologram: fit + bars
 ```
 
 Options:
@@ -140,7 +141,8 @@ Options:
 - `-analysis-height`: Internal analysis frame height (0 = default 480, never below `-h`)
 - `-zoom-margin`: Subject bbox padding factor (0 = default 1.12; landscape and portrait fits enforce a 1.18 padding floor)
 - `-max-zoom`: Maximum zoom-in factor (0 = default 2.0)
-- `-auto-orient`: Pick portrait (`HxW`) or landscape (`WxH`) output orientation from the subjects' aspect ratios; skipped for 1:1 outputs
+- `-auto-orient`: Pick portrait (`HxW`) or landscape (`WxH`) output orientation from the subjects' aspect ratios; skipped for 1:1 outputs. With `-fit` it instead picks the orientation with the least bars
+- `-fit`: **Fit mode** for non-hologram videos: scale the whole frame to fit the output resolution, centered on black bars - no content-aware crop, no zoom
 - `-temp-dir`: Scratch + analysis-cache parent (default: the system temp dir). Cached analyses make repeated renders of an unchanged video skip the detect pass entirely
 - `-ffmpeg-path`: Path to the ffmpeg binary (default: `ffmpeg` from `PATH`)
 
@@ -156,6 +158,15 @@ Give any output resolution - e.g. `-w 648 -h 200` - and let the cropper pick the
 - The video is never rotated or flipped: only the crop orientation transposes, and the source always stays upright.
 - `1:1` outputs bypass the decision completely (there is no portrait/landscape choice to make).
 - The flag is opt-in. Without it `-w`/`-h` are used exactly as requested, so you can still render a portrait and a landscape version of the same video by hand. A subjectless video keeps the requested orientation.
+
+#### Fit mode (`-fit`)
+
+Not every job is a hologram crop. A normal music video or full-frame clip should keep its whole picture - it just needs to land in a different shape (16:9 source, square social output). `-fit` is that mode: the **whole frame is scaled aspect-preserving to fit inside the output resolution and centered, the rest filled with black bars** (letterbox/pillarbox). No subject detection drives the framing, nothing is cropped, nothing is zoomed.
+
+- Detection still runs underneath: records, overlays, stills and metrics stay populated, and subject boxes map through the fit transform, so an overlay preview draws them at the right spot *inside* the bars.
+- `-auto-orient` with `-fit` becomes pure geometry: the orientation whose aspect is closer to the source's gets fewer bars, and the CLI prints both bar coverages. Unlike crop-mode auto-orient, it decides the same way on videos with no detectable subjects.
+- Matching aspects (e.g. 16:9 source to a 16:9-shaped target) produce an exact resize with no bars at all.
+- The API entry points are `holocropper.NewFitPlan(...)` or `Settings{FitWithBars: true}`; previews and renders treat fit and crop plans as different products (their `SettingsHash` values never match). See [HOLOCROPPER-API-PLAN.md](HOLOCROPPER-API-PLAN.md) §6.10.
 
 #### Walk mode (landscape to landscape)
 
@@ -339,6 +350,13 @@ plan, err := holocropper.NewPlan(analysis.Stream(), holocropper.Settings{
 	Width: 648, Height: 200, FPS: 24, AutoOrient: true,
 })
 flip := plan.Orientation().Flip // chosen orientation + AR aggregates
+
+// Fit mode (non-hologram videos, §6.10): the WHOLE frame scales into the
+// output on black bars - no crop, no zoom. Previews and the final render
+// below work on a fit Plan exactly as they do on a crop Plan.
+fitPlan, err := holocropper.NewFitPlan(analysis.Stream(), holocropper.Settings{
+	Width: 240, Height: 240, FPS: 24, FitWithBars: true, AutoOrient: true,
+})
 
 // Preview (versioned, output resolution) and the final render. Both are
 // Tasks: Wait blocks, Observer/TaskInfo drive the spinner.

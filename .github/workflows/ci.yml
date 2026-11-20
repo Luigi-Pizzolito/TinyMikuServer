@@ -111,6 +111,24 @@ jobs:
           ffprobe -hide_banner -v error -select_streams v:0 \
             -show_entries stream=width,height -of csv=p=0 /tmp/ci-cli/out/dance.mp4 | grep -qx 420,240
 
+      - name: CLI fit mode (-fit) renders the fixture on bars
+        run: |
+          set -euo pipefail
+          # Fit mode (§6.10): whole frame scaled to fit, black bars, no crop.
+          # The analysis cache from the previous step is reused (same input).
+          "$RUNNER_TEMP/holocropper" -i /tmp/ci-cli/in -o /tmp/ci-cli/out \
+            -temp-dir /tmp/ci-cli/tmp -w 240 -h 240 -fps 20 -fit
+          test -f /tmp/ci-cli/out/dance.mp4 || { echo "fit render lost the legacy name"; exit 1; }
+          ffprobe -hide_banner -v error -select_streams v:0 \
+            -show_entries stream=width,height -of csv=p=0 /tmp/ci-cli/out/dance.mp4 | grep -qx 240,240
+          # Fit auto-orient is pure geometry: a portrait fit request on a 16:9
+          # clip must flip to the least-bars orientation (420x240).
+          "$RUNNER_TEMP/holocropper" -i /tmp/ci-cli/in -o /tmp/ci-cli/out \
+            -temp-dir /tmp/ci-cli/tmp -w 240 -h 420 -fps 20 -fit -auto-orient 2>&1 | tee fit-orient.log
+          grep -q "FLIPPING to 420x240" fit-orient.log
+          ffprobe -hide_banner -v error -select_streams v:0 \
+            -show_entries stream=width,height -of csv=p=0 /tmp/ci-cli/out/dance.mp4 | grep -qx 420,240
+
   rest-of-repo:
     name: server + mikv (build, vet)
     runs-on: ubuntu-latest
