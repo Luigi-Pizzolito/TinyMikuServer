@@ -362,7 +362,7 @@ Analysis.Status() ► startup/reload reconciliation: restores every spinner with
 Cancel on any Task ► spinner clears, scratch cleaned, cancelled state surfaces
 ```
 
-`examples/wails-bindings/` implements exactly this flow as the acceptance reference for the data plane.
+`examples/wails-bindings/` implements exactly this flow as the acceptance reference for the data plane — built per the §9.2 brief, not inside this repo's milestones.
 
 ### 9.1 UI implementation suggestions (app side — the Wails frontend)
 
@@ -403,6 +403,46 @@ Everything the UI renders comes from those five fields — the API was shaped so
 
 **Keyboard/quality-of-life:** space = play/pause player, `[`/`]` = step frame (`Record(i)` popover follows), `r` = re-plan+preview shortcut. Keep all Plan-driven views (canvas, timeline, metrics) subscribed to the *current Plan object* — swapping the Plan pointer is the single re-render trigger for the whole tuning UI.
 
+### 9.2 C1 implementation brief (the Wails reference app — written for the app agent)
+
+C1 is delivered as this brief, not as code in this repository. The app is built by a separate agent/checkout; `pkg/holocropper` is consumed as-is and **must not be edited** to make the app work — if the surface seems to be missing something, report it instead of patching the library. §9.1 is the UI design guidance; this section is the concrete build order and contract.
+
+**Deliverable:** `examples/wails-bindings/` — a Wails v2 desktop app (Go backend + a JS frontend; pick vanilla JS or Svelte and stay with it) implementing the §9 flow end to end against the shipped surface. It is the acceptance reference for the data plane: if the app can drive the flow with pure `TaskInfo`/`Status`/`OnTask` wiring, the API is done.
+
+**Module wiring:** its own `go.mod` (Go `go 1.24.1` line like the other modules) with
+`require github.com/Luigi-Pizzolito/TinyMikuServer/pkg/holocropper` and
+`replace github.com/Luigi-Pizzolito/TinyMikuServer/pkg/holocropper => ../../pkg/holocropper`
+(holocropper's own go.mod already replaces `pkg/mikvformat` relative to itself — keep that shape, don't re-declare it). Never import the root module. ffmpeg is a runtime dependency: surface `FFmpegPath` in app settings.
+
+**The Go side is a thin binding layer — an `App` struct that owns exactly one `TempDir` (app data dir) and forwards to the library. Bindings to expose (names/signatures are the shipped ones):**
+
+| Binding | Call | Notes |
+|---|---|---|
+| `Inputs(dir)` | `holocropper.ListInputs(dir)` | input picker. `PosterFrame` (§6.2) is **not shipped**: draw thumbnails client-side, e.g. a `<video preload="metadata">` element per `InputInfo.Path` |
+| `SettingsSchema()` | `holocropper.Schema()` | build the form from `ParamSpec`s |
+| `ValidateSettings(s)` | `holocropper.Settings.Validate()` | per-field inline errors, all at once |
+| `StartAnalyze(input)` | `holocropper.Analyze(ctx, AnalyzeRequest{Input, TempDir, Observer})` | the analyze slot: calling it again supersedes the old task — just call |
+| `PlanNow(streamToken, s)` | `AnalysisTask.Plan(s)` while running, `NewPlan(analysis.Stream(), s)` after | the ~10 ms re-plan path; `AnalysisTask.Plan` works over the partial stream |
+| `RenderPreview(planID, s)` | `analysis.RenderPreview(ctx, plan, PreviewRequest{Options:{Kind}})` | fire-and-supersede; never check "is a render running" |
+| `RenderFinal(planID, s)` | `analysis.RenderFinal(ctx, plan, RenderRequest{OutputDir, TempDir})` | explicit button only |
+| `Previews()` | `analysis.Previews()` | `[]PreviewRef` with version + `SettingsHash` match test |
+| `CancelTask(id)` / `StatusNow()` | the Task's `Cancel()` / `analysis.Status()` | `StatusNow()` once at startup/hot-reload to restore spinners |
+| `ContactSheet(maxWidth)` | `plan.ContactSheet(...)` | timeline thumbnails |
+
+**Event contract (the whole live-data plane is three emissions):** build the `Observer` once in `NewApp` and emit through Wails events — `OnTask` → `events:Emit("task", TaskInfo)` (drives *all* spinners/progress bars, keyed by `TaskInfo.ID` + `Kind`), `OnFrames` → `"frames"` batched `FrameRecord`s (drives overlays during detect), `OnWarning` → `"warning"` toast. `SupersededError.NewTaskID` tells the frontend to move the spinner to the new ID — never show supersede as an error. Task waits run in goroutines; bind `Wait()` results to `"task_complete"`/`"task_error"` events rather than blocking the binding call.
+
+**Build order (each step is shippable and testable on its own):**
+
+1. **Form + picker:** `Schema()` form with live `Validate()` errors; `ListInputs` grid with posters. No processing yet.
+2. **Analyze:** start button → spinners purely from `task` events (prepare → detect phases, `Done/Total` bars); canvas overlays begin immediately from `frames` events + `AnalysisTask.Plan` replays.
+3. **Tuning loop:** slider `input` → `PlanNow` → redraw overlays/metrics (`plan.Metrics()`, `plan.Walk()`, `plan.DropoutFrames()`, `plan.Orientation()` score bars). Debounce ~400 ms → `Previews()` `SettingsHash` check → `RenderPreview` if stale. Players **preload-then-swap** to the new `-vN` file (§9.1) via a custom `app://` asset handler rooted *only* at `Previews()`/`Result.OutputPath` paths.
+4. **Final render:** button → `RenderFinal`, progress bar, `Result.OutputPath` appended to a renders list (dimension-tagged names, so different targets coexist).
+5. **Cancel + reconciliation:** per-zone cancel buttons → `CancelTask`; on app start `StatusNow()` restores every spinner. `cancelled`/`superseded` render as quiet states, not errors. `ErrStreamIncompatible` → "re-analyze with analysis height ≥ H" action.
+
+**Acceptance (= the C1 row, checkable in the app):** setting changes visibly move overlays/metrics within a frame of the slider; preview players swap to new version files without blanking; every spinner/progress bar is driven purely by `task` events + `StatusNow()` (no client-side state guessing); cancelling detect, a preview, or the final render each leaves the app usable, scratch cleaned, and no zombie ffmpeg; re-opening the app mid-run restores correct spinners from `Status()` alone.
+
+**Non-goals (restating §10 deferred):** no HTTP server (Wails' own asset handler suffices), no uploads, no job history/persistence, no mikv streaming integration, no supersampling above source height.
+
 ## 10. Epics, milestones, stories
 
 Estimates: story points (1,2,3,5,8). No implementation before approval.
@@ -431,8 +471,8 @@ Estimates: story points (1,2,3,5,8). No implementation before approval.
 
 | ID | Story | Est | Depends on | Acceptance criteria |
 |---|---|---|---|---|
-| C1 | `examples/wails-bindings/` reference app implementing the §9 flow end to end (live detect progress, instant re-plan on slider changes, output-res preview player swaps with spinner overlays, final render, cancel) | 8 | A1–A6, B1–B4 | interactive setting changes visibly update overlays/metrics immediately; preview players swap to new version files; spinners driven purely by `TaskInfo`/`Status`/`OnTask` |
-| C2 | CI test suite: golden pipeline test on a tiny fixture video (no corpus), replay equivalence, Task cancel cases, benchmark gate | 5 | C1 | suite green without corpus videos; benchmark gate enforced |
+| C1 | `examples/wails-bindings/` reference app implementing the §9 flow end to end (live detect progress, instant re-plan on slider changes, output-res preview player swaps with spinner overlays, final render, cancel) — **delivered as the §9.2 implementation brief; the app itself is built by an external agent, not in this repo** | 8 | A1–A6, B1–B4 | interactive setting changes visibly update overlays/metrics immediately; preview players swap to new version files; spinners driven purely by `TaskInfo`/`Status`/`OnTask` |
+| C2 | CI test suite: golden pipeline test on a tiny fixture video (no corpus), replay equivalence, Task cancel cases, benchmark gate — **delivered: `.github/workflows/ci.yml`** | 5 | C3 (built without C1) | suite green without corpus videos; benchmark gate enforced |
 | C3 | Port `cmd/holocropper` CLI onto the new surface (`Analyze → Plan → RenderFinal`), delete the fused one-shot path; env-var CSV kept as internal debug shim inside the detect pass | 3 | B2 | CLI corpus renders match current framing decision streams |
 
 ### Deferred (explicitly out of scope)
@@ -486,6 +526,7 @@ What changed while building it, and why. Everything here is the shipped shape; t
 - **C3: `HOLOCROPPER_DEBUG_BOXES` rides the replay.** `NewPlan` re-emits the framing CSV the corpus tooling reads — same 16 columns, one line per frame, values straight from the records it returns — so the debug hook survived the pipeline's removal. `TestPlanDebugCSVMatchesRecords` pins the shim against the records; the parity test double-checks shim vs golden.
 - **C3: the fused pipeline is deleted** (`pipeline.go`, `preprocess.go`, the six `STEP` stage goroutines, `Crop`/`Progress`/`Done`/`Cancel`, the mask structs, the CLI-path temp dirs and its own `ffmpeg` invocations, and the auto-orient probe decode with its private copy of the detection stages). `HoloCropper` survives as the framing-parameters holder (`Height`, `ZoomMargin`, `MaxZoom`, `srcH` → `framingParams()`); its geometry/PID wrapper methods are gone and the framing tests call the instance-free `*Calc` functions, so the corpus-calibrated behaviour is now pinned directly on the functions the API actually runs. The probe's degenerate-mask guard moved to the AR level (`degenerateMasterBBox` in the orientation aggregates): a frame whose thresholding collapses to a full-frame box still cannot skew the flip decision. `cmd/holocropper` is a thin front end over `Analyze → NewPlan → RenderFinal` with the same flags, messages, per-file goroutines, Ctrl-C-cancels-everything, progress bar and output naming, plus `-temp-dir` and `-ffmpeg-path`.
 - **C3: parity is golden-based, not live-fused.** The fused CSV was generated from the fused path itself and committed as `pkg/holocropper/testdata/holocropper-parity-fixture-240.csv`; `TestReplayParityVsDebugCSV` now checks three layers against it — `Analyze`'s per-frame subject boxes and subject counts, the Plan replay's crop/target/walk/EMA numbers (worst crop drift 0.005 px over 96 frames = the CSV's own 2-decimal rounding), and the shim CSV the replay writes. `HOLOCROPPER_REGENERATE_GOLDEN=1` rebuilds the golden from the API chain when an ffmpeg upgrade shifts decode drift. Independent end-to-end check: running the shipped CLI over the same fixture at the golden's fps writes a decision stream **byte-identical** to the golden.
+- **C2: CI suite without the corpus** (`.github/workflows/ci.yml`, two jobs). `holocropper`: ubuntu-latest + apt ffmpeg, `go-version-file` from the module's go.mod, gofmt gate, `go vet ./...`, CLI build, `go test -count=1 -race -timeout 600s ./...` — the whole suite runs on lavfi-synthesized fixtures and the committed golden CSV (the corpus lives in untracked `assets/`/`test/`, so a CI checkout has no video to read by construction) — plus a **CLI backwards-compatibility smoke**: fixture rendered with legacy flags, exactly one output named `<basename>.mp4`, ffprobe-dims checked at 240x240, re-render at 420x240 still exactly one legacy-named file. `rest-of-repo`: build + vet of the root module and `pkg/mikvformat`/`pkg/mikvserver`. The benchmark gate (A5) and the cancel/Task cases ride the `-race` run. **`requireFFmpeg` got a strict gate:** with `HOLOCROPPER_REQUIRE_FFMPEG` set (what CI exports) a missing ffmpeg *fails* the run instead of skipping — the suite can never go green by silently skipping every fixture test. Verified both ways locally: ffmpeg absent + gate set → `FAIL` with the gate message; gate unset → skip as before.
 
 ## 12. Remaining tunables (defaults; not blocking approval)
 
@@ -498,4 +539,4 @@ What changed while building it, and why. Everything here is the shipped shape; t
 `A1 → A2 → A3 → A4 → A5 → {A6, B1, B2} → {B3, B4} → C1 → C2 → C3`.
 A3 is the architectural keystone: everything in B and the interactive flow stands on the replay engine. First deliverable checkpoint: A5 (interactive re-planning proven on corpus streams, before any video is re-rendered).
 
-**Status 2026-11-20:** the A5 checkpoint is reached on `feat/holocropper-api` — A3 (replay engine + CLI delegation), A4 (analysis pass, cache, partial stream) and A5 (`NewPlan` with records/orientation/walk/dropouts and the < 100 ms benchmark gate) are implemented and tested, A2 shipped with them and A1 delivered as scoped in the implementation record. Milestone B is complete: B1/B2 (output-resolution previews with versioned files + supersede, final render with CLI parity), A6 (framing metrics report), B3 (snapshots + contact sheets) and B4 (unified Task/status plane with the warnings feed on every pass). **C3 is complete: the CLI runs `Analyze → NewPlan → RenderFinal`, the fused one-shot pipeline is deleted, and framing parity is held by the golden decision CSV** (see the C3 records above). Remaining: Milestone C — C1 Wails reference app, C2 CI suite without corpus.
+**Status 2026-11-20:** the A5 checkpoint is reached on `feat/holocropper-api` — A3 (replay engine + CLI delegation), A4 (analysis pass, cache, partial stream) and A5 (`NewPlan` with records/orientation/walk/dropouts and the < 100 ms benchmark gate) are implemented and tested, A2 shipped with them and A1 delivered as scoped in the implementation record. Milestone B is complete: B1/B2 (output-resolution previews with versioned files + supersede, final render with CLI parity), A6 (framing metrics report), B3 (snapshots + contact sheets) and B4 (unified Task/status plane with the warnings feed on every pass). **C3 is complete: the CLI runs `Analyze → NewPlan → RenderFinal`, the fused one-shot pipeline is deleted, and framing parity is held by the golden decision CSV** (see the C3 records above). **C2 is complete: the corpus-free CI suite ships in `.github/workflows/ci.yml`** — the full `-race` suite on lavfi fixtures + golden CSV, benchmark gate and cancel cases enforced, CLI legacy-naming smoke, and a strict `HOLOCROPPER_REQUIRE_FFMPEG` gate so fixture tests can never pass by skipping (see the C2 record). **C1 is delivered as guidelines: §9.2 is the implementable brief for the Wails reference app, which a separate agent builds outside this story.** Milestone C is closed on this repo's side.

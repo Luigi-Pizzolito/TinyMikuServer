@@ -356,9 +356,12 @@ res, err := finalTask.Wait() // <basename>-<WxH>.mp4; OutputName overrides it
 ### Running Tests
 
 ```bash
+make test                              # everything CI runs (see below)
 go test ./...                          # server + MikV packages
 cd pkg/holocropper && go test ./...    # HoloCropper is a separate Go module
 ```
+
+CI (`.github/workflows/ci.yml`) runs the holocropper suite with `-race` plus a CLI legacy-naming smoke, entirely on lavfi-synthesized fixture videos and the committed golden parity CSV - no corpus clips needed. Set `HOLOCROPPER_REQUIRE_FFMPEG=1` to make a missing ffmpeg fail the fixture tests instead of skipping them (CI sets it).
 
 ### Cleaning Build Artifacts
 
