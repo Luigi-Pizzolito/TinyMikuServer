@@ -129,6 +129,32 @@ jobs:
           ffprobe -hide_banner -v error -select_streams v:0 \
             -show_entries stream=width,height -of csv=p=0 /tmp/ci-cli/out/dance.mp4 | grep -qx 420,240
 
+      # The frame clock (§6.6): the analysis cache holds the SOURCE's frame
+      # rate, the render muxes at -fps, so a slower source must still produce a
+      # picture that measures the seconds it ran. 4 s at 12 fps, rendered at
+      # -fps 24, is 96 frames / 4 s of video - not 48 frames (2 s) under the
+      # same 4 s audio track.
+      - name: CLI renders follow the -fps frame clock
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ci-cli/in-slow /tmp/ci-cli/out-slow
+          ffmpeg -hide_banner -loglevel error -y \
+            -f lavfi -i "color=c=black:s=960x540:d=4:r=12" \
+            -f lavfi -i "color=c=white:s=120x60:d=4:r=12" \
+            -f lavfi -i "sine=frequency=440:duration=4" \
+            -filter_complex "[0:v][1:v]overlay=x='60+90*t':y=240,format=yuv420p[v]" \
+            -map "[v]" -map "2:a" -c:v libx264 -preset ultrafast -c:a aac -shortest \
+            /tmp/ci-cli/in-slow/slow.mp4
+          "$RUNNER_TEMP/holocropper" -i /tmp/ci-cli/in-slow -o /tmp/ci-cli/out-slow \
+            -temp-dir /tmp/ci-cli/tmp -w 120 -h 120 -fps 24
+          out=/tmp/ci-cli/out-slow/slow.mp4
+          test -f "$out" || { echo "frame-clock render output missing"; ls -l /tmp/ci-cli/out-slow; exit 1; }
+          ffprobe -hide_banner -v error -select_streams v:0 \
+            -show_entries stream=avg_frame_rate,nb_frames -of csv=p=0 "$out" | grep -qx '24/1,96'
+          dur=$(ffprobe -hide_banner -v error -show_entries format=duration -of csv=p=0 "$out")
+          awk -v d="$dur" 'BEGIN { exit !(d > 3.8 && d < 4.2) }' \
+            || { echo "render measures ${dur}s, want the source's 4s at 24 fps"; exit 1; }
+
       # MikV output smoke (§6.11): -mikv writes the firmware container.
       # Header layout checked raw: bytes 7-8 LE audio sample rate, byte 13
       # video encoding, byte 14 audio encoding, byte 15 reserved zero.
