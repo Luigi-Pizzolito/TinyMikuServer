@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -136,6 +137,68 @@ func planFPS(p *Plan) float64 {
 		return p.settings.FPS
 	}
 	return defaultFPS
+}
+
+// frameSchedule is the output frame list one render pass writes for a Plan.
+// The cached analysis holds the SOURCE's frame clock (prepare re-encodes with
+// -fps_mode passthrough) and the Plan replays at Settings.FPS, so a product
+// must hold seconds x renderFPS frames - not one frame per analysis frame.
+// Without this mapping a 12 fps source rendered at a 24 fps preset wrote half
+// the seconds its own audio track ran.
+type frameSchedule struct {
+	Frames int   // output frames the pass writes
+	SrcFor []int // SrcFor[i] is the analysis frame, and Plan record, output frame i replays
+
+	AnalysisFPS float64 // the clock the analysis was measured at; 0 when the cache does not say
+	RenderFPS   float64 // the clock the product muxes at
+	Resampled   bool    // the clocks differ, so analysis frames were repeated or dropped
+}
+
+// frameScheduleFor maps a Plan's records from the analysis clock to the render
+// clock: output frame i replays analysis frame floor(i x analysisFPS /
+// renderFPS). A faster render clock repeats frames, a slower one drops them,
+// and the order never changes. Nothing is blended - a repeated frame is the
+// same pixels, which is what a fixed frame budget expects. Unknown clocks (a
+// cache written before the analysis fps was recorded) keep the old
+// one-record-per-frame behaviour instead of guessing.
+func frameScheduleFor(records int, analysisFPS, renderFPS float64) frameSchedule {
+	if records <= 0 {
+		return frameSchedule{AnalysisFPS: analysisFPS, RenderFPS: renderFPS}
+	}
+	resample := analysisFPS > 0 && renderFPS > 0 && analysisFPS != renderFPS
+	frames := records
+	if resample {
+		frames = int(float64(records)*renderFPS/analysisFPS + 0.5)
+		if frames < 1 {
+			frames = 1
+		}
+	}
+	s := frameSchedule{
+		Frames:      frames,
+		SrcFor:      make([]int, frames),
+		AnalysisFPS: analysisFPS,
+		RenderFPS:   renderFPS,
+		Resampled:   resample,
+	}
+	for i := 0; i < frames; i++ {
+		j := i
+		if resample {
+			j = int(math.Floor(float64(i) * analysisFPS / renderFPS))
+			if j >= records {
+				j = records - 1
+			}
+		}
+		s.SrcFor[i] = j
+	}
+	return s
+}
+
+// frameSchedule is this Analysis's output frame list for p: the analysis
+// cache's recorded fps is the source's clock, planFPS(p) is the render clock.
+// Every output pass asks the same question - the frame loop, and the MikV
+// audio track that must have one chunk per output frame.
+func (a *Analysis) frameSchedule(p *Plan) frameSchedule {
+	return frameScheduleFor(len(p.records), a.meta.FPS, planFPS(p))
 }
 
 // ---------------------------------------------------------------------------
@@ -316,21 +379,23 @@ func previewWork(ctx context.Context, a *Analysis, task *PreviewTask, p *Plan, o
 
 // runCropLoop decodes the cached analysis video and writes the planned crops.
 // cropDir receives the plain crop sequence; overlayDir receives the same
-// frames with the framing boxes drawn.
+// frames with the framing boxes drawn. The sequences are the SCHEDULED frames:
+// file names are 1-based output frame numbers, so the image2 demuxer plays
+// them at the render clock.
 func runCropLoop(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, cropDir, overlayDir string, opts PreviewOptions, phase Phase) (int, error) {
 	r := p.resolved
 	style := defaultOverlayStyle()
-	return plannedFrames(ctx, tb, a, p, phase, func(idx int, out *image.RGBA) error {
+	return plannedFrames(ctx, tb, a, p, a.frameSchedule(p), phase, func(outIdx, srcIdx int, out *image.RGBA) error {
 		if cropDir != "" {
-			if err := writeJPEG(cropDir, idx+1, out); err != nil {
+			if err := writeJPEG(cropDir, outIdx+1, out); err != nil {
 				return err
 			}
 		}
 		if overlayDir != "" {
 			overlay := image.NewRGBA(image.Rect(0, 0, r.OutputW, r.OutputH))
 			copyRGBA(overlay, out)
-			drawOverlayBoxes(overlay, p.records[idx], opts, style)
-			if err := writeJPEG(overlayDir, idx+1, overlay); err != nil {
+			drawOverlayBoxes(overlay, p.records[srcIdx], opts, style)
+			if err := writeJPEG(overlayDir, outIdx+1, overlay); err != nil {
 				return err
 			}
 		}
@@ -342,9 +407,15 @@ func runCropLoop(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, cropDi
 // cached analysis video, applies the Plan's framing (content-aware crop or
 // fit-with-bars) and hands each finished output-resolution frame to fn in
 // order. One Plan record per decoded frame: a decode/frame-count mismatch is
-// an error, never a silent truncation. fn owns what the frame becomes -
-// a JPEG file (runCropLoop) or a MikV frame payload (RenderMikV).
-func plannedFrames(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, phase Phase, fn func(idx int, out *image.RGBA) error) (int, error) {
+// an error, never a silent truncation. The Plan's frames are played out on the
+// schedule, so an output pass writes renderFPS seconds-worth of frames even
+// when the analysis clock is different. fn owns what the frame becomes -
+// a JPEG file (runCropLoop) or a MikV frame payload (RenderMikV) - and is told
+// both the output frame it is writing and which analysis frame it replays.
+//
+// fn receives the same image for every output slot that repeats one analysis
+// frame: it must consume it (encode or copy), never keep it.
+func plannedFrames(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, sched frameSchedule, phase Phase, fn func(outIdx, srcIdx int, out *image.RGBA) error) (int, error) {
 	video, err := vidio.NewVideo(a.AnalysisVideoPath())
 	if err != nil {
 		return 0, fmt.Errorf("holocropper: open analysis video %s: %w", a.AnalysisVideoPath(), err)
@@ -360,39 +431,61 @@ func plannedFrames(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, phas
 	if err := video.SetFrameBuffer(buf.Pix); err != nil {
 		return 0, err
 	}
+	// The schedule is built from the cache metadata's fps; the file's own frame
+	// rate has to agree, or the resample would be steering by the wrong clock.
+	if vFPS := video.FPS(); sched.AnalysisFPS > 0 && vFPS > 0 && vFPS != sched.AnalysisFPS {
+		tb.warn(fmt.Sprintf("analysis video reports %g fps, its cache metadata says %g: the frame schedule follows the metadata",
+			vFPS, sched.AnalysisFPS))
+	}
+	if sched.Resampled {
+		tb.warn(fmt.Sprintf("the analysis runs at %g fps and the plan replays at %g: %d analysis frames become %d output frames",
+			sched.AnalysisFPS, sched.RenderFPS, len(p.records), sched.Frames))
+	}
 
 	r := p.resolved
-	tb.setPhase(phase, len(p.records))
-	count := 0
-	for video.Read() {
+	tb.setPhase(phase, sched.Frames)
+	out := 0
+	decoded := 0
+	for src := 0; video.Read(); src++ {
+		decoded++
 		if err := ctx.Err(); err != nil {
-			return count, err
+			return out, err
 		}
-		if count >= len(p.records) {
-			return count, fmt.Errorf("holocropper: analysis video has more frames than the plan (%d > %d)",
-				count+1, len(p.records))
+		if src >= len(p.records) {
+			return out, fmt.Errorf("holocropper: analysis video has more frames than the plan (%d > %d)",
+				src+1, len(p.records))
 		}
-		var out *image.RGBA
+		// A frame the schedule never plays is still decoded - the decode count
+		// is what proves the cache is the one the Plan was built from.
+		if out >= sched.Frames || sched.SrcFor[out] != src {
+			continue
+		}
+		var frame *image.RGBA
 		if p.settings.FitWithBars {
 			// Fit mode (§6.10): no crop - the whole analysis frame is
 			// scaled aspect-preserving into the output on black bars.
-			out = fitResizeTo(buf, r.OutputW, r.OutputH)
+			frame = fitResizeTo(buf, r.OutputW, r.OutputH)
 		} else {
-			cropped := cropToBBoxCalc(buf, p.cropRectAt(count))
-			out = fillResizeTo(cropped, r.OutputW, r.OutputH)
+			cropped := cropToBBoxCalc(buf, p.cropRectAt(src))
+			frame = fillResizeTo(cropped, r.OutputW, r.OutputH)
 		}
-
-		if err := fn(count, out); err != nil {
-			return count, err
+		for out < sched.Frames && sched.SrcFor[out] == src {
+			if err := fn(out, src, frame); err != nil {
+				return out, err
+			}
+			out++
+			tb.setDone(out)
 		}
-		count++
-		tb.setDone(count)
 	}
-	if count != len(p.records) {
-		return count, fmt.Errorf("holocropper: analysis video decoded %d frames, plan has %d - cache is stale",
-			count, len(p.records))
+	if decoded != len(p.records) {
+		return out, fmt.Errorf("holocropper: analysis video decoded %d frames, plan has %d - cache is stale",
+			decoded, len(p.records))
 	}
-	return count, nil
+	if out != sched.Frames {
+		return out, fmt.Errorf("holocropper: the frame schedule wanted %d output frames, the pass wrote %d",
+			sched.Frames, out)
+	}
+	return out, nil
 }
 
 // writeJPEG writes frame N (1-based, the name the ffmpeg image2 demuxer

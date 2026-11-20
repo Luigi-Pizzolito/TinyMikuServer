@@ -352,10 +352,17 @@ func renderMikVWork(ctx context.Context, a *Analysis, task *MikVTask, p *Plan, r
 		mikv.OpusBitrateKbps = req.Options.OpusBitrateKbps
 	}
 
+	// The frame schedule decides how many frames this container holds - and
+	// therefore how many audio chunks the track must be cut into. Both the
+	// frame loop and the audio track read the same schedule, so AddFrame never
+	// runs out of chunks.
+	sched := a.frameSchedule(p)
+	warnAudioCutToPicture(tb, a, sched, fps)
+
 	// 1. The audio track first: the frame loop feeds it straight into
 	// AddFrame, and an encode failure should fail the pass before any
 	// crop work is spent.
-	chunks, err := mikVAudioTrack(ctx, tb, req.FFmpegPath, a.meta.Input, mikv, len(p.records), task.scratch)
+	chunks, err := mikVAudioTrack(ctx, tb, req.FFmpegPath, a.meta.Input, mikv, sched.Frames, task.scratch)
 	if err != nil {
 		return nil, err
 	}
@@ -365,18 +372,18 @@ func renderMikVWork(ctx context.Context, a *Analysis, task *MikVTask, p *Plan, r
 	if jpegQuality == 0 {
 		jpegQuality = mikvformat.DefaultJPEGQuality
 	}
-	frames, err := plannedFrames(ctx, tb, a, p, PhaseMikVFrames, func(idx int, out *image.RGBA) error {
+	frames, err := plannedFrames(ctx, tb, a, p, sched, PhaseMikVFrames, func(outIdx, srcIdx int, out *image.RGBA) error {
 		var payload []byte
 		if req.Options.VideoJPEG {
 			var buf jpegBuffer
 			if err := jpeg.Encode(&buf, out, &jpeg.Options{Quality: jpegQuality}); err != nil {
-				return fmt.Errorf("holocropper: mikv jpeg frame %d: %w", idx+1, err)
+				return fmt.Errorf("holocropper: mikv jpeg frame %d: %w", outIdx+1, err)
 			}
 			payload = buf.data
 		} else {
 			payload = rgb565LE(out)
 		}
-		return mikv.AddFrame(payload, chunks[idx])
+		return mikv.AddFrame(payload, chunks[outIdx])
 	})
 	if err != nil {
 		return nil, err
@@ -465,6 +472,23 @@ func rgb565LE(img *image.RGBA) []byte {
 	return out
 }
 
+// warnAudioCutToPicture states the container's own budget out loud: a MikV's
+// audio is as long as its frames, so a source whose track runs past the last
+// frame window loses that tail. The analysis cache carries the source's frame
+// clock, which is where the comparison comes from.
+func warnAudioCutToPicture(tb *taskBase, a *Analysis, sched frameSchedule, fps int) {
+	if a.meta.FPS <= 0 || a.meta.Frames <= 0 || fps <= 0 {
+		return
+	}
+	source := float64(a.meta.Frames) / a.meta.FPS
+	picture := float64(sched.Frames) / float64(fps)
+	if source <= picture+0.05 {
+		return
+	}
+	tb.warn(fmt.Sprintf("the source runs %.2fs and the picture holds %.2fs at %d fps: the MikV's audio is cut to its frames",
+		source, picture, fps))
+}
+
 // mikVAudioTrack produces exactly len(frames) audio chunks for mikv's
 // declared encoding:
 //
@@ -473,7 +497,8 @@ func rgb565LE(img *image.RGBA) []byte {
 //     budget); a short tail zero-pads exactly like the original converter.
 //   - EncodingOGGOpus: the whole track encoded as ONE ordinary OGG-Opus
 //     stream at the packet duration the fps selects, then cut at page
-//     boundaries by mikvformat.SplitOGGOpus.
+//     boundaries by mikvformat.SplitOGGOpus - which drops whatever completes
+//     past the last frame window, the same budget the PCM chunks cut to.
 //
 // A source without an audio track renders the PCM path as silence (with a
 // warning, like the converter's); OGG-Opus has nothing to encode and fails

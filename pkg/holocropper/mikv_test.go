@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -119,8 +120,23 @@ func TestMikVRenderLegacyDefaultOutput(t *testing.T) {
 
 	res := runMikVRender(t, a, p, ffmpeg, tempDir, MikVRequest{OutputDir: outDir})
 
-	if res.Frames != fixtureSeconds*fixtureFPS {
-		t.Fatalf("frames = %d, want %d", res.Frames, fixtureSeconds*fixtureFPS)
+	// The picture follows the Plan's clock, not the analysis clock: 4 s at the
+	// plan's 20 fps is 80 frames, resampled (nearest-frame, dropping every
+	// sixth) from the 96 frames the fixture's 24 fps analysis clock holds.
+	if res.Frames != fixtureSeconds*20 {
+		t.Fatalf("frames = %d, want %d: 4 s at the plan's 20 fps", res.Frames, fixtureSeconds*20)
+	}
+	warned := ""
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "become") {
+			warned = w
+		}
+	}
+	if warned == "" {
+		t.Errorf("the pass resampled %d analysis frames to %d output frames without saying so in Warnings",
+			fixtureSeconds*fixtureFPS, res.Frames)
+	} else {
+		t.Logf("frame clock: %s", warned)
 	}
 	want := filepath.Join(outDir, "fixture-40x40.mikv")
 	if res.OutputPath != want {
@@ -169,20 +185,24 @@ func TestMikVRenderLegacyDefaultOutput(t *testing.T) {
 	}
 	// The leashed crop walks across the whole master path before the
 	// subject box dominates the frame, so the bright-box frames are a
-	// healthy majority rather than "every frame".
-	if litFrames < 50 {
+	// healthy majority rather than "every frame" - a majority of the frames
+	// the render clock actually wrote.
+	if litFrames*2 <= len(mikv.Frames) {
 		t.Fatalf("only %d/%d frames contain the white subject box", litFrames, len(mikv.Frames))
 	}
 
-	// The 4 s track covers 80 frames; the rest is the documented silence tail.
+	// The legacy PCM budget is sampleRate/fps samples per frame, and the
+	// picture now measures exactly the 4 s the track holds: 80 frames x 800
+	// samples = 64000 samples. The silent tail the old frame-clock mismatch
+	// produced (96 frames at 20 fps against a 4 s track) is gone.
 	silent := 0
 	for _, f := range mikv.Frames {
 		if bytes.Trim(f.Audio, "\x00") == nil {
 			silent++
 		}
 	}
-	if silent < 10 {
-		t.Fatalf("expected a silent tail after the 4 s track, only %d silent chunks", silent)
+	if silent > 1 {
+		t.Fatalf("%d audio chunks are silent: a 4 s picture at 20 fps wants the whole 4 s track under it", silent)
 	}
 }
 

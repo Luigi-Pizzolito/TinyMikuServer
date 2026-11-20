@@ -53,11 +53,20 @@ func requireFFmpeg(t *testing.T) string {
 // 120x60 box overlaid on a linear rightward path, plus a sine audio track.
 func buildFixture(t *testing.T, ffmpegPath, dir string) string {
 	t.Helper()
+	return buildFixtureAt(t, ffmpegPath, dir, fixtureFPS)
+}
+
+// buildFixtureAt renders the same clip at a chosen SOURCE frame rate: the
+// clock a render pass has to resample from when the Plan replays the framing
+// at a different fps (renders.go frameSchedule).
+func buildFixtureAt(t *testing.T, ffmpegPath, dir string, srcFPS float64) string {
+	t.Helper()
 	out := filepath.Join(dir, "fixture.mp4")
+	rate := strconv.FormatFloat(srcFPS, 'f', -1, 64)
 	args := []string{
 		"-hide_banner", "-loglevel", "error", "-y",
-		"-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=%dx%d:d=%d:r=%d", fixtureW, fixtureH, fixtureSeconds, fixtureFPS),
-		"-f", "lavfi", "-i", fmt.Sprintf("color=c=white:s=120x60:d=%d:r=%d", fixtureSeconds, fixtureFPS),
+		"-f", "lavfi", "-i", fmt.Sprintf("color=c=black:s=%dx%d:d=%d:r=%s", fixtureW, fixtureH, fixtureSeconds, rate),
+		"-f", "lavfi", "-i", fmt.Sprintf("color=c=white:s=120x60:d=%d:r=%s", fixtureSeconds, rate),
 		"-f", "lavfi", "-i", fmt.Sprintf("sine=frequency=440:duration=%d", fixtureSeconds),
 		"-filter_complex", "[0:v][1:v]overlay=x='60+90*t':y=240,format=yuv420p[v]",
 		"-map", "[v]", "-map", "2:a",
