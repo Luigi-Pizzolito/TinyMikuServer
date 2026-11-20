@@ -70,23 +70,25 @@ func TestTaskWarningsSnapshot(t *testing.T) {
 	}
 }
 
-// The -vsync option was removed in ffmpeg 8 (vidio 1.5.1 still passes it).
-// Running such a command through the shared pass runner must surface the
-// stderr error tokens on the Task AND a typed error carrying the tail -
-// the owner learns about a failing pass from both channels.
+// The failure path must surface the stderr error tokens on the Task AND a
+// typed error carrying the tail - the owner learns about a failing pass from
+// both channels. The failing command is version-proof: opening a missing
+// input aborts every ffmpeg build. (An earlier revision failed on purpose
+// via the -vsync option ffmpeg 8 removed - that test silently assumed the
+// runner's ffmpeg was already >= 8 and failed on Ubuntu's 6.1, where -vsync
+// still parses.)
 func TestRunFFmpegProgressWarningsOnFailure(t *testing.T) {
 	ffmpeg := requireFFmpeg(t)
-	input := buildFixture(t, ffmpeg, t.TempDir())
 
 	tb := newTaskBase(context.Background(), TaskAnalyze, nil)
 	err := runFFmpegProgress(context.Background(), ffmpeg, []string{
-		"-hide_banner", "-i", input,
+		"-hide_banner",
+		"-i", "/nonexistent/absent-input.mp4", // fails in every ffmpeg build
 		"-vf", "scale=64:48",
-		"-vsync", "0", // removed option: ffmpeg aborts during arg parsing
 		"-f", "null", "-",
 	}, PhasePrepare, tb)
 	if err == nil {
-		t.Fatal("-vsync must fail on modern ffmpeg")
+		t.Fatal("ffmpeg with an unreadable input must fail")
 	}
 	var ferr *FFmpegError
 	if !errors.As(err, &ferr) {

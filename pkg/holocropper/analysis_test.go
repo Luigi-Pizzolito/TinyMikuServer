@@ -582,11 +582,45 @@ func readDebugCSV(t *testing.T, path string) []csvFrameRow {
 	return out
 }
 
-// parityGoldenName is the framing decision stream the fused CLI pipeline
-// wrote for this fixture through HOLOCROPPER_DEBUG_BOXES, committed before
-// story C3 removed that pipeline. TestReplayParityVsDebugCSV is the gate the
-// deletion rides on: the embeddable passes must reproduce those decisions.
-const parityGoldenName = "holocropper-parity-fixture-240.csv"
+// parityGoldenName is the testdata file holding the framing decision stream
+// for the fixture, recorded through HOLOCROPPER_DEBUG_BOXES. The first golden
+// was the fused CLI pipeline's own output, committed before story C3 removed
+// that pipeline; TestReplayParityVsDebugCSV is the gate the deletion rides
+// on: the embeddable passes must reproduce those decisions.
+//
+// Goldens are tagged with the ffmpeg MAJOR version that recorded them: the
+// decision stream depends on the fixture's encode/decode round trip and the
+// scaler output of the analysis video, which are ffmpeg-build artifacts -
+// boxes drift by a pixel between majors (Ubuntu CI's 6.1 vs a 9.x desktop).
+// Each supported ffmpeg major version gets its own golden; regenerating
+// writes the file named from the ffmpeg that actually ran.
+func parityGoldenName(major int) string {
+	return fmt.Sprintf("holocropper-parity-fixture-240-ffmpeg%d.csv", major)
+}
+
+// ffmpegMajorVersion extracts the major version from `ffmpeg -version` and
+// tolerates distro/git decorations ("6.1.1-0ubuntu0.24.04.1", "n7.0.2",
+// "9.0.2-static").
+func ffmpegMajorVersion(t *testing.T, ffmpegPath string) int {
+	t.Helper()
+	out, err := exec.Command(ffmpegPath, "-version").Output()
+	if err != nil {
+		t.Fatalf("ffmpeg -version: %v", err)
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) < 3 || fields[0] != "ffmpeg" || fields[1] != "version" {
+		t.Fatalf("unrecognized ffmpeg -version output: %q", string(out))
+	}
+	v := strings.TrimLeft(fields[2], "nv")
+	if i := strings.Index(v, "."); i >= 0 {
+		v = v[:i]
+	}
+	major, err := strconv.Atoi(v)
+	if err != nil || major <= 0 {
+		t.Fatalf("unrecognized ffmpeg version %q", fields[2])
+	}
+	return major
+}
 
 // TestReplayParityVsDebugCSV is the framing-parity gate (story C3, golden
 // mode). The golden CSV is the fused pipeline's own ground truth for the
@@ -595,8 +629,11 @@ const parityGoldenName = "holocropper-parity-fixture-240.csv"
 // decisions, and the HOLOCROPPER_DEBUG_BOXES shim on NewPlan re-emits the
 // file the corpus tooling reads.
 //
-// Set HOLOCROPPER_REGENERATE_GOLDEN=1 to rewrite the golden from the API
-// chain - for example after an ffmpeg upgrade changes decode drift.
+// The golden is selected by the running ffmpeg's major version (see
+// parityGoldenName). With no golden for that version the test fails with the
+// regeneration command - set HOLOCROPPER_REGENERATE_GOLDEN=1 to write one
+// from the API chain and commit it, e.g. after an ffmpeg upgrade changes
+// decode drift.
 func TestReplayParityVsDebugCSV(t *testing.T) {
 	ffmpeg := requireFFmpeg(t)
 
@@ -604,15 +641,25 @@ func TestReplayParityVsDebugCSV(t *testing.T) {
 		outH, outW = 240, 240
 		fps        = fixtureFPS
 	)
-	golden := filepath.Join("testdata", parityGoldenName)
+	major := ffmpegMajorVersion(t, ffmpeg)
+	golden := filepath.Join("testdata", parityGoldenName(major))
 
 	inputDir, tempDir := t.TempDir(), t.TempDir()
 	fixture := buildFixture(t, ffmpeg, inputDir)
 
+	// Regeneration mode runs before the golden-must-exist gate: a golden for
+	// a new ffmpeg major is created precisely when none exists yet.
 	if os.Getenv("HOLOCROPPER_REGENERATE_GOLDEN") != "" {
 		regenerateParityGolden(t, ffmpeg, fixture, tempDir, golden, outW, outH, fps)
 		return
 	}
+
+	if st, err := os.Stat(golden); err != nil {
+		t.Fatalf("no golden decision stream for ffmpeg %d: run HOLOCROPPER_REGENERATE_GOLDEN=1 go test -run TestReplayParityVsDebugCSV with this ffmpeg, review the diff and commit %s", major, golden)
+	} else if st.Size() == 0 {
+		t.Fatalf("%s is empty", golden)
+	}
+	t.Logf("golden %s", filepath.Base(golden))
 
 	rows := readDebugCSV(t, golden)
 
