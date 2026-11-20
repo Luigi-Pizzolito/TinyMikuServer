@@ -263,6 +263,9 @@ const (
 	PhasePreviewMux    Phase = "preview_mux"    // ffmpeg preview mux
 	PhaseRenderFrames  Phase = "render_frames"  // final crop JPEG pass
 	PhaseRenderMux     Phase = "render_mux"     // ffmpeg final mux + audio
+	PhaseMikVAudio     Phase = "mikv_audio"     // ffmpeg audio track (raw PCM or OGG-Opus)
+	PhaseMikVFrames    Phase = "mikv_frames"    // planned crops -> MikV frame payloads
+	PhaseMikVWrite     Phase = "mikv_write"     // MikV container write
 )
 
 type TaskKind string
@@ -271,6 +274,7 @@ const (
 	TaskAnalyze     TaskKind = "analyze"
 	TaskPreview     TaskKind = "preview"
 	TaskRenderFinal TaskKind = "render_final"
+	TaskRenderMikV  TaskKind = "render_mikv"
 )
 
 type TaskState string
