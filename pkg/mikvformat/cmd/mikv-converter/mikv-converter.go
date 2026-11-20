@@ -22,6 +22,11 @@ func main() {
 	audioChannels := flag.Uint("channels", 1, "Number of audio channels (default: 1)")
 	audioBitsPerSample := flag.Uint("bitsPerSample", 16, "Audio bits per sample (default: 16)")
 
+	jpeg := flag.Bool("jpeg", false, "Store video frames as JPEG (MikV video encoding 0x01, MJPEG-in-MikV) instead of DEFLATEd RGB565")
+	jpegQuality := flag.Int("jpeg-quality", mikvformat.DefaultJPEGQuality, "JPEG quality for -jpeg frames (default: 90)")
+	opus := flag.Bool("opus", false, "Store audio as OGG-Opus segments (MikV audio encoding 0x01) instead of raw PCM; forces -sampleRate 48000")
+	opusBitrate := flag.Int("opus-bitrate", 0, "libopus bitrate in kbps for -opus audio (default: libopus default)")
+
 	verbose := flag.Bool("silent", false, "Disable verbose output")
 	flag.Parse()
 
@@ -85,8 +90,27 @@ func main() {
 		mikv := mikvformat.NewMikVFormat()
 		mikv.Verbose = !(*verbose)
 
+		// Encoding selection (see the MikV format spec: header bytes 13-14).
+		// Leaving both off reproduces the original DEFLATE + raw PCM output.
+		if *jpeg {
+			mikv.VideoEncoding = mikvformat.EncodingJPEG
+			mikv.JPEGQuality = *jpegQuality
+		}
+		if *opus {
+			mikv.AudioEncoding = mikvformat.EncodingOGGOpus
+			mikv.OpusBitrateKbps = *opusBitrate
+			if *audioSampleRate != mikvformat.OGGOpusSampleRate {
+				fmt.Printf("OGG-Opus audio uses the 48000 Hz granule clock; sample rate %d overridden to %d\n",
+					*audioSampleRate, mikvformat.OGGOpusSampleRate)
+			}
+		}
+
 		// Set audio parameters
-		mikv.SetAudioParams(uint16(*audioSampleRate), uint8(*audioChannels), uint8(*audioBitsPerSample))
+		sampleRate := *audioSampleRate
+		if *opus {
+			sampleRate = mikvformat.OGGOpusSampleRate
+		}
+		mikv.SetAudioParams(uint16(sampleRate), uint8(*audioChannels), uint8(*audioBitsPerSample))
 
 		// Load MP4 file
 		if err := mikv.LoadFromMP4(file); err != nil {
