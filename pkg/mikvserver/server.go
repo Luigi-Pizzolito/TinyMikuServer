@@ -66,6 +66,12 @@ func (ms *MikVServer) videoHandler(w http.ResponseWriter, r *http.Request) {
 	totalFrameLength := audioFrameLength + videoFrameLength
 	w.Header().Set("Content-Length", strconv.Itoa(totalFrameLength))
 	w.Header().Set("X-Video-Length", strconv.Itoa(videoFrameLength))
+	// Encoding IDs of the frame payloads (the MikV header bytes 13-14
+	// values, see the mikvformat spec): 0 = DEFLATE RGB565 / raw PCM,
+	// 1 = JPEG / OGG-Opus page segment. Clients that predate these
+	// headers see identical bytes - encoding 0 is the legacy default.
+	w.Header().Set("X-Video-Encoding", strconv.Itoa(int(ms.lastFrame.VideoEncoding)))
+	w.Header().Set("X-Audio-Encoding", strconv.Itoa(int(ms.lastFrame.AudioEncoding)))
 
 	// Prepare the response
 	totalFrameBuffer := make([]byte, totalFrameLength)
