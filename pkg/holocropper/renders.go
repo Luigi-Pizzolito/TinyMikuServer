@@ -316,9 +316,35 @@ func previewWork(ctx context.Context, a *Analysis, task *PreviewTask, p *Plan, o
 
 // runCropLoop decodes the cached analysis video and writes the planned crops.
 // cropDir receives the plain crop sequence; overlayDir receives the same
-// frames with the framing boxes drawn. One Plan record per decoded frame: a
-// decode/frame-count mismatch is an error, never a silent truncation.
+// frames with the framing boxes drawn.
 func runCropLoop(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, cropDir, overlayDir string, opts PreviewOptions, phase Phase) (int, error) {
+	r := p.resolved
+	style := defaultOverlayStyle()
+	return plannedFrames(ctx, tb, a, p, phase, func(idx int, out *image.RGBA) error {
+		if cropDir != "" {
+			if err := writeJPEG(cropDir, idx+1, out); err != nil {
+				return err
+			}
+		}
+		if overlayDir != "" {
+			overlay := image.NewRGBA(image.Rect(0, 0, r.OutputW, r.OutputH))
+			copyRGBA(overlay, out)
+			drawOverlayBoxes(overlay, p.records[idx], opts, style)
+			if err := writeJPEG(overlayDir, idx+1, overlay); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// plannedFrames is the frame loop every output pass shares: it decodes the
+// cached analysis video, applies the Plan's framing (content-aware crop or
+// fit-with-bars) and hands each finished output-resolution frame to fn in
+// order. One Plan record per decoded frame: a decode/frame-count mismatch is
+// an error, never a silent truncation. fn owns what the frame becomes -
+// a JPEG file (runCropLoop) or a MikV frame payload (RenderMikV).
+func plannedFrames(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, phase Phase, fn func(idx int, out *image.RGBA) error) (int, error) {
 	video, err := vidio.NewVideo(a.AnalysisVideoPath())
 	if err != nil {
 		return 0, fmt.Errorf("holocropper: open analysis video %s: %w", a.AnalysisVideoPath(), err)
@@ -336,7 +362,6 @@ func runCropLoop(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, cropDi
 	}
 
 	r := p.resolved
-	style := defaultOverlayStyle()
 	tb.setPhase(phase, len(p.records))
 	count := 0
 	for video.Read() {
@@ -347,7 +372,6 @@ func runCropLoop(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, cropDi
 			return count, fmt.Errorf("holocropper: analysis video has more frames than the plan (%d > %d)",
 				count+1, len(p.records))
 		}
-		rec := p.records[count]
 		var out *image.RGBA
 		if p.settings.FitWithBars {
 			// Fit mode (§6.10): no crop - the whole analysis frame is
@@ -358,18 +382,8 @@ func runCropLoop(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, cropDi
 			out = fillResizeTo(cropped, r.OutputW, r.OutputH)
 		}
 
-		if cropDir != "" {
-			if err := writeJPEG(cropDir, count+1, out); err != nil {
-				return count, err
-			}
-		}
-		if overlayDir != "" {
-			overlay := image.NewRGBA(image.Rect(0, 0, r.OutputW, r.OutputH))
-			copyRGBA(overlay, out)
-			drawOverlayBoxes(overlay, rec, opts, style)
-			if err := writeJPEG(overlayDir, count+1, overlay); err != nil {
-				return count, err
-			}
+		if err := fn(count, out); err != nil {
+			return count, err
 		}
 		count++
 		tb.setDone(count)
