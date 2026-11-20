@@ -628,7 +628,17 @@ func analyzeWork(ctx context.Context, entry *analysisEntry, task *AnalysisTask, 
 		"-hide_banner",
 		"-i", ra.input,
 		"-vf", fmt.Sprintf("scale=%d:%d", aw, ah),
-		"-sws_flags", "lanczos+accurate_rnd",
+		// lanczos+bitexact: the analysis scaler must be CPU-dispatch
+		// independent. SIMD lanczos paths round differently on different
+		// CPU flag sets (a 1 px edge-ring difference was observed between
+		// a desktop and a GH runner on the SAME ffmpeg build), which
+		// would silently shift detect bboxes and break the golden parity
+		// gate. bitexact forces swscale's deterministic algorithm.
+		"-sws_flags", "lanczos+accurate_rnd+bitexact",
+		// cpu-independent x264: same rationale - subpel search and mode
+		// decisions must not follow the CPU's asm, or the analysis
+		// bitstream (and therefore detect) differs per machine.
+		"-x264-params", "cpu-independent=1",
 		"-fps_mode", "passthrough",
 		"-an",
 		tmpVideo,
