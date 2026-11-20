@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"image"
 	"image/jpeg"
@@ -286,6 +287,13 @@ func NewMikVFormat() *MikVFormat {
 
 // IO functions
 
+// ErrTruncatedRecord reports a MikV frame record that ends before the lengths
+// it declares are filled. A file that stops exactly at a record boundary is a
+// complete container; one that stops inside a record is a partial product, and
+// Load refuses it instead of reporting the frames that survived as a shorter
+// valid file. Consumers can test this with errors.Is.
+var ErrTruncatedRecord = errors.New("truncated frame record")
+
 // -- Load function
 func (m *MikVFormat) Load(filename string) error {
 	file, err := os.Open(filename)
@@ -300,14 +308,19 @@ func (m *MikVFormat) Load(filename string) error {
 		return err
 	}
 
-	// Read frames
+	// Read frames. io.EOF here means the file ended at a record boundary,
+	// which is what a complete container looks like; any other read failure is
+	// a cut record (ErrTruncatedRecord), and the frames this Load managed to
+	// read before the cut are dropped rather than reported as a whole file.
+	kept := len(m.Frames)
 	for {
 		frame, errrf := m.readFrame(file)
-		if errrf == io.EOF {
+		if errors.Is(errrf, io.EOF) {
 			break
 		}
 		if errrf != nil {
-			return err
+			m.Frames = m.Frames[:kept]
+			return errrf
 		}
 		m.Frames = append(m.Frames, *frame)
 	}
@@ -689,31 +702,61 @@ func (m *MikVFormat) readHeader(file *os.File) error {
 }
 
 // -- readFrame function
+// A clean io.EOF means the file ended exactly where the next record's length
+// would start: the container is complete. Anything shorter is a cut record and
+// comes back as ErrTruncatedRecord.
 func (m *MikVFormat) readFrame(file *os.File) (*MikVFrame, error) {
 	var frame MikVFrame
 
 	// Read video frame length (uint32) in little-endian format
 	var videoLength uint32
 	if err := binary.Read(file, binary.LittleEndian, &videoLength); err != nil {
-		return nil, fmt.Errorf("Error reading video frame length: %v", err)
+		if errors.Is(err, io.EOF) {
+			return nil, io.EOF
+		}
+		return nil, fmt.Errorf("%w: the file stops where a video frame length belongs: %v", ErrTruncatedRecord, err)
+	}
+
+	// A payload longer than the rest of the file is a cut record on the spot:
+	// checking it here is what stops a corrupt length from asking for a buffer
+	// the file could never fill.
+	left, err := bytesLeftInFile(file)
+	if err != nil {
+		return nil, fmt.Errorf("Error checking file size: %v", err)
+	}
+	if int64(videoLength) > left {
+		return nil, fmt.Errorf("%w: video payload wants %d bytes, %d remain", ErrTruncatedRecord, videoLength, left)
 	}
 
 	// Read video frame data
 	frame.Video = make([]byte, videoLength)
-	if _, err := io.ReadFull(file, frame.Video); err != nil {
-		return nil, fmt.Errorf("Error reading video data: %v", err)
+	if n, err := io.ReadFull(file, frame.Video); err != nil {
+		return nil, fmt.Errorf("%w: video payload wants %d bytes, %d arrived: %v", ErrTruncatedRecord, videoLength, n, err)
 	}
 
-	// Read audio frame length (uint32) in little-endian format
+	// Read audio frame length (uint32) in little-endian format. Even a plain
+	// EOF here is a cut record: the video payload above already opened this
+	// record, so the file is one field short of closing it.
 	var audioLength uint32
 	if err := binary.Read(file, binary.LittleEndian, &audioLength); err != nil {
-		return nil, fmt.Errorf("Error reading audio frame length: %v", err)
+		if errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("%w: the file stops where an audio frame length belongs", ErrTruncatedRecord)
+		}
+		return nil, fmt.Errorf("%w: audio frame length: %v", ErrTruncatedRecord, err)
+	}
+
+	left, err = bytesLeftInFile(file)
+	if err != nil {
+		return nil, fmt.Errorf("Error checking file size: %v", err)
+	}
+	if int64(audioLength) > left {
+		return nil, fmt.Errorf("%w: audio payload wants %d bytes, %d remain", ErrTruncatedRecord, audioLength, left)
 	}
 
 	// Read audio chunk data
 	frame.Audio = make([]byte, audioLength)
-	if _, err := io.ReadFull(file, frame.Audio); err != nil {
-		return nil, fmt.Errorf("Error reading audio frame data: %v", err)
+	if n, err := io.ReadFull(file, frame.Audio); err != nil {
+		return nil, fmt.Errorf("%w: audio payload wants %d bytes, %d arrived: %v", ErrTruncatedRecord, audioLength, n, err)
 	}
 
 	// The encodings ride on the header; stamp them onto the frame so a
@@ -723,6 +766,23 @@ func (m *MikVFormat) readFrame(file *os.File) (*MikVFrame, error) {
 
 	return &frame, nil
 
+}
+
+// bytesLeftInFile reports how many bytes a seekable file still holds from its
+// current read position.
+func bytesLeftInFile(file *os.File) (int64, error) {
+	pos, err := file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return 0, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	if info.Size() < pos {
+		return 0, nil
+	}
+	return info.Size() - pos, nil
 }
 
 // -- writeHeader function

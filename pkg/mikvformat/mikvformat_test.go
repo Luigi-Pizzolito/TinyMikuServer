@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -335,6 +337,114 @@ func TestReaderRejectsUnknownEncodings(t *testing.T) {
 	b, _ := os.ReadFile(p + ".resave")
 	if b[15] != 0 {
 		t.Fatalf("reserved byte re-emitted as 0x%02X, want 0x00", b[15])
+	}
+}
+
+// TestLoadRefusesTruncatedRecords is the strict-reader pin: a MikV that stops
+// inside a frame record is a partial product, not a shorter valid container.
+// Every cut inside a record must fail as ErrTruncatedRecord and leave no frames
+// behind; a cut exactly at a record boundary is a complete file and loads.
+func TestLoadRefusesTruncatedRecords(t *testing.T) {
+	dir := t.TempDir()
+
+	mikv := NewMikVFormat()
+	mikv.FPS = 20
+	mikv.Height = 8
+	mikv.Width = 8
+	mikv.SetAudioParams(16000, 1, 16)
+	for i := 0; i < 3; i++ {
+		if err := mikv.AddFrame(patternFill(16, byte(i)), patternFill(32, byte(i*2))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	full := filepath.Join(dir, "whole.mikv")
+	if err := mikv.Save(full); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The stored payload lengths are the writer's business (the default video
+	// encoding DEFLATEs), so the cuts are measured off the file it wrote:
+	// [16-byte header][u32 video len][video][u32 audio len][audio] per frame.
+	videoLen := int(binary.LittleEndian.Uint32(raw[16:]))
+	audioLenAt := 16 + 4 + videoLen
+	audioLen := int(binary.LittleEndian.Uint32(raw[audioLenAt:]))
+	record := 4 + videoLen + 4 + audioLen
+
+	whole := NewMikVFormat()
+	if err := whole.Load(full); err != nil {
+		t.Fatalf("Load on the whole file: %v", err)
+	}
+	if len(whole.Frames) != 3 {
+		t.Fatalf("whole file loaded %d frames, want 3", len(whole.Frames))
+	}
+	if 16+3*record != len(raw) {
+		t.Fatalf("the written file is %d bytes, which does not read as 3 records of %d", len(raw), record)
+	}
+
+	cuts := []struct {
+		name string
+		at   int
+		want string
+	}{
+		{"mid-video-length-field", 16 + 2, "video frame length"},
+		{"short-video-payload", 16 + 4 + videoLen/2,
+			fmt.Sprintf("video payload wants %d bytes, %d remain", videoLen, videoLen/2)},
+		{"missing-audio-length", audioLenAt, "audio frame length"},
+		{"mid-audio-payload", audioLenAt + 4 + audioLen/2,
+			fmt.Sprintf("audio payload wants %d bytes, %d remain", audioLen, audioLen/2)},
+	}
+	for _, c := range cuts {
+		p := filepath.Join(dir, "cut-"+c.name+".mikv")
+		if err := os.WriteFile(p, append([]byte(nil), raw[:c.at]...), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		back := NewMikVFormat()
+		err := back.Load(p)
+		if err == nil {
+			t.Errorf("%s: Load said nothing, want a refusal (it read %d frames)", c.name, len(back.Frames))
+			continue
+		}
+		if !errors.Is(err, ErrTruncatedRecord) {
+			t.Errorf("%s: Load said %q, want an ErrTruncatedRecord", c.name, err.Error())
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: Load said %q, want it to name %q", c.name, err.Error(), c.want)
+		}
+		if len(back.Frames) != 0 {
+			t.Errorf("%s: Load kept %d frames after refusing, want none", c.name, len(back.Frames))
+		}
+	}
+
+	// A length field bigger than the rest of the file is the same refusal, and
+	// it is caught before any buffer the size of the lie is allocated.
+	lie := append([]byte(nil), raw...)
+	binary.LittleEndian.PutUint32(lie[16:], 1<<30)
+	p := filepath.Join(dir, "lie.mikv")
+	if err := os.WriteFile(p, lie, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	back := NewMikVFormat()
+	if err := back.Load(p); err == nil || !errors.Is(err, ErrTruncatedRecord) {
+		t.Errorf("Load on an over-long payload said %v, want ErrTruncatedRecord", err)
+	}
+
+	// The boundary is not a cut: one record is a complete container.
+	for _, frames := range []int{1, 2} {
+		p := filepath.Join(dir, fmt.Sprintf("boundary-%d.mikv", frames))
+		if err := os.WriteFile(p, raw[:16+frames*record], 0o644); err != nil {
+			t.Fatal(err)
+		}
+		back := NewMikVFormat()
+		if err := back.Load(p); err != nil {
+			t.Errorf("Load on %d whole records: %v", frames, err)
+			continue
+		}
+		if len(back.Frames) != frames {
+			t.Errorf("boundary file loaded %d frames, want %d", len(back.Frames), frames)
+		}
 	}
 }
 
