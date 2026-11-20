@@ -73,13 +73,15 @@ import (
  *		the complete Ogg pages whose packets finish within frame k's time
  *		window (48000/FPS samples, in Ogg granule units); chunks may be
  *		empty (codec preroll, or a page that covers several frames), and
- *		concatenating every audio chunk in file order reproduces the
- *		original .ogg stream byte for byte - a decoder that already has
- *		an Ogg demuxer consumes the chunks sequentially as a plain byte
- *		stream. Opus packet duration is picked for the fps (40 ms at
- *		24 fps), the stream's OpusHead is authoritative for sample rate
- *		and channels, and the header audio fields carry the nominal
- *		values written (48000 Hz for this encoding).
+ *		whatever completes past the last frame window is dropped, so the
+ *		audio track is exactly as long as the frames. Concatenating every
+ *		audio chunk in file order therefore reproduces a valid .ogg - a
+ *		decoder that already has an Ogg demuxer consumes the chunks
+ *		sequentially as a plain byte stream. Opus packet duration is
+ *		picked for the fps (40 ms at 24 fps), the stream's OpusHead is
+ *		authoritative for sample rate and channels, and the header audio
+ *		fields carry the nominal values written (48000 Hz for this
+ *		encoding).
  * A reader MUST reject a file whose encoding ID is neither 0x00 nor 0x01
  * rather than misread its frames. Files written with 0x00/0x00 are byte-
  * compatible with the original format: header, frame layout and payloads
@@ -194,8 +196,9 @@ const (
 
 	// EncodingOGGOpus (0x01): the audio track is one OGG-Opus stream, cut
 	// at page boundaries into per-video-frame segments. Each frame's audio
-	// chunk holds whole Ogg pages (possibly none); concatenating every
-	// audio chunk in file order reproduces the original .ogg byte for byte.
+	// chunk holds whole Ogg pages (possibly none); packets that complete
+	// past the last frame window are dropped, so concatenating every audio
+	// chunk in file order reproduces a valid .ogg as long as the frames.
 	// Chunk lengths are therefore variable (the uint32 prefix already
 	// allows it) and the Ogg stream itself (OpusHead) is authoritative for
 	// sample rate/channels - the header audio fields stay filled with the

@@ -98,6 +98,11 @@ type opusPacket struct {
 // chunks; a chunk can be empty (encoder preroll shifts the first packets,
 // or the schedule simply gives a frame none). Chunk 0 starts with the
 // untouched OpusHead/OpusTags pages.
+//
+// Packets that complete past the last frame window are dropped: the container
+// has no picture to play them against, so the audio track is exactly as long
+// as the frames it carries - the same budget the raw-PCM path cuts to. Concat
+// the chunks and you get a valid, shorter .ogg, not the original stream.
 func SplitOGGOpus(ogg []byte, fps uint8, frames int) ([][]byte, error) {
 	if frames <= 0 {
 		return nil, fmt.Errorf("SplitOGGOpus: frames must be > 0")
@@ -113,7 +118,9 @@ func SplitOGGOpus(ogg []byte, fps uint8, frames int) ([][]byte, error) {
 		return nil, err
 	}
 
-	// Schedule every packet into its completion window (monotonic).
+	// Schedule every packet into its completion window (monotonic). A packet
+	// that completes past the last window is audio with no picture: it is
+	// dropped rather than squeezed into the final frame.
 	perFrame := make([][]opusPacket, frames)
 	for _, pkt := range packets {
 		k := int((pkt.end+int64(window)-1)/int64(window)) - 1 // ceil(end/window)-1
@@ -121,7 +128,7 @@ func SplitOGGOpus(ogg []byte, fps uint8, frames int) ([][]byte, error) {
 			k = 0
 		}
 		if k >= frames {
-			k = frames - 1
+			continue
 		}
 		perFrame[k] = append(perFrame[k], pkt)
 	}

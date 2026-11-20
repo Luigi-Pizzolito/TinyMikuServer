@@ -93,10 +93,12 @@ func synthOGG(span int, base int64, perPage int, pkts [][]byte, tailSlack int64,
 	return out
 }
 
-// splitAndVerify splits ogg and checks the joined chunks carry every packet
-// byte for byte, in order, and that chunk 0 starts with the untouched
-// header pages.
-func splitAndVerify(t *testing.T, ogg []byte, fps uint8, span int, frames int, wantPackets int) [][]byte {
+// splitAndVerify splits ogg and checks the joined chunks carry the packets
+// byte for byte, in order, and that chunk 0 starts with the untouched header
+// pages. wantSrc is what the source stream holds; wantKept is what survives
+// the picture's frame windows - they differ exactly by the audio that runs
+// past the last frame, which SplitOGGOpus drops.
+func splitAndVerify(t *testing.T, ogg []byte, fps uint8, span int, frames int, wantSrc, wantKept int) [][]byte {
 	t.Helper()
 	chunks, err := SplitOGGOpus(ogg, fps, frames)
 	if err != nil {
@@ -109,8 +111,8 @@ func splitAndVerify(t *testing.T, ogg []byte, fps uint8, span int, frames int, w
 	if err != nil {
 		t.Fatalf("parse source: %v", err)
 	}
-	if len(pkts) != wantPackets {
-		t.Fatalf("source parse: %d packets, want %d", len(pkts), wantPackets)
+	if len(pkts) != wantSrc {
+		t.Fatalf("source parse: %d packets, want %d", len(pkts), wantSrc)
 	}
 	joined := JoinOGGChunks(chunks)
 	if !bytes.HasPrefix(joined, header) {
@@ -120,8 +122,8 @@ func splitAndVerify(t *testing.T, ogg []byte, fps uint8, span int, frames int, w
 	if err != nil {
 		t.Fatalf("parse joined stream: %v", err)
 	}
-	if len(pktsBack) != wantPackets {
-		t.Fatalf("joined stream has %d packets, want %d", len(pktsBack), wantPackets)
+	if len(pktsBack) != wantKept {
+		t.Fatalf("joined stream has %d packets, want %d (the source has %d)", len(pktsBack), wantKept, wantSrc)
 	}
 	for i := range pktsBack {
 		if !bytes.Equal(pktsBack[i].data, pkts[i].data) {
@@ -194,7 +196,7 @@ func TestOGGCRC32KnownVector(t *testing.T) {
 func TestSplitJoinRoundTripSynthetic(t *testing.T) {
 	pkts := fakeOpusPackets(48, 100)
 	ogg := synthOGG(1920, 0, 12, pkts, 0, nil) // 4 pages x 12 packets, clean grid
-	chunks := splitAndVerify(t, ogg, 24, 1920, 48, 48)
+	chunks := splitAndVerify(t, ogg, 24, 1920, 48, 48, 48)
 
 	// The 1920-granule packets over 2000-granule windows distribute unevenly.
 	// Chunk 0 carries the two header pages, so its header packets are not
@@ -226,10 +228,12 @@ func TestSplitJoinRoundTripSynthetic(t *testing.T) {
 
 func TestSplitPrerollConvention(t *testing.T) {
 	// A strict encoder that bakes an 80 ms preroll (3840 granules) into the
-	// granule timeline must still be accepted; the schedule just shifts.
+	// granule timeline must still be accepted; the schedule just shifts. The
+	// shift also pushes the last packet past the last picture window, and that
+	// one packet is dropped: the container's audio ends with its frames.
 	pkts := fakeOpusPackets(24, 90)
 	ogg := synthOGG(1920, 3840, 8, pkts, 0, nil)
-	chunks := splitAndVerify(t, ogg, 24, 1920, 24, 24)
+	chunks := splitAndVerify(t, ogg, 24, 1920, 24, 24, 23)
 
 	header, _, _, _, err := parseOGGOpus(ogg, 1920)
 	if err != nil {
@@ -307,16 +311,48 @@ func TestSplitCorruptionRejections(t *testing.T) {
 	}
 }
 
-func TestSplitFrameCountClamping(t *testing.T) {
+func TestSplitClampsAudioToThePicture(t *testing.T) {
 	pkts := fakeOpusPackets(40, 80)
 	ogg := synthOGG(1920, 0, 10, pkts, 0, nil)
 
-	// More audio than video: the tail clamps into the last chunk.
-	splitAndVerify(t, ogg, 24, 1920, 10, 40)
+	// More audio than video: a packet that completes past the last frame
+	// window is dropped, not squeezed into the final frame. 40 packets of
+	// 1920 granules over 2000-granule windows keep the 10 the picture covers,
+	// and the container's sound is exactly as long as its frames.
+	chunks, err := SplitOGGOpus(ogg, 24, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 10 {
+		t.Fatalf("chunks = %d, want 10", len(chunks))
+	}
+	joined := JoinOGGChunks(chunks)
+	header, _, _, src, err := parseOGGOpus(ogg, 1920)
+	if err != nil {
+		t.Fatalf("parse source: %v", err)
+	}
+	if !bytes.HasPrefix(joined, header) {
+		t.Fatal("chunk 0 does not start with the byte-identical header pages")
+	}
+	_, _, _, kept, err := parseOGGOpus(joined, 1920)
+	if err != nil {
+		t.Fatalf("the clamped track is not a valid OGG-Opus stream: %v", err)
+	}
+	if len(kept) != 10 {
+		t.Fatalf("the clamped track carries %d packets, want the 10 that fit the picture", len(kept))
+	}
+	for i := range kept {
+		if !bytes.Equal(kept[i].data, src[i].data) {
+			t.Fatalf("packet %d altered by the clamp", i)
+		}
+	}
+	if kept[len(kept)-1].end > 10*2000 {
+		t.Fatalf("the last kept packet ends at granule %d, past the 10th frame window", kept[len(kept)-1].end)
+	}
 
 	// More video than audio: trailing chunks stay empty (valid MikV: the
 	// frame keeps a zero-length audio chunk).
-	chunks, err := SplitOGGOpus(ogg, 24, 100)
+	chunks, err = SplitOGGOpus(ogg, 24, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -327,15 +363,57 @@ func TestSplitFrameCountClamping(t *testing.T) {
 	}
 }
 
-func TestSplitMultiPageFrame(t *testing.T) {
-	// 130 x 255-byte packets (2 lacing segments each) clamped into a single
-	// frame overflow the 255-entry segment table; buildOggPageRun must
-	// split into multiple pages without ever cutting a packet.
+func TestBuildOggPageRunSplitsLongPacketRuns(t *testing.T) {
+	// 130 x 255-byte packets (2 lacing segments each) overflow the 255-entry
+	// segment table; buildOggPageRun must split into multiple pages without
+	// ever cutting a packet. SplitOGGOpus no longer routes that many packets
+	// into one frame window - audio past the picture is dropped - so the page
+	// encoder is pinned directly.
 	pkts := fakeOpusPackets(130, 255)
 	ogg := synthOGG(1920, 0, 120, pkts, 0, nil)
-	chunks := splitAndVerify(t, ogg, 24, 1920, 1, 130)
-	if n := bytes.Count(chunks[0], []byte("OggS")); n < 3 { // headers + >=2 audio pages
-		t.Fatalf("chunk 0 has %d pages, want header pages plus a split audio run", n)
+	_, serial, maxSeq, parsed, err := parseOGGOpus(ogg, 1920)
+	if err != nil {
+		t.Fatalf("parse fixture: %v", err)
+	}
+	if len(parsed) != 130 {
+		t.Fatalf("fixture parses as %d packets, want 130", len(parsed))
+	}
+	seq := maxSeq + 1
+	run, err := buildOggPageRun(serial, &seq, parsed, true)
+	if err != nil {
+		t.Fatalf("buildOggPageRun: %v", err)
+	}
+	if n := bytes.Count(run, []byte("OggS")); n < 2 {
+		t.Fatalf("the run is %d page(s), want the segment table split across at least 2", n)
+	}
+	// Walk the run page by page and check the last page carries the EOS flag.
+	lastFlags := byte(0)
+	for off := 0; off+27 <= len(run); {
+		if string(run[off:off+4]) != "OggS" {
+			t.Fatalf("page run is not a sequence of Ogg pages at offset %d", off)
+		}
+		lastFlags = run[off+5]
+		nseg := int(run[off+26])
+		body := 0
+		for _, v := range run[off+27 : off+27+nseg] {
+			body += int(v)
+		}
+		off += 27 + nseg + body
+	}
+	if lastFlags&0x04 == 0 {
+		t.Errorf("the final page of a 130-packet run is not flagged EOS")
+	}
+	_, _, _, back, err := parseOGGOpus(run, 1920)
+	if err != nil {
+		t.Fatalf("the page run does not parse back: %v", err)
+	}
+	if len(back) != 130 {
+		t.Fatalf("the page run carries %d packets, want all 130", len(back))
+	}
+	for i := range back {
+		if !bytes.Equal(back[i].data, parsed[i].data) {
+			t.Fatalf("packet %d was altered by the page split", i)
+		}
 	}
 }
 
@@ -388,9 +466,11 @@ func TestSplitRealFFmpegOpusStream(t *testing.T) {
 	ogg := encodeRealOpus(t, ffmpeg, 2)
 
 	// The real stream: ffmpeg cancels the libopus delay out of the pts, so
-	// granules run clean and the final page lands short - exactly the
-	// slack SplitOGGOpus must accept.
-	chunks := splitAndVerify(t, ogg, 24, 1920, 48, 51)
+	// granules run clean and the final page lands short - exactly the slack
+	// SplitOGGOpus must accept. 2 s of 40 ms packets is 51 packets against 48
+	// picture windows: the one that completes past the last frame is dropped,
+	// so the track is exactly as long as the frames it ships with.
+	chunks := splitAndVerify(t, ogg, 24, 1920, 48, 51, 50)
 
 	// The joined chunks must be a complete .ogg ffmpeg itself accepts -
 	// this is the guarantee the firmware's ogg_pages/opus decoder relies on.
