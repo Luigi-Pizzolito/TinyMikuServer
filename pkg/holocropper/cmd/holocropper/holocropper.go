@@ -55,6 +55,11 @@ func main() {
 	fitBars := flag.Bool("fit", false, "Fit mode for non-hologram videos: scale the WHOLE frame to fit the output resolution, centered on black bars - no content-aware crop or zoom (works for normal 4:3/16:9 sources destined for other shapes, e.g. square social/MV output)")
 	tempDir := flag.String("temp-dir", os.TempDir(), "Scratch + analysis-cache parent directory (cached analyses make repeated corpus renders skip the detect pass)")
 	ffmpegPath := flag.String("ffmpeg-path", "", "Path to the ffmpeg binary (default: ffmpeg from PATH)")
+	mikvOut := flag.Bool("mikv", false, "Write the final output as a MikV container (the firmware format) instead of mp4; the file is <basename>-<WxH>.mikv")
+	mikvJPEG := flag.Bool("mikv-jpeg", false, "With -mikv: store video frames as JPEG (MikV video encoding 0x01, MJPEG-in-MikV) instead of DEFLATEd RGB565")
+	mikvOpus := flag.Bool("mikv-opus", false, "With -mikv: store audio as OGG-Opus cut into per-frame segments (MikV audio encoding 0x01) instead of raw PCM; 48000 Hz; the firmware MJPEG+Opus pairing is 24 fps + 48 kHz")
+	mikvJPEGQuality := flag.Int("jpeg-quality", 90, "JPEG quality (1-100) for -mikv-jpeg frames")
+	mikvOpusBitrate := flag.Int("opus-bitrate", 0, "libopus bitrate in kbps for -mikv-opus audio (0 = encoder default)")
 
 	flag.Parse()
 
@@ -105,6 +110,20 @@ func main() {
 	fmt.Printf("Zoom Margin: %.2f / Max Zoom: %.2f (0 = auto)\n", *zoomMargin, *maxZoom)
 	fmt.Printf("Auto Orient: %t\n", *autoOrient)
 	fmt.Printf("Fit Mode (bars, no cropping): %t\n", *fitBars)
+	if *mikvOut {
+		videoMode := "DEFLATE RGB565"
+		if *mikvJPEG {
+			videoMode = fmt.Sprintf("JPEG q%d", *mikvJPEGQuality)
+		}
+		audioMode := "raw PCM 16000 Hz"
+		if *mikvOpus {
+			audioMode = "OGG-Opus 48000 Hz"
+			if *mikvOpusBitrate > 0 {
+				audioMode = fmt.Sprintf("OGG-Opus 48000 Hz @ %d kbps", *mikvOpusBitrate)
+			}
+		}
+		fmt.Printf("MikV Output: true (video: %s, audio: %s)\n", videoMode, audioMode)
+	}
 	fmt.Printf("Temp Dir: %s\n", *tempDir)
 	fmt.Printf("FFmpeg Path: %s\n", orDefault(*ffmpegPath, "ffmpeg (PATH)"))
 
@@ -112,11 +131,21 @@ func main() {
 
 	var wg sync.WaitGroup
 
+	var mikvReq *holocropper.MikVOptions
+	if *mikvOut {
+		mikvReq = &holocropper.MikVOptions{
+			VideoJPEG:       *mikvJPEG,
+			JPEGQuality:     *mikvJPEGQuality,
+			AudioOpus:       *mikvOpus,
+			OpusBitrateKbps: *mikvOpusBitrate,
+		}
+	}
+
 	for _, inputFile := range inputFiles {
 		wg.Add(1)
 		go func(file string) {
 			defer wg.Done()
-			cropFile(file, *width, *height, *fps, *analysisHeight, *zoomMargin, *maxZoom, *autoOrient, *fitBars, *outputDir, *tempDir, *ffmpegPath)
+			cropFile(file, *width, *height, *fps, *analysisHeight, *zoomMargin, *maxZoom, *autoOrient, *fitBars, *outputDir, *tempDir, *ffmpegPath, mikvReq)
 			fmt.Printf("Processing complete for %s\n", file)
 		}(inputFile)
 	}
@@ -129,10 +158,11 @@ func main() {
 
 // cropFile runs the full API chain for one input video: Analyze (prepare +
 // detect, cached), NewPlan (in-process framing replay) or NewFitPlan (fit
-// mode, bars for non-hologram videos), RenderFinal (frame sequence + audio
-// mux at output resolution).
+// mode, bars for non-hologram videos), then RenderFinal (frame sequence +
+// audio mux at output resolution) - or RenderMikV when mikvOpts is set,
+// writing the firmware's MikV container instead of an mp4.
 func cropFile(file string, width, height int, fps float64, analysisHeight int,
-	zoomMargin, maxZoom float64, autoOrient, fitBars bool, outputDir, tempDir, ffmpegPath string) {
+	zoomMargin, maxZoom float64, autoOrient, fitBars bool, outputDir, tempDir, ffmpegPath string, mikvOpts *holocropper.MikVOptions) {
 
 	// Legacy input checks with the legacy messages, so scripted invocations
 	// keep the same failure surface.
@@ -244,6 +274,37 @@ func cropFile(file string, width, height int, fps float64, analysisHeight int,
 	// Legacy output naming: <basename>.mp4 in the output dir, overwritten on
 	// re-render, exactly like the old fused path.
 	legacyName := strings.TrimSuffix(filepath.Base(file), filepath.Ext(file)) + ".mp4"
+
+	if mikvOpts != nil {
+		// MikV output (-mikv): the planned frames go straight into the
+		// firmware container; the dimension-tagged default name keeps
+		// different output targets from colliding.
+		mikvTask, err := analysis.RenderMikV(context.Background(), plan, holocropper.MikVRequest{
+			OutputDir:  outputDir,
+			TempDir:    tempDir,
+			FFmpegPath: ffmpegPath,
+			Options:    *mikvOpts,
+			Observer:   observer,
+		})
+		if err != nil {
+			log.Printf("Error during cropping for file %s: %v", file, err)
+			return
+		}
+		registerCancel(file, mikvTask)
+		mres, err := mikvTask.Wait()
+		if err != nil {
+			log.Printf("Error during cropping for file %s: %v", file, err)
+			return
+		}
+		bart.Close()
+		fmt.Printf("Output: %s (%dx%d, %d frames, %d fps, video enc 0x%02X, audio enc 0x%02X, %.2fs)\n",
+			mres.OutputPath, mres.OutputW, mres.OutputH, mres.Frames, mres.FPS,
+			mres.VideoEncoding, mres.AudioEncoding, mres.ElapsedSeconds)
+		for _, w := range mres.Warnings {
+			fmt.Printf("ffmpeg warning: %s\n", w)
+		}
+		return
+	}
 
 	renderTask, err := analysis.RenderFinal(context.Background(), plan, holocropper.RenderRequest{
 		OutputDir:  outputDir,
