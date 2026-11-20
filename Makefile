@@ -25,14 +25,16 @@ build-holocropper:
 	cd $(HOLOCROPPER_DIR) && $(GO_BUILD) -o ../../../../$(BIN_DIR)/holocropper
 
 # Mirrors .github/workflows/ci.yml: build+vet for the server and mikv modules,
-# the full -race suite for holocropper (lavfi fixtures + golden CSV only, no
+# the pkg/mikvformat suite (its OGG-Opus encoder tests use ffmpeg when present;
+# HOLOCROPPER_REQUIRE_FFMPEG=1 turns a missing ffmpeg into a failure), and the
+# full -race suite for holocropper (lavfi fixtures + golden CSV only, no
 # corpus videos needed).
 test: test-mikv test-holocropper
 
 test-mikv:
-	@echo "Building and vetting server + mikv packages..."
+	@echo "Building, vetting and testing server + mikv packages..."
 	$(GO_BUILD) ./... && $(GO) vet ./...
-	cd pkg/mikvformat && $(GO_BUILD) ./... && $(GO) vet ./...
+	cd pkg/mikvformat && $(GO_BUILD) ./... && $(GO) vet ./... && $(GO) test -count=1 -timeout 300s ./...
 	cd pkg/mikvserver && $(GO_BUILD) ./... && $(GO) vet ./...
 
 test-holocropper:

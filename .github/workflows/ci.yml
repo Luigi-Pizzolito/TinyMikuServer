@@ -129,8 +129,44 @@ jobs:
           ffprobe -hide_banner -v error -select_streams v:0 \
             -show_entries stream=width,height -of csv=p=0 /tmp/ci-cli/out/dance.mp4 | grep -qx 420,240
 
+      # MikV output smoke (§6.11): -mikv writes the firmware container.
+      # Header layout checked raw: bytes 7-8 LE audio sample rate, byte 13
+      # video encoding, byte 14 audio encoding, byte 15 reserved zero.
+      - name: CLI mikv output (-mikv) writes legacy-encoding containers
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/holocropper" -i /tmp/ci-cli/in -o /tmp/ci-cli/out \
+            -temp-dir /tmp/ci-cli/tmp -w 120 -h 120 -fps 20 -mikv
+          mikv=/tmp/ci-cli/out/dance-120x120.mikv
+          test -f "$mikv" || { echo "mikv output missing"; exit 1; }
+          od -An -c -N4 "$mikv" | grep -q "M   i   k   V"
+          # offsets 9-10: 16000 Hz default; byte 13/14/15: encodings 0/0
+          # (DEFLATE RGB565 + raw PCM) with reserved zero
+          od -An -tu1 -j9 -N2 "$mikv" | grep -Eq "128[[:space:]]+62"
+          od -An -tu1 -j13 -N3 "$mikv" | grep -Eq "^ +0[[:space:]]+0[[:space:]]+0$"
+
+      # The firmware MJPEG+Opus pairing: 24 fps + 48 kHz, 40 ms Opus packets.
+      - name: CLI mikv MJPEG+Opus pairing (-mikv -mikv-jpeg -mikv-opus)
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/holocropper" -i /tmp/ci-cli/in -o /tmp/ci-cli/out \
+            -temp-dir /tmp/ci-cli/tmp -w 100 -h 100 -fps 24 -mikv -mikv-jpeg -mikv-opus -opus-bitrate 32
+          mikv=/tmp/ci-cli/out/dance-100x100.mikv
+          test -f "$mikv" || { echo "mikv opus pairing output missing"; exit 1; }
+          # offsets 9-10: 48000 Hz; byte 13/14/15: encodings 1/1 (JPEG +
+          # OGG-Opus) with reserved zero
+          od -An -tu1 -j9 -N2 "$mikv" | grep -Eq "128[[:space:]]+187"
+          od -An -tu1 -j13 -N3 "$mikv" | grep -Eq "^ +1[[:space:]]+1[[:space:]]+0$"
+          # Every JPEG frame payload is stored raw, so the container carries
+          # at least one FFD8 SOI per frame (4 s x 24 fps = 96 frames), and
+          # the audio chunks are pages of one Ogg stream.
+          soi_count=$(od -An -tx1 "$mikv" | tr -d ' \n' | grep -o 'ffd8' | wc -l)
+          [ "$soi_count" -ge 96 ] || { echo "only $soi_count JPEG SOI markers, want >= 96"; exit 1; }
+          ogg_pages=$(od -An -c "$mikv" | tr -d ' \n' | grep -o 'OggS' | wc -l)
+          [ "$ogg_pages" -ge 3 ] || { echo "only $ogg_pages Ogg pages in the audio track"; exit 1; }
+
   rest-of-repo:
-    name: server + mikv (build, vet)
+    name: server + mikv (build, vet, test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -143,12 +179,24 @@ jobs:
             pkg/mikvformat/go.sum
             pkg/mikvserver/go.sum
 
+      - name: Install ffmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends ffmpeg
+          fi
+          ffmpeg -version | head -1
+
       - name: Build and vet the main module
         run: go build ./... && go vet ./...
 
-      - name: Build and vet pkg/mikvformat
+      - name: Build, vet and test pkg/mikvformat
         working-directory: pkg/mikvformat
-        run: go build ./... && go vet ./...
+        env:
+          HOLOCROPPER_REQUIRE_FFMPEG: "1"
+        run: |
+          go build ./... && go vet ./...
+          go test -count=1 -timeout 300s ./...
 
       - name: Build and vet pkg/mikvserver
         working-directory: pkg/mikvserver

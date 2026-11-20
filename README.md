@@ -8,10 +8,10 @@ TinyMikuServer is a specialized video streaming server designed to serve content
 
 ## Features
 
-- **Custom MikV Format**: A lightweight binary format optimized for storing synchronized video and audio frames with DEFLATE compression
+- **Custom MikV Format**: A lightweight binary format optimized for storing synchronized video and audio frames - DEFLATEd RGB565 video with raw PCM audio by default, with header-recorded payload encodings for JPEG video (MJPEG-in-MikV) and OGG-Opus audio
 - **Streaming Server**: HTTP-based server for real-time streaming of MikV content
-- **Video Converter**: Tool to convert MP4 files to the MikV format
-- **HoloCropper**: Content-aware video cropping tool for preparing hologram-style videos at any output aspect ratio (1:1, portrait, landscape), with auto-orient and walk mode - plus a **fit mode** (`-fit`) for non-hologram videos: whole-frame scale-to-fit with black bars
+- **Video Converter**: Tool to convert MP4 files to the MikV format, including `-jpeg` and `-opus` payload encodings
+- **HoloCropper**: Content-aware video cropping tool for preparing hologram-style videos at any output aspect ratio (1:1, portrait, landscape), with auto-orient and walk mode - plus a **fit mode** (`-fit`) for non-hologram videos: whole-frame scale-to-fit with black bars - and **MikV output** (`-mikv`) that writes the firmware container straight from the render, MJPEG+OGG-Opus pairing included
 - **Optimized for Edge Devices**: Designed for efficient streaming to embedded systems and IoT devices
 
 ## Project Structure
@@ -23,6 +23,7 @@ TinyMikuServer/
 ├── pkg/
 │   ├── mikvformat/        # MikV format library
 │   │   ├── MikVFormat.go  # Core format implementation
+│   │   ├── ogg_opus.go    # OGG-Opus per-frame segmentation
 │   │   └── cmd/
 │   │       └── mikv-converter/  # MP4 to MikV converter CLI
 │   ├── mikvserver/        # HTTP streaming server
@@ -32,6 +33,7 @@ TinyMikuServer/
 │       ├── analysis.go    # Analyze pass (prepare + detect, cached)
 │       ├── plan.go        # NewPlan: in-process framing replay
 │       ├── renders.go     # RenderPreview / RenderFinal passes
+│       ├── mikv.go        # RenderMikV pass (MikV container output)
 │       └── cmd/
 │           └── holocropper/     # HoloCropper CLI (drives those passes)
 ├── bin/                   # Compiled binaries (generated)
@@ -119,7 +121,13 @@ Options:
 - `-sampleRate`: Audio sample rate (default: 16000)
 - `-channels`: Number of audio channels (default: 1)
 - `-bitsPerSample`: Audio bits per sample (default: 16)
+- `-jpeg`: Store video frames as JPEG (video encoding `0x01`, MJPEG-in-MikV) instead of DEFLATEd RGB565
+- `-jpeg-quality`: JPEG quality for `-jpeg` frames (default: 90)
+- `-opus`: Store audio as OGG-Opus cut into per-frame segments (audio encoding `0x01`) instead of raw PCM; forces `-sampleRate 48000`
+- `-opus-bitrate`: libopus bitrate in kbps for `-opus` audio (default: encoder's own)
 - `-silent`: Disable verbose output
+
+Leaving `-jpeg`/`-opus` off produces the original encoding exactly. The firmware pairing for the compressed variants is **24 fps video + 48 kHz OGG-Opus audio** (40 ms packets).
 
 ### 3. Cropping Videos with HoloCropper
 
@@ -143,10 +151,13 @@ Options:
 - `-max-zoom`: Maximum zoom-in factor (0 = default 2.0)
 - `-auto-orient`: Pick portrait (`HxW`) or landscape (`WxH`) output orientation from the subjects' aspect ratios; skipped for 1:1 outputs. With `-fit` it instead picks the orientation with the least bars
 - `-fit`: **Fit mode** for non-hologram videos: scale the whole frame to fit the output resolution, centered on black bars - no content-aware crop, no zoom
+- `-mikv`: Write the final output as a **MikV container** (the firmware format) instead of mp4; the file is `<basename>-<WxH>.mikv`
+- `-mikv-jpeg`: With `-mikv`: store video frames as JPEG (video encoding `0x01`, MJPEG-in-MikV) instead of DEFLATEd RGB565; `-jpeg-quality` sets the quality (default 90)
+- `-mikv-opus`: With `-mikv`: store audio as OGG-Opus cut into per-frame segments (audio encoding `0x01`) instead of raw PCM; uses 48000 Hz audio, `-opus-bitrate` in kbps overrides the encoder default
 - `-temp-dir`: Scratch + analysis-cache parent (default: the system temp dir). Cached analyses make repeated renders of an unchanged video skip the detect pass entirely
 - `-ffmpeg-path`: Path to the ffmpeg binary (default: `ffmpeg` from `PATH`)
 
-Output keeps the legacy naming: `<input basename>.mp4` in `-o`, overwritten on re-render.
+Output keeps the legacy naming: `<input basename>.mp4` in `-o`, overwritten on re-render (`-mikv` instead writes the dimension-tagged `<basename>-<WxH>.mikv`).
 
 Setting `HOLOCROPPER_DEBUG_BOXES=boxes.csv` writes a per-frame framing log (subject box, smoothed box, applied crop) for verification.
 
@@ -167,6 +178,20 @@ Not every job is a hologram crop. A normal music video or full-frame clip should
 - `-auto-orient` with `-fit` becomes pure geometry: the orientation whose aspect is closer to the source's gets fewer bars, and the CLI prints both bar coverages. Unlike crop-mode auto-orient, it decides the same way on videos with no detectable subjects.
 - Matching aspects (e.g. 16:9 source to a 16:9-shaped target) produce an exact resize with no bars at all.
 - The API entry points are `holocropper.NewFitPlan(...)` or `Settings{FitWithBars: true}`; previews and renders treat fit and crop plans as different products (their `SettingsHash` values never match). See [HOLOCROPPER-API-PLAN.md](HOLOCROPPER-API-PLAN.md) §6.10.
+
+#### MikV output (`-mikv`)
+
+The last step of the asset pipeline is usually `mikv-converter`. `-mikv` folds that step into the render: the planned frames are written straight into a MikV container, no intermediate mp4. The framing is identical to a normal render - crop, auto-orient, walk mode and fit mode all apply - only the output *container* changes.
+
+```bash
+./bin/holocropper -i mv.mp4 -o ./assets/mp4 -w 240 -h 240 -fps 20 -mikv                      # legacy encodings: DEFLATE RGB565 + raw PCM
+./bin/holocropper -i mv.mp4 -o ./assets/mp4 -w 240 -h 240 -fps 24 -mikv -mikv-jpeg -mikv-opus  # MJPEG + OGG-Opus (40 ms packets at 48 kHz)
+```
+
+- The default output carries the original encodings (header bytes 13/14 = `0x00`/`0x00`): DEFLATEd RGB565 video, raw PCM at 16000 Hz mono 16-bit - exactly what the firmware reads today.
+- `-mikv-jpeg` stores one complete JPEG per frame (video encoding `0x01`); `-mikv-opus` stores the audio as one ordinary OGG-Opus stream cut at page boundaries into one chunk per frame (audio encoding `0x01`). Concatenating a file's audio chunks reproduces a plain `.ogg` - a decoder needs no MikV knowledge to play it.
+- MikV stores an integral frame rate: `-fps` must be whole. Raw PCM chunks are fixed-length (`sampleRate/fps` samples), so with PCM audio the sample rate must divide the fps; the recommended compressed pairing is **24 fps + 48 kHz**, where everything divides (40 ms Opus packets).
+- The API entry point is `analysis.RenderMikV(ctx, plan, MikVRequest{...})` with `MikVOptions` selecting the encodings; it shares the render slot with previews and the mp4 render. See [HOLOCROPPER-API-PLAN.md](HOLOCROPPER-API-PLAN.md) §6.11.
 
 #### Walk mode (landscape to landscape)
 
@@ -270,6 +295,8 @@ The MikV format is a custom binary format optimized for synchronized video and a
 - **Audio Bits per Sample**: 16
 - **Compression**: DEFLATE (zlib)
 
+For the compressed variants (JPEG video + OGG-Opus audio) the recommended pairing is **24 FPS + 48000 Hz audio** - the Opus packet duration then lands on exactly 40 ms per video frame.
+
 ### File Structure
 
 ```
@@ -277,6 +304,8 @@ The MikV format is a custom binary format optimized for synchronized video and a
 ```
 
 #### Header Format (16 bytes)
+
+All integers are little-endian.
 
 | Offset | Size | Type   | Description                  |
 |--------|------|--------|------------------------------|
@@ -286,15 +315,30 @@ The MikV format is a custom binary format optimized for synchronized video and a
 | 7      | 2    | uint16 | Video frame width            |
 | 9      | 2    | uint16 | Audio sample rate            |
 | 11     | 1    | uint8  | Audio channels               |
-| 12     | 2    | uint16 | Audio bits per sample        |
-| 14     | 2    | uint16 | Reserved (padding)           |
+| 12     | 1    | uint8  | Audio bits per sample        |
+| 13     | 1    | uint8  | Video encoding               |
+| 14     | 1    | uint8  | Audio encoding               |
+| 15     | 1    | uint8  | Reserved (always zero)       |
+
+Original MikV files wrote zeros into the reserved padding, so offsets 13-15 read as encoding `0x00` - the legacy encodings - for every pre-existing file. Readers must reject unknown encoding IDs: a payload read under the wrong encoding is silent garbage.
+
+| Video encoding (byte 13) | Payload                                            |
+|--------------------------|----------------------------------------------------|
+| `0x00`                   | DEFLATE (zlib) compressed RGB565 frame (legacy default) |
+| `0x01`                   | One complete JPEG image per frame (MJPEG-in-MikV)  |
+
+| Audio encoding (byte 14) | Payload                                            |
+|--------------------------|----------------------------------------------------|
+| `0x00`                   | Raw interleaved PCM, `sampleRate / FPS` samples per frame (legacy default) |
+| `0x01`                   | OGG-Opus page segments: the audio track is ONE ordinary Ogg Opus stream, cut at page boundaries into one chunk per video frame (variable-length; chunks may be empty). Concatenating every audio chunk in file order reproduces the original `.ogg` byte for byte |
 
 #### Frame Structure
 
 Each frame contains:
-- **Video Size** (4 bytes): uint32 - Size of compressed video data
-- **Video Data** (variable): DEFLATE compressed RGB565 frame
-- **Audio Data** (fixed): Raw PCM audio samples
+- **Video Size** (4 bytes): uint32 - Size of the encoded video data
+- **Video Data** (variable): the payload per byte 13 of the header
+- **Audio Size** (4 bytes): uint32 - Size of the encoded audio data
+- **Audio Data** (variable): the payload per byte 14 of the header
 
 ## API Reference
 
@@ -304,14 +348,22 @@ Each frame contains:
 // Create a new MikV format instance
 mikv := mikvformat.NewMikVFormat()
 
-// Load from file
+// Load from file (header encoding IDs are validated; frames carry
+// VideoEncoding/AudioEncoding stamps)
 mikv.Load("path/to/file.mikv")
 
 // Save to file
 mikv.Save("path/to/output.mikv")
 
-// Create from MP4
-mikv.FromMP4("path/to/video.mp4")
+// Create from MP4. Defaults: DEFLATE RGB565 + raw PCM. For the
+// compressed variants set the encoding IDs first:
+mikv.VideoEncoding = mikvformat.EncodingJPEG    // MJPEG-in-MikV
+mikv.AudioEncoding = mikvformat.EncodingOGGOpus // 48 kHz granule clock
+mikv.LoadFromMP4("path/to/video.mp4")
+
+// Split one OGG-Opus stream into per-video-frame chunks (and back):
+chunks, err := mikvformat.SplitOGGOpus(oggBytes, fps, frames)
+ogg := mikvformat.JoinOGGChunks(chunks)
 
 // Stream frames
 frameChan := make(chan mikvformat.MikVFrame)
@@ -331,6 +383,11 @@ server.Stream <- frame
 // Stop server
 server.Stop()
 ```
+
+The `/video` endpoint announces the file's payload encodings in the response
+headers `X-Video-Encoding` and `X-Audio-Encoding` (the header byte 13/14
+values), so clients pick the right decoder per frame. Encoding `0` is the
+legacy default, so pre-existing clients see identical bytes.
 
 ### HoloCropper
 
@@ -367,6 +424,18 @@ finalTask, err := analysis.RenderFinal(ctx, plan, holocropper.RenderRequest{
 	OutputDir: "output", TempDir: "./tmp",
 })
 res, err := finalTask.Wait() // <basename>-<WxH>.mp4; OutputName overrides it
+
+// MikV output (§6.11): the same planned frames written straight into the
+// firmware container. Zero Options = the legacy encodings.
+mikvTask, err := analysis.RenderMikV(ctx, plan, holocropper.MikVRequest{
+	OutputDir: "output", TempDir: "./tmp",
+	Options: holocropper.MikVOptions{
+		VideoJPEG: true,          // header byte 13 = 0x01
+		AudioOpus: true,          // header byte 14 = 0x01, 48 kHz
+		OpusBitrateKbps: 32,
+	},
+})
+mres, err := mikvTask.Wait() // <basename>-<WxH>.mikv; OutputName overrides it
 ```
 
 ## Development
@@ -379,7 +448,7 @@ go test ./...                          # server + MikV packages
 cd pkg/holocropper && go test ./...    # HoloCropper is a separate Go module
 ```
 
-CI (`.github/workflows/ci.yml`) runs the holocropper suite with `-race` plus a CLI legacy-naming smoke, entirely on lavfi-synthesized fixture videos and the golden parity CSVs (one per ffmpeg major version, matched to the pinned CI image) - no corpus clips needed. Set `HOLOCROPPER_REQUIRE_FFMPEG=1` to make a missing ffmpeg fail the fixture tests instead of skipping them (CI sets it). If the pinned image's ffmpeg stops reproducing its golden, dispatch the CI workflow with `regenerate_golden=true` - it re-records the goldens on the runner's own ffmpeg build and uploads them as an artifact to review and commit (or run `HOLOCROPPER_REGENERATE_GOLDEN=1 go test -run TestReplayParityVsDebugCSV` locally with the ffmpeg you use).
+CI (`.github/workflows/ci.yml`) runs the holocropper suite with `-race` plus CLI smokes for legacy naming, fit mode and MikV output (header bytes checked raw on the rendered container), entirely on lavfi-synthesized fixture videos and the golden parity CSVs (one per ffmpeg major version, matched to the pinned CI image) - no corpus clips needed. It also runs the `pkg/mikvformat` suite, whose OGG-Opus tests encode real `ffmpeg -c:a libopus` streams. Set `HOLOCROPPER_REQUIRE_FFMPEG=1` to make a missing ffmpeg fail those tests instead of skipping them (CI sets it). If the pinned image's ffmpeg stops reproducing its golden, dispatch the CI workflow with `regenerate_golden=true` - it re-records the goldens on the runner's own ffmpeg build and uploads them as an artifact to review and commit (or run `HOLOCROPPER_REGENERATE_GOLDEN=1 go test -run TestReplayParityVsDebugCSV` locally with the ffmpeg you use).
 
 ### Cleaning Build Artifacts
 
