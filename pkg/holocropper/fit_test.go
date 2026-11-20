@@ -228,6 +228,7 @@ func TestRenderFinalFitBars(t *testing.T) {
 		"-f", "lavfi", "-i", fmt.Sprintf("color=c=gray:s=%dx%d:d=%d:r=%d", fixtureW, fixtureH, fixtureSeconds, fixtureFPS),
 		"-f", "lavfi", "-i", fmt.Sprintf("sine=frequency=440:duration=%d", fixtureSeconds),
 		"-map", "0:v", "-map", "1:a",
+		"-x264-params", "cpu-independent=1",
 		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
 		fixture)
 	if out, err := cmd.CombinedOutput(); err != nil {

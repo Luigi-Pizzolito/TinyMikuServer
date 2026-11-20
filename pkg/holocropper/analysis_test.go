@@ -61,6 +61,12 @@ func buildFixture(t *testing.T, ffmpegPath, dir string) string {
 		"-f", "lavfi", "-i", fmt.Sprintf("sine=frequency=440:duration=%d", fixtureSeconds),
 		"-filter_complex", "[0:v][1:v]overlay=x='60+90*t':y=240,format=yuv420p[v]",
 		"-map", "[v]", "-map", "2:a",
+		// cpu-independent + bitexact: the fixture itself must be machine-
+		// deterministic too - the golden pins detection over THIS encode,
+		// and x264's asm decisions differ per CPU the same way the
+		// pipeline's did (that was the second CI run's real root cause).
+		"-x264-params", "cpu-independent=1",
+		"-sws_flags", "accurate_rnd+bitexact",
 		"-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-shortest",
 		out,
 	}
