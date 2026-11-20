@@ -181,7 +181,7 @@ flowchart LR
   PLAN -. "debug hook: HOLOCROPPER_DEBUG_BOXES" .-> CSV["per-frame framing CSV"]
 ```
 
-`Analyze` measures one **master bbox** per frame (covering all detected subjects) and caches it. `NewPlan` replays the framing controller over those bboxes - so changing `-w`, `-h`, `-zoom-margin` or `-auto-orient` costs a millisecond-scale replay, not a re-decode - and `RenderFinal`/`RenderPreview` execute the plan's crop rectangles against the cached analysis video. The replay is provably the old pipeline's decision stream: `TestReplayParityVsDebugCSV` pins it, frame for frame, against the fused pipeline's own golden CSV.
+`Analyze` measures one **master bbox** per frame (covering all detected subjects) and caches it. `NewPlan` replays the framing controller over those bboxes - so changing `-w`, `-h`, `-zoom-margin` or `-auto-orient` costs a millisecond-scale replay, not a re-decode - and `RenderFinal`/`RenderPreview` execute the plan's crop rectangles against the cached analysis video. The replay is provably the old pipeline's decision stream: `TestReplayParityVsDebugCSV` pins it, frame for frame, against the fused pipeline's own golden CSV - one golden per ffmpeg major version, since the decision stream follows that build's encode/decode behavior.
 
 The framing controller owns every per-frame decision: subject smoothing, the aspect-locked target geometry, and three plant controllers (pan X, pan Y, zoom):
 
@@ -361,7 +361,7 @@ go test ./...                          # server + MikV packages
 cd pkg/holocropper && go test ./...    # HoloCropper is a separate Go module
 ```
 
-CI (`.github/workflows/ci.yml`) runs the holocropper suite with `-race` plus a CLI legacy-naming smoke, entirely on lavfi-synthesized fixture videos and the committed golden parity CSV - no corpus clips needed. Set `HOLOCROPPER_REQUIRE_FFMPEG=1` to make a missing ffmpeg fail the fixture tests instead of skipping them (CI sets it).
+CI (`.github/workflows/ci.yml`) runs the holocropper suite with `-race` plus a CLI legacy-naming smoke, entirely on lavfi-synthesized fixture videos and the golden parity CSVs (one per ffmpeg major version, matched to the pinned CI image) - no corpus clips needed. Set `HOLOCROPPER_REQUIRE_FFMPEG=1` to make a missing ffmpeg fail the fixture tests instead of skipping them (CI sets it). If the pinned image's ffmpeg stops reproducing its golden, dispatch the CI workflow with `regenerate_golden=true` - it re-records the goldens on the runner's own ffmpeg build and uploads them as an artifact to review and commit (or run `HOLOCROPPER_REGENERATE_GOLDEN=1 go test -run TestReplayParityVsDebugCSV` locally with the ffmpeg you use).
 
 ### Cleaning Build Artifacts
 

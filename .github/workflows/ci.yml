@@ -2,14 +2,31 @@ name: CI
 
 # Corpus-free by design: every fixture in pkg/holocropper is synthesized with
 # ffmpeg's lavfi sources (buildFixture), and framing parity is held by the
-# committed golden CSV (pkg/holocropper/testdata). No asset video is needed or
-# read. HOLOCROPPER_REQUIRE_FFMPEG makes a missing ffmpeg a FAILURE rather than
-# a silent skip of the fixture tests.
+# golden CSVs in pkg/holocropper/testdata, one per ffmpeg MAJOR version
+# (the decision stream follows the encode/decode + scaler artifacts of the
+# ffmpeg build, which drift by a pixel between majors). No asset video is
+# needed or read. HOLOCROPPER_REQUIRE_FFMPEG makes a missing ffmpeg a FAILURE
+# rather than a silent skip of the fixture tests.
+#
+# The holocropper job pins ubuntu-24.04 so its apt ffmpeg stays the version
+# the ffmpeg6 golden was recorded on. If GitHub ever changes this image's
+# ffmpeg major, the parity test fails with the exact regeneration command
+# (HOLOCROPPER_REGENERATE_GOLDEN=1) - commit the new golden it names.
 
 on:
   push:
     branches: [main, "feat/**"]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      regenerate_golden:
+        description: >-
+          Record the parity goldens with this runner's ffmpeg build and upload
+          them as an artifact - download, review the diff, commit. Use when
+          the pinned image's ffmpeg no longer reproduces a committed golden
+          (the decision stream follows the build's encode/decode behavior).
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -18,7 +35,8 @@ concurrency:
 jobs:
   holocropper:
     name: holocropper (-race, golden parity, CLI smoke)
-    runs-on: ubuntu-latest
+    # Pinned: the ffmpeg6 golden was recorded against this image's ffmpeg.
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: pkg/holocropper
@@ -56,6 +74,15 @@ jobs:
 
       - name: Test
         run: go test -count=1 -race -timeout 600s ./...
+        env:
+          HOLOCROPPER_REGENERATE_GOLDEN: ${{ inputs.regenerate_golden && '1' || '' }}
+
+      - name: Upload regenerated goldens
+        if: inputs.regenerate_golden
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-goldens
+          path: pkg/holocropper/testdata/*.csv
 
       # Backwards-compatibility smoke: legacy flags in, legacy file name out.
       # Also proves the second render of an unchanged input hits the analysis
