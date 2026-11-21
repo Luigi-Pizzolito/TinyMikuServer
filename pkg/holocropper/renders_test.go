@@ -999,3 +999,67 @@ func TestRenderPreviewMuxChoice(t *testing.T) {
 		t.Errorf("Previews() mux labels = %+v, want one mjpeg and one vp9-webm", seen)
 	}
 }
+
+// previewGOPSeconds is the frame-chronology law the vp9-webm preview mux
+// enforces: a Chromium-playable preview re-anchors its keyframes at least
+// every two seconds. previewGOPFrames converts that to frames without ever
+// proposing a GOP ffmpeg rejects.
+func TestPreviewGOPFramesLaw(t *testing.T) {
+	for _, tc := range []struct {
+		fps  float64
+		want int
+	}{{24, 48}, {30, 60}, {12.5, 25}, {1, 2}, {0, 2}, {0.4, 2}, {23.6, 47}} {
+		if got := previewGOPFrames(tc.fps); got != tc.want {
+			t.Errorf("previewGOPFrames(%v) = %d, want %d", tc.fps, got, tc.want)
+		}
+	}
+}
+
+// TestRenderPreviewVP9GOPChains pins the decode-compatibility reason the GOP
+// cap exists: the standard fixture is 4 seconds, so a default-keyint vp9 pass
+// renders it as ONE inter-frame chain. Chromium's VP9 decoder refuses such a
+// preview (MEDIA_ERR_DECODE straight after loadedmetadata, while libvpx and
+// ffvp9 read the same bytes fine) - so every chain in a preview must be at
+// most previewGOPSeconds long, which a keyframe interval proves.
+func TestRenderPreviewVP9GOPChains(t *testing.T) {
+	ffmpeg := requireFFmpeg(t)
+	a, p := setupRenderFixture(t, ffmpeg, 240, 240)
+
+	task, err := a.RenderPreview(context.Background(), p, PreviewRequest{
+		FFmpegPath: ffmpeg,
+		Options:    PreviewOptions{Kind: PreviewCrop, MuxVideo: PreviewMuxVP9WebM},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vp9, err := task.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyframes := countVideoKeyframes(t, vp9.CropVideoPath)
+	if keyframes < 2 {
+		t.Errorf("vp9 preview %s carries %d keyframe(s): a whole preview would hang off one inter-frame chain, and Chromium refuses exactly those",
+			vp9.CropVideoPath, keyframes)
+	}
+}
+
+// countVideoKeyframes counts the packets ffprobe flags as keyframes.
+func countVideoKeyframes(t *testing.T, path string) int {
+	t.Helper()
+	ffprobe, err := exec.LookPath("ffprobe")
+	if err != nil {
+		t.Fatalf("ffprobe is not on PATH and this test pins the keyframe interval: %v", err)
+	}
+	out, err := exec.Command(ffprobe, "-v", "error", "-select_streams", "v:0",
+		"-show_entries", "packet=flags", "-of", "csv=p=0", path).Output()
+	if err != nil {
+		t.Fatalf("ffprobe %s: %v", path, err)
+	}
+	n := 0
+	for _, flags := range strings.Fields(string(out)) {
+		if strings.Contains(flags, "K") {
+			n++
+		}
+	}
+	return n
+}

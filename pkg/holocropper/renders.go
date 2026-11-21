@@ -50,7 +50,22 @@ const previewRetention = 3
 const (
 	previewVP9CRF     = 30
 	previewVP9CPUUsed = 4
+	previewGOPSeconds = 2
 )
+
+// previewGOPFrames is the keyframe interval the vp9-webm preview mux hands
+// ffmpeg: two seconds of frames. Chromium's VP9 decoder refuses single-GOP
+// previews long enough to be one continuous inter-frame chain (see
+// muxFrameSequence), so the encode re-anchors every previewGOPSeconds no
+// matter how short the clip is. Never below 2 - ffmpeg rejects -g 1 as a
+// GOP size.
+func previewGOPFrames(fps float64) int {
+	g := int(math.Round(fps * previewGOPSeconds))
+	if g < 2 {
+		g = 2
+	}
+	return g
+}
 
 const previewsSubdir = "previews"
 
@@ -557,9 +572,20 @@ func muxFrameSequence(ctx context.Context, ffmpegPath, framesDir, audioSource st
 	if mux == PreviewMuxVP9WebM {
 		// Constant-quality VP9 with a deadline the preview pass can actually
 		// afford: a preview is a framing check, not an archive master.
+		//
+		// -g is not cosmetics. libvpx's default keyint (128) covers a short
+		// clip with ONE keyframe, and the whole clip then hangs off one long
+		// inter-frame chain. Chromium/blink's VP9 decoder refuses exactly
+		// those chains for some content (MEDIA_ERR_DECODE right after
+		// loadedmetadata, while every other decoder - libvpx itself included -
+		// reads the file fine). A preview is played in a browser, so the key
+		// interval is capped at two seconds of frames: measured on the QA
+		// rig, a 48-frame chain plays and the 96-frame single-GOP build of
+		// the same content does not.
 		args = append(args, "-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p",
 			"-crf", strconv.Itoa(previewVP9CRF), "-b:v", "0",
-			"-deadline", "good", "-cpu-used", strconv.Itoa(previewVP9CPUUsed))
+			"-deadline", "good", "-cpu-used", strconv.Itoa(previewVP9CPUUsed),
+			"-g", strconv.Itoa(previewGOPFrames(fps)))
 	} else {
 		args = append(args, "-c:v", "mjpeg", "-q:v", "6")
 	}
