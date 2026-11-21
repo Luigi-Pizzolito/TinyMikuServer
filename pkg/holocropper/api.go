@@ -259,6 +259,7 @@ type Phase string
 const (
 	PhasePrepare       Phase = "prepare"        // ffmpeg analysis re-encode
 	PhaseDetect        Phase = "detect"         // subject detection pass
+	PhaseProbe         Phase = "probe"          // fit-mode geometry pass: frame count + clock, no detection
 	PhasePreviewFrames Phase = "preview_frames" // crop+overlay JPEG pass
 	PhasePreviewMux    Phase = "preview_mux"    // ffmpeg preview mux
 	PhaseRenderFrames  Phase = "render_frames"  // final crop JPEG pass
@@ -324,14 +325,41 @@ type AnalysisStatus struct {
 // ---------------------------------------------------------------------------
 // Requests
 
-// AnalyzeRequest drives the prepare+detect pass.
+// AnalyzeMode selects WHAT the analysis pass runs (mode-aware analysis law,
+// plan §2/U1). The mode is not part of the cache identity: one cache dir per
+// (input, analysis height) is resumable across modes - a fit cache re-Analyzed
+// with crop mode keeps its analysis video and runs only the detect phase.
+type AnalyzeMode string
+
+const (
+	// AnalyzeCrop is the full pass: prepare + subject detection. An empty
+	// Mode means crop (the pre-mode API behavior).
+	AnalyzeCrop AnalyzeMode = "crop"
+	// AnalyzeFit is the fit-mode pass: prepare + a geometry probe, NO subject
+	// detection. The stream carries one subject-less sample per analysis
+	// frame, so plan replay, previews and every render product run against it
+	// exactly like a detected stream - the fit transform never touches the
+	// image, so it never needed the detection.
+	AnalyzeFit AnalyzeMode = "fit"
+)
+
+// AnalyzeRequest drives the analysis pass.
 type AnalyzeRequest struct {
-	Input          string    `json:"input"`           // input video file
-	TempDir        string    `json:"temp_dir"`        // required: cache + scratch parent
-	FFmpegPath     string    `json:"ffmpeg_path"`     // "" = "ffmpeg" from PATH
-	AnalysisHeight int       `json:"analysis_height"` // 0 = 480; part of the cache key
-	KeepWorkDir    bool      `json:"keep_work_dir"`   // debug: leave scratch on failure/cancel
-	Observer       *Observer `json:"-"`
+	Input          string      `json:"input"`           // input video file
+	TempDir        string      `json:"temp_dir"`        // required: cache + scratch parent
+	FFmpegPath     string      `json:"ffmpeg_path"`     // "" = "ffmpeg" from PATH
+	AnalysisHeight int         `json:"analysis_height"` // 0 = 480; part of the cache key
+	Mode           AnalyzeMode `json:"mode"`            // "" = crop (prepare+detect); fit = no detection
+	KeepWorkDir    bool        `json:"keep_work_dir"`   // debug: leave scratch on failure/cancel
+	Observer       *Observer   `json:"-"`
+}
+
+// normalizedMode resolves the "" default to the crop pass.
+func (r AnalyzeRequest) normalizedMode() AnalyzeMode {
+	if r.Mode == AnalyzeFit {
+		return AnalyzeFit
+	}
+	return AnalyzeCrop
 }
 
 // Validate reports ALL field violations at once (filesystem existence is
@@ -346,6 +374,12 @@ func (r AnalyzeRequest) Validate() []ValidationError {
 	}
 	if r.AnalysisHeight != 0 && r.AnalysisHeight < 16 {
 		errs = append(errs, ValidationError{Field: "analysis_height", Reason: "must be 0 (default 480) or at least 16"})
+	}
+	switch r.Mode {
+	case "", AnalyzeCrop, AnalyzeFit:
+	default:
+		errs = append(errs, ValidationError{Field: "mode",
+			Reason: fmt.Sprintf("must be %q, %q or \"\" for the crop default (got %q)", AnalyzeCrop, AnalyzeFit, r.Mode)})
 	}
 	return errs
 }

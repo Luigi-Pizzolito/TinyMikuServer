@@ -892,6 +892,12 @@ func RenderWhole(ctx context.Context, req AnalyzeRequest, settings Settings, ren
 	if errs := renderReq.Validate(); len(errs) > 0 {
 		return nil, &SettingsError{Errors: errs}
 	}
+	// Fit settings never touch the image, so they need no detection: a
+	// one-shot fit render picks the fit analysis mode unless the caller named
+	// one explicitly.
+	if req.Mode == "" && settings.FitWithBars {
+		req.Mode = AnalyzeFit
+	}
 
 	task, err := Analyze(ctx, req)
 	if err != nil {

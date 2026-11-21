@@ -30,11 +30,21 @@ under the caller's TempDir, live-queryable while running.
 		meta.json       cache identity (input path/mtime/size, analysis height,
 		                geometry, frame alignment)
 
-The cache key is sha256(input path | mtime | size | analysis height | "pt1")
+ The cache key is sha256(input path | mtime | size | analysis height | "pt1")
 so a re-Analyze of an unchanged input hits the cache and a modified input
 misses. Analyze is last-call-wins per cache key: a new Analyze supersedes the
 running one (Task slot semantics), and while a pass runs PartialStream()
-exposes the frames detected so far for live planning. */
+exposes the frames detected so far for live planning.
+
+Mode law (plan §2/U1): AnalyzeRequest.Mode selects the pass - crop (default)
+runs prepare+detect; fit runs prepare + a geometry probe and NO detection,
+streaming one subject-less sample per analysis frame instead of measured
+boxes. The fit transform never reads the detection, so fit plan replay,
+previews and every render product run against the synthetic stream unchanged.
+The cache is resumable across modes: meta.json records detected:true|false,
+and a crop Analyze over a fit cache skips prepare and runs only the detect
+phase over the already-cached analysis video. Switching the other way needs
+no work at all: any complete cache answers a fit Analyze immediately. */
 
 // ---------------------------------------------------------------------------
 // Detection stream
@@ -225,7 +235,10 @@ func (s DetectionStream) AnalysisVideoPath() string {
 
 // analysisFormatVersion bumps when meta.json or stream.bin.gz layout changes;
 // caches of older formats are treated as misses.
-const analysisFormatVersion = 1
+// v2 (mode-aware analysis, plan §2/U1): meta.json carries "detected"
+// (true = the stream holds measured boxes; false = fit-mode synthetic
+// geometry samples, resumable with a detect-only pass).
+const analysisFormatVersion = 2
 
 // frameAlignmentTag names the prepare encoding mode (§4/S13): frame indices
 // map 1:1 between source, analysis video and stream. Part of the cache key
@@ -239,20 +252,25 @@ const (
 )
 
 type analysisMeta struct {
-	FormatVersion  int       `json:"format_version"`
-	Key            string    `json:"key"`
-	Input          string    `json:"input"`
-	InputMTimeNS   int64     `json:"input_mtime_ns"`
-	InputSizeBytes int64     `json:"input_size_bytes"`
-	AnalysisHeight int       `json:"analysis_height"` // the rounded-even value actually encoded
-	AnalysisW      int       `json:"analysis_w"`
-	AnalysisH      int       `json:"analysis_h"`
-	SourceW        int       `json:"source_w"`
-	SourceH        int       `json:"source_h"`
-	Frames         int       `json:"frames"`
-	FPS            float64   `json:"fps"`
-	Alignment      string    `json:"frame_alignment"`
-	CreatedAt      time.Time `json:"created_at"`
+	FormatVersion  int     `json:"format_version"`
+	Key            string  `json:"key"`
+	Input          string  `json:"input"`
+	InputMTimeNS   int64   `json:"input_mtime_ns"`
+	InputSizeBytes int64   `json:"input_size_bytes"`
+	AnalysisHeight int     `json:"analysis_height"` // the rounded-even value actually encoded
+	AnalysisW      int     `json:"analysis_w"`
+	AnalysisH      int     `json:"analysis_h"`
+	SourceW        int     `json:"source_w"`
+	SourceH        int     `json:"source_h"`
+	Frames         int     `json:"frames"`
+	FPS            float64 `json:"fps"`
+	Alignment      string  `json:"frame_alignment"`
+	// Detected is the resume law (v2): true when the stream carries measured
+	// subject boxes, false when it carries fit-mode synthetic samples - the
+	// analysis video is still the full frame-aligned encode either way, so a
+	// later crop Analyze runs only the detect phase over it.
+	Detected  bool      `json:"detected"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // resolvedAnalyze is the validated, cache-keyed form of an AnalyzeRequest.
@@ -405,6 +423,12 @@ func (a *Analysis) AnalysisVideoPath() string { return filepath.Join(a.dir, anal
 // Dir is the analysis cache dir under the caller's TempDir.
 func (a *Analysis) Dir() string { return a.dir }
 
+// Detected reports whether this analysis ran the subject-detect pass. A
+// fit-mode analysis (false) still holds the full frame-aligned analysis video
+// and a complete geometry stream - a later crop Analyze on the same cache key
+// resumes with the detect phase only.
+func (a *Analysis) Detected() bool { return a.meta.Detected }
+
 // Evict deletes the cache dir and forgets the registry entry (cancelling
 // any analyze pass still running for it).
 func (a *Analysis) Evict() error {
@@ -486,10 +510,16 @@ func (t *AnalysisTask) completedAnalysis() *Analysis {
 	return t.analysis
 }
 
-// Analyze starts (or reuses) the prepare+detect pass for req. Last call
-// wins per cache key: a running Analyze for the same input + analysis
-// height is superseded by this one. A valid cache hit completes the Task
-// immediately without running any pass.
+// Analyze starts (or reuses) the analysis pass for req. Last call wins per
+// cache key: a running Analyze for the same input + analysis height is
+// superseded by this one. A valid cache hit completes the Task immediately
+// without running any pass. Mode-aware (plan §2/U1):
+//   - fit over any complete cache: immediate hit (geometry is there; fit
+//     never needed the detection).
+//   - crop over a detected cache: immediate hit, as before.
+//   - crop over a fit-skipped cache: RESUME - the cached analysis video is
+//     already the frame-aligned encode this key produced, so only the detect
+//     phase runs. If the analysis video vanished, the pass re-runs whole.
 func Analyze(ctx context.Context, req AnalyzeRequest) (*AnalysisTask, error) {
 	if errs := req.Validate(); len(errs) > 0 {
 		return nil, &SettingsError{Errors: errs}
@@ -509,25 +539,34 @@ func Analyze(ctx context.Context, req AnalyzeRequest) (*AnalysisTask, error) {
 	}
 	entry.slot.install(task.taskBase)
 
+	resumeFrom := (*Analysis)(nil)
 	if a := entry.canonical(ra); a != nil {
-		// Cache hit: adopt the cached stream into the Task's partial stream
-		// and complete immediately - no ffmpeg, no detect.
-		src := a.stream
-		src.mu.RLock()
-		task.data.samples = make([]streamSample, len(src.samples))
-		copy(task.data.samples, src.samples)
-		task.data.analysisW, task.data.analysisH = src.analysisW, src.analysisH
-		task.data.srcW, task.data.srcH = src.srcW, src.srcH
-		task.data.fps, task.data.complete = src.fps, src.complete
-		src.mu.RUnlock()
-		task.mu.Lock()
-		task.analysis = a
-		task.mu.Unlock()
-		task.finish(nil)
-		return task, nil
+		if req.normalizedMode() == AnalyzeFit || a.meta.Detected {
+			// Cache hit: adopt the cached stream into the Task's partial
+			// stream and complete immediately - no ffmpeg, no detect.
+			src := a.stream
+			src.mu.RLock()
+			task.data.samples = make([]streamSample, len(src.samples))
+			copy(task.data.samples, src.samples)
+			task.data.analysisW, task.data.analysisH = src.analysisW, src.analysisH
+			task.data.srcW, task.data.srcH = src.srcW, src.srcH
+			task.data.fps, task.data.complete = src.fps, src.complete
+			task.data.videoPath = src.videoPath
+			src.mu.RUnlock()
+			task.mu.Lock()
+			task.analysis = a
+			task.mu.Unlock()
+			task.finish(nil)
+			return task, nil
+		}
+		// crop over a fit-skipped cache: resume where the fit pass stopped.
+		if st, serr := os.Stat(a.AnalysisVideoPath()); serr == nil && st.Size() > 0 {
+			resumeFrom = a
+		}
+		// No usable analysis video (partial state): fall through to a full pass.
 	}
 
-	go runAnalyze(entry, task, req, ra)
+	go runAnalyze(entry, task, req, ra, resumeFrom)
 	return task, nil
 }
 
@@ -546,8 +585,11 @@ func CachedAnalysis(input, tempDir string, analysisHeight int) (*Analysis, error
 }
 
 // runAnalyze is the Task runner: prepare (ffmpeg re-encode, frame
-// passthrough), detect (streamed subject detection), persistence.
-func runAnalyze(entry *analysisEntry, task *AnalysisTask, req AnalyzeRequest, ra resolvedAnalyze) {
+// passthrough), detect (streamed subject detection) or the fit-mode geometry
+// probe, persistence. resumeFrom carries a fit-skipped cache whose analysis
+// video the detect phase replays over - prepare is skipped (nil = run the
+// whole pass).
+func runAnalyze(entry *analysisEntry, task *AnalysisTask, req AnalyzeRequest, ra resolvedAnalyze, resumeFrom *Analysis) {
 	tb := task.taskBase
 	defer func() {
 		if r := recover(); r != nil {
@@ -556,7 +598,7 @@ func runAnalyze(entry *analysisEntry, task *AnalysisTask, req AnalyzeRequest, ra
 	}()
 	tb.begin()
 
-	a, err := analyzeWork(task.ctx, entry, task, req, ra)
+	a, err := analyzeWork(task.ctx, entry, task, req, ra, resumeFrom)
 	if err != nil {
 		if !req.KeepWorkDir {
 			// Leave no half-written cache: this Task's own scratch files are
@@ -590,7 +632,11 @@ func cleanupScratch(dir string, taskID int) {
 	os.Remove(scratchName(dir, analysisMetaName, taskID))
 }
 
-func analyzeWork(ctx context.Context, entry *analysisEntry, task *AnalysisTask, req AnalyzeRequest, ra resolvedAnalyze) (*Analysis, error) {
+// analyzeWork runs the pass selected by req's mode. resumeFrom != nil is the
+// detect-resume law (plan §2/U1): the cached analysis video is already the
+// frame-aligned encode this cache key produced, so prepare is skipped and
+// only the detect phase runs over it.
+func analyzeWork(ctx context.Context, entry *analysisEntry, task *AnalysisTask, req AnalyzeRequest, ra resolvedAnalyze, resumeFrom *Analysis) (*Analysis, error) {
 	tb := task.taskBase
 	sd := task.data
 
@@ -618,51 +664,78 @@ func analyzeWork(ctx context.Context, entry *analysisEntry, task *AnalysisTask, 
 	}
 	sd.setGeometry(aw, ah, srcW, srcH, 0)
 
-	// Prepare: frame-passthrough re-encode (-fps_mode passthrough, §4/S13)
-	// with no audio; written to .tmp and renamed so a cancelled pass never
-	// leaves a half-file named analysis.mp4.
-	tb.setPhase(PhasePrepare, srcFrames)
-	tmpVideo := scratchName(ra.dir, analysisVideoName, tb.id)
 	videoPath := filepath.Join(ra.dir, analysisVideoName)
-	args := []string{
-		"-hide_banner",
-		"-i", ra.input,
-		"-vf", fmt.Sprintf("scale=%d:%d", aw, ah),
-		// lanczos+bitexact: the analysis scaler must be CPU-dispatch
-		// independent. SIMD lanczos paths round differently on different
-		// CPU flag sets (a 1 px edge-ring difference was observed between
-		// a desktop and a GH runner on the SAME ffmpeg build), which
-		// would silently shift detect bboxes and break the golden parity
-		// gate. bitexact forces swscale's deterministic algorithm.
-		"-sws_flags", "lanczos+accurate_rnd+bitexact",
-		// cpu-independent x264: same rationale - subpel search and mode
-		// decisions must not follow the CPU's asm, or the analysis
-		// bitstream (and therefore detect) differs per machine.
-		"-x264-params", "cpu-independent=1",
-		"-fps_mode", "passthrough",
-		"-an",
-		tmpVideo,
-		"-y",
-	}
-	if err := runFFmpegProgress(ctx, req.FFmpegPath, args, PhasePrepare, tb); err != nil {
-		return nil, err
-	}
-	if err := os.Rename(tmpVideo, videoPath); err != nil {
-		return nil, fmt.Errorf("holocropper: analysis video finalize: %w", err)
+	if resumeFrom != nil {
+		// Detect resume (plan §2/U1): the fit pass's analysis video is already
+		// in place under this exact cache key - same analysis height input,
+		// same source dims, so the geometry computed above is the geometry it
+		// was encoded at. Prepare is skipped entirely.
+		if resumeFrom.AnalysisVideoPath() != videoPath {
+			return nil, fmt.Errorf("holocropper: detect resume cache mismatch (%s vs %s)",
+				resumeFrom.AnalysisVideoPath(), videoPath)
+		}
+	} else {
+		// Prepare: frame-passthrough re-encode (-fps_mode passthrough, §4/S13)
+		// with no audio; written to .tmp and renamed so a cancelled pass never
+		// leaves a half-file named analysis.mp4.
+		tb.setPhase(PhasePrepare, srcFrames)
+		tmpVideo := scratchName(ra.dir, analysisVideoName, tb.id)
+		args := []string{
+			"-hide_banner",
+			"-i", ra.input,
+			"-vf", fmt.Sprintf("scale=%d:%d", aw, ah),
+			// lanczos+bitexact: the analysis scaler must be CPU-dispatch
+			// independent. SIMD lanczos paths round differently on different
+			// CPU flag sets (a 1 px edge-ring difference was observed between
+			// a desktop and a GH runner on the SAME ffmpeg build), which
+			// would silently shift detect bboxes and break the golden parity
+			// gate. bitexact forces swscale's deterministic algorithm.
+			"-sws_flags", "lanczos+accurate_rnd+bitexact",
+			// cpu-independent x264: same rationale - subpel search and mode
+			// decisions must not follow the CPU's asm, or the analysis
+			// bitstream (and therefore detect) differs per machine.
+			"-x264-params", "cpu-independent=1",
+			"-fps_mode", "passthrough",
+			"-an",
+			tmpVideo,
+			"-y",
+		}
+		if err := runFFmpegProgress(ctx, req.FFmpegPath, args, PhasePrepare, tb); err != nil {
+			return nil, err
+		}
+		if err := os.Rename(tmpVideo, videoPath); err != nil {
+			return nil, fmt.Errorf("holocropper: analysis video finalize: %w", err)
+		}
 	}
 	// From here on the stream knows which video file its frames came from,
 	// so Snapshot/ContactSheet on Plans built from PartialStream work too.
 	sd.setVideoPath(videoPath)
 
-	// Detect: stream the analysis video through the shared single-frame
-	// detector (detectFrame): grayscale -> Otsu hysteresis -> binary ->
-	// subjectsFromBinary, the same measurements the corpus framing decisions
-	// were tuned on.
-	tb.setPhase(PhaseDetect, srcFrames)
-	batcher := newFrameBatcher(req.Observer)
-	frames, err := runDetectStream(ctx, videoPath, tb, sd, batcher)
-	if err != nil {
-		return nil, err
+	detected := req.normalizedMode() == AnalyzeCrop
+	var frames int
+	if detected {
+		// Detect: stream the analysis video through the shared single-frame
+		// detector (detectFrame): grayscale -> Otsu hysteresis -> binary ->
+		// subjectsFromBinary, the same measurements the corpus framing
+		// decisions were tuned on.
+		tb.setPhase(PhaseDetect, srcFrames)
+		batcher := newFrameBatcher(req.Observer)
+		frames, err = runDetectStream(ctx, videoPath, tb, sd, batcher)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// Fit mode: no subject detection - the fit transform scales the full
+		// frame, so every consumer downstream needs only geometry and frame
+		// count from the stream. One subject-less sample per analysis frame,
+		// counted through the same vidio reader the detect pass and the
+		// render loops use: the stream/records/decoded-frame invariant holds
+		// by construction.
+		tb.setPhase(PhaseProbe, srcFrames)
+		frames, err = runFitProbe(ctx, videoPath, tb, sd)
+		if err != nil {
+			return nil, err
+		}
 	}
 	// A supersede/cancel that landed while the last frames decoded still
 	// wins here: never persist a stream for a pass that no longer owns the
@@ -695,6 +768,7 @@ func analyzeWork(ctx context.Context, entry *analysisEntry, task *AnalysisTask, 
 		Frames:         frames,
 		FPS:            sd.fpsLocked(),
 		Alignment:      frameAlignmentTag,
+		Detected:       detected,
 		CreatedAt:      time.Now().UTC(),
 	}
 	tmpMeta := scratchName(ra.dir, analysisMetaName, tb.id)
@@ -762,7 +836,48 @@ func runDetectStream(ctx context.Context, videoPath string, tb *taskBase, sd *st
 	return count, nil
 }
 
+// runFitProbe is the fit-mode geometry pass (mode-aware analysis law, plan
+// §2/U1): it opens the prepared analysis video with the same vidio reader the
+// detect pass and the render loops use, decodes it with NO detection work,
+// and appends one subject-less sample per frame. Measuring the frame count
+// through this reader (not the container metadata) keeps the invariant every
+// render pass checks - decoded frames == stream samples == plan records -
+// true by construction.
+func runFitProbe(ctx context.Context, videoPath string, tb *taskBase, sd *streamData) (int, error) {
+	video, err := vidio.NewVideo(videoPath)
+	if err != nil {
+		return 0, fmt.Errorf("holocropper: fit probe open %s: %w", videoPath, err)
+	}
+	defer video.Close()
+
+	w, h := video.Width(), video.Height()
+	buf := image.NewRGBA(image.Rect(0, 0, w, h))
+	if err := video.SetFrameBuffer(buf.Pix); err != nil {
+		return 0, err
+	}
+	sd.setGeometry(w, h, sd.srcWLocked(), sd.srcHLocked(), video.FPS())
+
+	count := 0
+	for video.Read() {
+		if err := ctx.Err(); err != nil {
+			tb.setDone(count)
+			return count, err
+		}
+		count++
+		sd.append(streamSample{})
+		if count%512 == 0 {
+			tb.setDone(count)
+		}
+	}
+	if count == 0 {
+		return 0, fmt.Errorf("holocropper: fit probe decoded zero frames from %s", videoPath)
+	}
+	tb.setDone(count)
+	return count, nil
+}
+
 func (d *streamData) srcWLocked() int { d.mu.RLock(); defer d.mu.RUnlock(); return d.srcW }
+
 func (d *streamData) srcHLocked() int { d.mu.RLock(); defer d.mu.RUnlock(); return d.srcH }
 func (d *streamData) fpsLocked() float64 {
 	d.mu.RLock()
