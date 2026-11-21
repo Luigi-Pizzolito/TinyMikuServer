@@ -227,6 +227,87 @@ func TestNewPlanRecordSpaces(t *testing.T) {
 	}
 }
 
+// TestNormalizeRectKeepsStagePaddingOutsideUnit: the Norm space is division,
+// never clamping. A landscape stage-padding crop (§12.8) sits partly outside
+// the analysis frame and its normalized copy must say so - the overlay law a
+// consumer has to be able to follow is "draw the crop window where it truly
+// is", not "where the frame happens to end". Only draw.clampToFrame clamps,
+// and only for burned-in box drawing.
+func TestNormalizeRectKeepsStagePaddingOutsideUnit(t *testing.T) {
+	// The shape TestPlanNormCropCarriesLandscapeStagePadding's replay answers at
+	// a settled frame: a 3.24:1 crop standing on the frame floor, overflowing
+	// both x edges.
+	crop := Rect{X: -310.1, Y: 25, W: 1474.2, H: 455}
+	n := normalizeRect(crop, 854, 480)
+	if n.X >= 0 || n.X+n.W <= 1 {
+		t.Fatalf("Norm crop %+v was pulled back inside the frame: the padding is not reported", n)
+	}
+	// Division only, on all four edges.
+	if math.Abs(n.X*854-crop.X) > 1e-9 || math.Abs(n.W*854-crop.W) > 1e-9 ||
+		math.Abs(n.Y*480-crop.Y) > 1e-9 || math.Abs(n.H*480-crop.H) > 1e-9 {
+		t.Fatalf("Norm crop %+v is not the crop divided by the frame", n)
+	}
+	// Vertical extents are always fully in-frame, so they stay in 0..1.
+	if n.Y < 0 || n.Y+n.H > 1 {
+		t.Fatalf("Norm crop %+v left the frame vertically", n)
+	}
+	if got := normalizeRect(crop, 0, 480); got != (Rect{}) {
+		t.Fatalf("degenerate frame answered %+v, want the zero rect", got)
+	}
+}
+
+// TestPlanNormCropCarriesLandscapeStagePadding: the same law read off a real
+// replay, because it is the records (not the helper) a UI consumes. A 350x300
+// subject standing on the frame floor of a 16:9 analysis frame, rendered
+// 648x200, cannot be contained by any in-frame 3.24:1 crop: framing pads the
+// stage instead (§12.8/§12.10). Every frame's crop leaves the frame's left AND
+// right edges, and the Norm space carries that out-of-range geometry so a UI
+// overlaying the ORIGINAL video can draw the window's off-frame edges as gaps
+// instead of painting a border at the source edge.
+func TestPlanNormCropCarriesLandscapeStagePadding(t *testing.T) {
+	samples := make([]streamSample, 80)
+	for i := range samples {
+		x := 200 + 4*i
+		if x+350 > 854 {
+			x = 854 - 350
+		}
+		samples[i] = newStreamSample(image.Rect(x, 180, x+350, 480), 1) // feet on the frame floor
+	}
+	p, err := NewPlan(newTestStream(samples, 854, 480, 1280, 720), Settings{Width: 648, Height: 200, FPS: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs := p.Records()
+	if len(recs) != 80 {
+		t.Fatalf("records: %d want 80", len(recs))
+	}
+	for _, r := range recs {
+		// Norm = analysis px / analysis frame, exactly, out-of-range included.
+		if math.Abs(r.Norm.Crop.X*854-r.Crop.X) > 1e-9 || math.Abs(r.Norm.Crop.W*854-r.Crop.W) > 1e-9 ||
+			math.Abs(r.Norm.Crop.Y*480-r.Crop.Y) > 1e-9 || math.Abs(r.Norm.Crop.H*480-r.Crop.H) > 1e-9 {
+			t.Fatalf("frame %d: Norm crop %+v not the analysis crop divided by the frame", r.Frame, r.Norm.Crop)
+		}
+		if r.Norm.Crop.X >= 0 || r.Norm.Crop.X+r.Norm.Crop.W <= 1 {
+			t.Fatalf("frame %d: Norm crop %+v never leaves the frame horizontally: stage padding was hidden", r.Frame, r.Norm.Crop)
+		}
+		if r.Norm.Crop.Y < 0 || r.Norm.Crop.Y+r.Norm.Crop.H > 1 {
+			t.Fatalf("frame %d: Norm crop %+v escaped the frame vertically", r.Frame, r.Norm.Crop)
+		}
+		// The overflow is stage padding, not a broken crop: aspect-locked and
+		// within the §12.8 per-side cap.
+		if math.Abs(r.Crop.W/r.Crop.H-648.0/200) > 0.01 {
+			t.Fatalf("frame %d: crop %+v not aspect-locked to 648:200", r.Frame, r.Crop)
+		}
+		if pad := (r.Crop.W - 854) / 2; pad > landscapePadCapFrac*854+1 {
+			t.Fatalf("frame %d: side padding %.1f exceeds the cap %.1f", r.Frame, pad, landscapePadCapFrac*854)
+		}
+		// The padding is inside the OUTPUT: the crop always fills it exactly.
+		if r.Out.Crop != (Rect{X: 0, Y: 0, W: 648, H: 200}) {
+			t.Fatalf("frame %d: Out.Crop %+v, want the whole output frame", r.Frame, r.Out.Crop)
+		}
+	}
+}
+
 func TestNewPlanSettingsHash(t *testing.T) {
 	stream := newTestStream(walkingSamples(20, 100, 4, 120, 300), 854, 480, 1280, 720)
 	other := newTestStream(walkingSamples(30, 400, 2, 120, 300), 854, 480, 1280, 720)

@@ -273,7 +273,7 @@ type FrameRecord struct {
     Frame int; Subjects int
     BBox, EMA, Crop Rect      // analysis px
     TargetH, WalkTgt float64; WalkActive bool
-    Norm, Out SpaceRects      // precomputed 0..1 and output-px spaces
+    Norm, Out SpaceRects      // analysis-frame-normalized and output-px spaces
 }
 
 type Phase string // prepare | detect | preview_frames | preview_mux | render_frames | render_mux
