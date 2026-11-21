@@ -1000,15 +1000,15 @@ func TestRenderPreviewMuxChoice(t *testing.T) {
 	}
 }
 
-// previewGOPSeconds is the frame-chronology law the vp9-webm preview mux
-// enforces: a Chromium-playable preview re-anchors its keyframes at least
-// every two seconds. previewGOPFrames converts that to frames without ever
-// proposing a GOP ffmpeg rejects.
+// previewGOPFrames is the decode-compatibility law the vp9-webm preview mux
+// enforces: at most one second of frames between keyframes, ceilinged at
+// previewGOPMaxFrames (the measured Chromium play zone). The conversion
+// never proposes a GOP ffmpeg rejects.
 func TestPreviewGOPFramesLaw(t *testing.T) {
 	for _, tc := range []struct {
 		fps  float64
 		want int
-	}{{24, 48}, {30, 60}, {12.5, 25}, {1, 2}, {0, 2}, {0.4, 2}, {23.6, 47}} {
+	}{{24, 24}, {30, 24}, {60, 24}, {120, 24}, {12.5, 13}, {1, 2}, {0, 2}, {0.4, 2}, {23.6, 24}} {
 		if got := previewGOPFrames(tc.fps); got != tc.want {
 			t.Errorf("previewGOPFrames(%v) = %d, want %d", tc.fps, got, tc.want)
 		}
@@ -1020,7 +1020,7 @@ func TestPreviewGOPFramesLaw(t *testing.T) {
 // renders it as ONE inter-frame chain. Chromium's VP9 decoder refuses such a
 // preview (MEDIA_ERR_DECODE straight after loadedmetadata, while libvpx and
 // ffvp9 read the same bytes fine) - so every chain in a preview must be at
-// most previewGOPSeconds long, which a keyframe interval proves.
+// most previewGOPMaxFrames long, which a keyframe interval proves.
 func TestRenderPreviewVP9GOPChains(t *testing.T) {
 	ffmpeg := requireFFmpeg(t)
 	a, p := setupRenderFixture(t, ffmpeg, 240, 240)
