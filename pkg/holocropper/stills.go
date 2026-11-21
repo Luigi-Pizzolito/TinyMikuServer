@@ -260,15 +260,26 @@ func (p *Plan) decodeAnalysisFrameSeek(idx int) (*image.RGBA, error) {
 	if p.resolved.AnalysisW <= 0 || p.resolved.AnalysisH <= 0 {
 		return nil, fmt.Errorf("holocropper: plan has no analysis geometry for stills")
 	}
-	ss := (float64(idx) - 0.5) / p.analysisFPS
-	if ss < 0 {
+	return seekAnalysisFrame(p.videoPath, idx, p.resolved.AnalysisW, p.resolved.AnalysisH, p.analysisFPS)
+}
+
+// seekAnalysisFrame fetches analysis frame idx (0-based) out of `path` with an
+// ffmpeg INPUT seek. This is the frame-seeking law the whole package shares -
+// stills, contact sheets and the lazy subject-detail verbs all read one frame
+// through it.
+func seekAnalysisFrame(path string, idx, w, h int, fps float64) (*image.RGBA, error) {
+	if idx < 0 {
+		return nil, fmt.Errorf("holocropper: analysis frame index %d is negative", idx)
+	}
+	ss := (float64(idx) - 0.5) / fps
+	if fps <= 0 || ss < 0 {
 		ss = 0
 	}
 
 	cmd := exec.Command("ffmpeg",
 		"-hide_banner", "-loglevel", "error",
 		"-ss", strconv.FormatFloat(ss, 'f', 6, 64),
-		"-i", p.videoPath,
+		"-i", path,
 		"-map", "0:v:0",
 		"-frames:v", "1",
 		"-f", "image2pipe",
@@ -287,7 +298,6 @@ func (p *Plan) decodeAnalysisFrameSeek(idx int) (*image.RGBA, error) {
 		return nil, fmt.Errorf("holocropper: seek analysis frame: %w", err)
 	}
 
-	w, h := p.resolved.AnalysisW, p.resolved.AnalysisH
 	frame := image.NewRGBA(image.Rect(0, 0, w, h))
 	if _, err := io.ReadFull(stdout, frame.Pix); err != nil {
 		cmd.Process.Kill()

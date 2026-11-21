@@ -5,7 +5,6 @@ import (
 	"image/color"
 	"image/draw"
 	"math"
-	"sort"
 
 	"github.com/bamiaux/rez"
 )
@@ -162,13 +161,6 @@ func dfs(binaryMap *image.Gray, labelMatrix [][]int, x, y, label int) image.Rect
 	return image.Rect(minX, minY, maxX+1, maxY+1)
 }
 
-// ByArea implements the sort.Interface for []image.Rectangle based on area.
-type ByArea []image.Rectangle
-
-func (a ByArea) Len() int           { return len(a) }
-func (a ByArea) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByArea) Less(i, j int) bool { return a[i].Dx()*a[i].Dy() > a[j].Dx()*a[j].Dy() }
-
 // combineBounds combines the bounds of all rectangles in the slice
 // that overlap with the given rectangle and removes them from the slice.
 func combineBounds(rect image.Rectangle, rects []image.Rectangle, tol int) (combined image.Rectangle, remainingRects []image.Rectangle) {
@@ -233,39 +225,14 @@ func totalBoundingBox(rectangles []image.Rectangle) image.Rectangle {
 	return image.Rect(minX, minY, maxX, maxY)
 }
 
-// subjectsFromBinary runs the shared subject-extraction stage: connected
-// component labelling -> area sort -> keep boxes with at least 20% of the
-// largest box's area (merging overlapping neighbours expanded by 5% of the
-// frame height) -> union master bbox. detectFrame (the embeddable detect
-// pass) is its only caller now that the fused pipeline and its probe are
-// gone, so the DetectionStream and every path built on it see exactly these
-// subjects.
+// subjectsFromBinary is the two-number summary of subjectDetailFromBinary:
+// the union master bbox and the subject count. One implementation measures a
+// frame (subject_detail.go), so the detect pass, the plan replay and the lazy
+// detail verbs (SubjectBoxes/FrameIslands) can never disagree about what a
+// frame's subjects were.
 func subjectsFromBinary(binaryImg *image.Gray) (image.Rectangle, int) {
-	boundingBoxes, _ := connectedComponentLabeling(binaryImg)
-	var rectangles []image.Rectangle
-	for _, rect := range boundingBoxes {
-		rectangles = append(rectangles, rect)
-	}
-	if len(rectangles) == 0 {
-		return image.ZR, 0
-	}
-	sort.Sort(ByArea(rectangles))
-
-	subjects := make([]image.Rectangle, 0)
-	computedOverlapRects := rectangles
-	for _, bbox := range rectangles {
-		largestArea := rectangles[0].Dx() * rectangles[0].Dy()
-		area := bbox.Dx() * bbox.Dy()
-		perCovered := 100 * float64(float64(area)/float64(largestArea))
-		// Boxes classified as big have at least 20% of the area of the biggest box
-		if perCovered >= 20 {
-			// Merge bounding boxes
-			bbox, computedOverlapRects = combineBounds(bbox, computedOverlapRects, binaryImg.Bounds().Dy()/20)
-			// Append to main subjects list
-			subjects = append(subjects, bbox)
-		}
-	}
-	return totalBoundingBox(subjects), len(subjects)
+	d := subjectDetailFromBinary(binaryImg)
+	return d.Master, d.Subjects
 }
 
 // detectFrame runs the full single-frame subject detection exactly as the
@@ -298,20 +265,8 @@ func detectFrame(img *image.RGBA, lastThr *float64) (image.Rectangle, int, image
 // bbox (the 1-1 project's calculateCentroid: sum pixel coords over white
 // pixels, divide by the count). Returns zero when bbox contains no white.
 func maskCentroid(img *image.Gray, bbox image.Rectangle) image.Point {
-	var totalX, totalY, count int64
-	for y := bbox.Min.Y; y < bbox.Max.Y; y++ {
-		for x := bbox.Min.X; x < bbox.Max.X; x++ {
-			if img.GrayAt(x, y).Y == 255 {
-				totalX += int64(x)
-				totalY += int64(y)
-				count++
-			}
-		}
-	}
-	if count == 0 {
-		return image.Point{}
-	}
-	return image.Point{X: int(totalX / count), Y: int(totalY / count)}
+	_, cent := maskStats(img, bbox)
+	return cent
 }
 
 // aspectLockedTargetCalc computes the desired crop from a (smoothed) subject

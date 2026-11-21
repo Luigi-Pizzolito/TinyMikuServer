@@ -58,24 +58,35 @@ type streamSample struct {
 	// master bbox (761/U3, stream v2). 0,0 means "not recorded": a v1-format
 	// stream loaded from an old cache, a synthetic fit sample, or a lost frame.
 	cx, cy int16
+	// thr is the gray-level threshold that frame's mask was built with
+	// (stream v2). The lazy detail verbs (SubjectBoxes/FrameIslands) re-measure
+	// a frame from the cached analysis video, and reproducing the mask the
+	// detect pass saw needs the SAME threshold - otsu's hysteresis makes it a
+	// per-frame state, not something a later call can recompute.
+	// thrUnrecorded = "no reading" (v1 cache, fit-mode sample, lost frame).
+	thr uint16
 }
 
+// thrUnrecorded is the sentinel "this frame's threshold was not stored".
+// Real thresholds are gray levels 0..255, so 0xFFFF can never collide.
+const thrUnrecorded = uint16(0xFFFF)
+
 // streamRecordBytes is the packed size of one v2 stream sample. v1 was 10 B
-// (no centroid); readStreamFile still decodes a v1 file, with Centroid left
-// unrecorded, so a cache written by an older build loads with degraded
-// telemetry instead of failing.
+// (bbox + subject count); readStreamFile still decodes a v1 file, with Centroid
+// and the threshold left unrecorded, so a cache written by an older build loads
+// with degraded telemetry instead of failing.
 const streamVersion = 2
 
 func streamRecordBytes(version int) int {
 	if version >= streamVersion {
-		return 14
+		return 16
 	}
 	return 10
 }
 
 func newStreamSample(bbox image.Rectangle, subjects int, centroid image.Point) streamSample {
 	if bbox.Empty() {
-		return streamSample{}
+		return streamSample{thr: thrUnrecorded}
 	}
 	s := streamSample{
 		x0:       int16(bbox.Min.X),
@@ -85,7 +96,18 @@ func newStreamSample(bbox image.Rectangle, subjects int, centroid image.Point) s
 		subjects: uint16(subjects),
 		cx:       int16(centroid.X),
 		cy:       int16(centroid.Y),
+		thr:      thrUnrecorded,
 	}
+	return s
+}
+
+// withThreshold records the threshold the detect pass actually applied to this
+// frame (the hysteresis state), so the detail verbs can rebuild the same mask.
+// The conversion is applyThreshold's OWN argument expression - uint8(applied),
+// no clamp added - because the verbs must re-run the exact binarization the
+// detect pass ran, not a close approximation of it.
+func withThreshold(s streamSample, applied float64) streamSample {
+	s.thr = uint16(uint8(applied))
 	return s
 }
 
@@ -271,7 +293,11 @@ func (s DetectionStream) AnalysisVideoPath() string {
 // subject centroid (stream v2 samples, recorded in meta.stream_version);
 // a stream written under the older 10 B layout still loads, with the
 // centroid simply not recorded for those frames.
-const analysisFormatVersion = 3
+// v4 (plan G3): stream v2 samples also carry the frame's applied threshold,
+// which the lazy detail verbs need to rebuild the exact mask. The interim
+// 14 B v2 layout is retired rather than decoded: it only ever existed on
+// development builds, and a 14 B file read as 16 B is garbage, not degraded.
+const analysisFormatVersion = 4
 
 // frameAlignmentTag names the prepare encoding mode (§4/S13): frame indices
 // map 1:1 between source, analysis video and stream. Part of the cache key
@@ -854,7 +880,7 @@ func runDetectStream(ctx context.Context, videoPath string, tb *taskBase, sd *st
 		}
 		count++
 		bbox, subj, cent := detectFrame(buf, &lastThr)
-		sd.append(newStreamSample(bbox, subj, cent))
+		sd.append(withThreshold(newStreamSample(bbox, subj, cent), lastThr))
 		if batcher.observer != nil && batcher.observer.OnFrames != nil {
 			r := rectOf(bbox)
 			batcher.add(FrameRecord{
@@ -906,7 +932,9 @@ func runFitProbe(ctx context.Context, videoPath string, tb *taskBase, sd *stream
 			return count, err
 		}
 		count++
-		sd.append(streamSample{})
+		// A fit pass never binarized a frame, so there is no threshold to
+		// re-measure it with: the detail verbs report that honestly.
+		sd.append(streamSample{thr: thrUnrecorded})
 		if count%512 == 0 {
 			tb.setDone(count)
 		}
@@ -933,7 +961,7 @@ func (d *streamData) fpsLocked() float64 {
 func writeStreamFile(path string, sd *streamData) error {
 	samples, _, _, _, _, _, _ := sd.snapshot()
 	var raw bytes.Buffer
-	var scratch [14]byte
+	var scratch [16]byte
 	for _, s := range samples {
 		binary.LittleEndian.PutUint16(scratch[0:2], uint16(s.x0))
 		binary.LittleEndian.PutUint16(scratch[2:4], uint16(s.y0))
@@ -942,6 +970,7 @@ func writeStreamFile(path string, sd *streamData) error {
 		binary.LittleEndian.PutUint16(scratch[8:10], s.subjects)
 		binary.LittleEndian.PutUint16(scratch[10:12], uint16(s.cx))
 		binary.LittleEndian.PutUint16(scratch[12:14], uint16(s.cy))
+		binary.LittleEndian.PutUint16(scratch[14:16], s.thr)
 		raw.Write(scratch[:])
 	}
 	var gz bytes.Buffer
@@ -957,9 +986,9 @@ func writeStreamFile(path string, sd *streamData) error {
 }
 
 // readStreamFile decodes stream.bin.gz written under `version`'s layout:
-// v2 is 14 B per sample (bbox + subjects + centroid); the original v1 10 B
-// layout loads with the centroid simply not recorded (degraded telemetry —
-// the plan U3 law for caches an older build wrote).
+// v2 is 16 B per sample (bbox + subjects + centroid + threshold); the original
+// v1 10 B layout loads with both new fields simply not recorded (degraded
+// telemetry — the plan U3 law for caches an older build wrote).
 func readStreamFile(path string, version int) ([]streamSample, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -988,10 +1017,12 @@ func readStreamFile(path string, version int) ([]streamSample, error) {
 			x1:       int16(binary.LittleEndian.Uint16(b[o+4:])),
 			y1:       int16(binary.LittleEndian.Uint16(b[o+6:])),
 			subjects: binary.LittleEndian.Uint16(b[o+8:]),
+			thr:      thrUnrecorded,
 		}
-		if rec >= 14 {
+		if rec >= 16 {
 			s.cx = int16(binary.LittleEndian.Uint16(b[o+10:]))
 			s.cy = int16(binary.LittleEndian.Uint16(b[o+12:]))
+			s.thr = binary.LittleEndian.Uint16(b[o+14:])
 		}
 		samples[i] = s
 	}

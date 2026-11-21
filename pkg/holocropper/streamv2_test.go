@@ -14,16 +14,17 @@ import (
 )
 
 /* U3 stream-v2 pins (plan HOLOCROPPER-API-PLAN.md §2/U3, item 761):
-the packed stream sample grows 10 B -> 14 B with the subject centroid, the
-meta records the layout version, FrameRecords/DetectionFrames carry the
-centroid, and a v1-layout file still loads with the centroid simply
-unrecorded — an old cache never fails, it just loses the new telemetry. */
+the packed stream sample grows 10 B -> 16 B with the subject centroid and the
+frame's applied threshold, the meta records the layout version,
+FrameRecords/DetectionFrames carry the centroid, and a v1-layout file still
+loads with the new telemetry simply unrecorded — an old cache never fails, it
+just loses what it never stored. */
 
 func TestStreamV2RoundTripCarriesCentroid(t *testing.T) {
 	sd := newStreamData()
-	sd.append(newStreamSample(image.Rect(10, 20, 300, 400), 3, image.Point{X: 150, Y: 210}))
-	sd.append(newStreamSample(image.Rect(40, 40, 320, 420), 2, image.Point{X: -15, Y: 7})) // negative int16 round-trips
-	sd.append(newStreamSample(image.ZR, 0, image.Point{}))                                 // lost frame stays fully zero
+	sd.append(withThreshold(newStreamSample(image.Rect(10, 20, 300, 400), 3, image.Point{X: 150, Y: 210}), 137.9))
+	sd.append(withThreshold(newStreamSample(image.Rect(40, 40, 320, 420), 2, image.Point{X: -15, Y: 7}), 84)) // negative int16 round-trips
+	sd.append(newStreamSample(image.ZR, 0, image.Point{}))                                                    // lost frame stays fully zero
 	sd.setGeometry(320, 480, 640, 720, 24)
 
 	path := filepath.Join(t.TempDir(), "stream.bin.gz")
@@ -45,10 +46,21 @@ func TestStreamV2RoundTripCarriesCentroid(t *testing.T) {
 		if s.centroid() != want[i] {
 			t.Errorf("sample %d centroid %v, want %v", i, s.centroid(), want[i])
 		}
+		if s.thr != sd.samples[i].thr {
+			t.Errorf("sample %d thr %d, want %d", i, s.thr, sd.samples[i].thr)
+		}
 	}
 	// A zero-centroid sample reads as unrecorded, matching the v1 semantic.
 	if !got[2].centroid().Eq(image.Point{}) {
 		t.Error("lost-frame sample carries a phantom centroid")
+	}
+	// The threshold conversion is applyThreshold's own uint8 truncation, so
+	// the detail verbs re-binarize with exactly the byte the detect pass used.
+	if got[0].thr != 137 {
+		t.Errorf("137.9 stored as %d; uint8(137.9) truncates to 137", got[0].thr)
+	}
+	if got[2].thr != thrUnrecorded {
+		t.Errorf("lost-frame sample thr %d, want the unrecorded sentinel", got[2].thr)
 	}
 }
 
@@ -88,6 +100,9 @@ func TestStreamV1FileLoadsDegraded(t *testing.T) {
 	if !got[0].centroid().Eq(image.Point{}) {
 		t.Error("v1 sample fabricated a centroid; it must read as unrecorded")
 	}
+	if got[0].thr != thrUnrecorded {
+		t.Error("v1 sample fabricated a threshold; it must read as unrecorded")
+	}
 }
 
 func TestAnalyzeCarriesCentroidsEndToEnd(t *testing.T) {
@@ -106,7 +121,8 @@ func TestAnalyzeCarriesCentroidsEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// meta.json records both version bumps: analysis format v3 and stream v2.
+	// meta.json records both version bumps: analysis format v4 (which covers
+	// the threshold-carrying 16 B sample layout) and stream v2.
 	metaBytes, err := os.ReadFile(filepath.Join(a1.Dir(), analysisMetaName))
 	if err != nil {
 		t.Fatal(err)
@@ -115,8 +131,8 @@ func TestAnalyzeCarriesCentroidsEndToEnd(t *testing.T) {
 	if err := json.Unmarshal(metaBytes, &meta); err != nil {
 		t.Fatal(err)
 	}
-	if meta.FormatVersion != analysisFormatVersion || analysisFormatVersion != 3 {
-		t.Fatalf("meta format_version = %d (const %d), want 3", meta.FormatVersion, analysisFormatVersion)
+	if meta.FormatVersion != analysisFormatVersion || analysisFormatVersion != 4 {
+		t.Fatalf("meta format_version = %d (const %d), want 4", meta.FormatVersion, analysisFormatVersion)
 	}
 	if meta.StreamVersion != streamVersion {
 		t.Fatalf("meta stream_version = %d, want %d", meta.StreamVersion, streamVersion)
