@@ -226,12 +226,82 @@ func scaleRect(r Rect, fx, fy float64) Rect {
 
 // decodeAnalysisFrame fetches exactly one analysis frame with the same
 // one-pass select machinery the sheet uses.
+// decodeAnalysisFrame fetches one analysis frame. A Plan whose stream locked
+// an fps gets the time-seeked decode (decodeAnalysisFrameSeek); a Plan from
+// a stream that never locked one keeps the select-filter fetch.
 func (p *Plan) decodeAnalysisFrame(idx int) (*image.RGBA, error) {
+	if idx < 0 || idx >= len(p.records) {
+		return nil, fmt.Errorf("holocropper: analysis video has %d frames, still asks for index %d", len(p.records), idx)
+	}
+	if p.analysisFPS > 0 {
+		return p.decodeAnalysisFrameSeek(idx)
+	}
 	frames, err := p.decodeAnalysisFrames([]int{idx})
 	if err != nil {
 		return nil, err
 	}
 	return frames[0], nil
+}
+
+// decodeAnalysisFrameSeek fetches frame idx with an ffmpeg INPUT seek instead
+// of a select filter. Accurate input seek decodes from the keyframe before
+// the target and discards frames whose pts lands before the seek point, so
+// the pipe work is bounded to roughly one GOP ahead of the target instead of
+// a full linear pass over the whole analysis video - the cost a live
+// frame-strip poll pays several times a second must not scale with video
+// length.
+//
+// The seek sits half a frame EARLY: ffmpeg hands out the first frame with
+// pts >= ss, so half a frame below the target's own timestamp makes the
+// target frame the first survivor under float rounding (the analysis encode
+// is frame-passthrough, so frame idx sits at idx/analysisFPS — the engine's
+// frame-grid law, the same CFR assumption the framing decider steps on).
+func (p *Plan) decodeAnalysisFrameSeek(idx int) (*image.RGBA, error) {
+	if p.resolved.AnalysisW <= 0 || p.resolved.AnalysisH <= 0 {
+		return nil, fmt.Errorf("holocropper: plan has no analysis geometry for stills")
+	}
+	ss := (float64(idx) - 0.5) / p.analysisFPS
+	if ss < 0 {
+		ss = 0
+	}
+
+	cmd := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error",
+		"-ss", strconv.FormatFloat(ss, 'f', 6, 64),
+		"-i", p.videoPath,
+		"-map", "0:v:0",
+		"-frames:v", "1",
+		"-f", "image2pipe",
+		"-pix_fmt", "rgba",
+		"-vcodec", "rawvideo",
+		"-fps_mode", "passthrough",
+		"-",
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("holocropper: seek analysis frame: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("holocropper: seek analysis frame: %w", err)
+	}
+
+	w, h := p.resolved.AnalysisW, p.resolved.AnalysisH
+	frame := image.NewRGBA(image.Rect(0, 0, w, h))
+	if _, err := io.ReadFull(stdout, frame.Pix); err != nil {
+		cmd.Process.Kill()
+		cmd.Wait()
+		return nil, fmt.Errorf("holocropper: seek analysis frame %d: ffmpeg returned no frame: %v: %s",
+			idx+1, err, strings.TrimSpace(stderr.String()))
+	}
+	if err := stdout.Close(); err != nil {
+		return nil, fmt.Errorf("holocropper: seek analysis frame: close pipe: %w", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, fmt.Errorf("holocropper: seek analysis frame: %v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return frame, nil
 }
 
 func (p *Plan) decodeAnalysisFrames(indices []int) ([]*image.RGBA, error) {

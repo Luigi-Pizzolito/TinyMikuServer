@@ -287,6 +287,31 @@ func TestSnapshotFixture(t *testing.T) {
 	}
 }
 
+// The live frame strip (Horidashimi item 743) polls Snapshot while a pass is
+// running, so the time-seeked fetch must return the exact frame the
+// select-filter pass returns - boundaries included.
+func TestSnapshotSeekDecodeMatchesSelect(t *testing.T) {
+	ffmpeg := requireFFmpeg(t)
+	_, p := setupRenderFixture(t, ffmpeg, 240, 240)
+	if p.analysisFPS <= 0 {
+		t.Fatalf("fixture plan carries no analysis fps")
+	}
+	n := len(p.records)
+	for _, idx := range []int{0, 1, 2, n / 3, n / 2, n - 2, n - 1} {
+		seek, err := p.decodeAnalysisFrameSeek(idx)
+		if err != nil {
+			t.Fatalf("seek decode index %d: %v", idx, err)
+		}
+		sel, err := p.decodeAnalysisFrames([]int{idx})
+		if err != nil {
+			t.Fatalf("select decode index %d: %v", idx, err)
+		}
+		if !bytes.Equal(seek.Pix, sel[0].Pix) {
+			t.Errorf("index %d: seek decode is not the same frame as the select decode", idx)
+		}
+	}
+}
+
 func TestSnapshotMaxWidthCap(t *testing.T) {
 	ffmpeg := requireFFmpeg(t)
 	_, p := setupRenderFixture(t, ffmpeg, 240, 240)

@@ -38,6 +38,11 @@ type Plan struct {
 	// videoPath is the cached analysis video the source stream was detected
 	// from ("" for synthetic streams); Snapshot/ContactSheet composite from it.
 	videoPath string
+
+	// analysisFPS is the analysis video's frame rate (0 when the stream did
+	// not lock one). Snapshot uses it for the time-seeked frame fetch in
+	// decodeAnalysisFrame; the select-filter path remains the fallback.
+	analysisFPS float64
 }
 
 // Records returns the full per-frame replay, in stream order. Frame 1 is
@@ -125,10 +130,10 @@ func NewPlan(stream DetectionStream, s Settings) (*Plan, error) {
 		return nil, errors.New("holocropper: Plan requires a detection stream")
 	}
 
-	samples, aw, ah, srcW, srcH, _, _ := stream.data.snapshot()
+	samples, aw, ah, srcW, srcH, streamFPS, _ := stream.data.snapshot()
 	if aw == 0 || ah == 0 {
 		// Analysis geometry not probed yet - a valid empty replay.
-		return &Plan{settings: s, settingsHash: planSettingsHash(s, false), videoPath: stream.AnalysisVideoPath()}, nil
+		return &Plan{settings: s, settingsHash: planSettingsHash(s, false), videoPath: stream.AnalysisVideoPath(), analysisFPS: streamFPS}, nil
 	}
 	if srcW <= 0 || srcH <= 0 {
 		srcW, srcH = aw, ah // meta without source dims: fall back to the analysis frame
@@ -227,6 +232,7 @@ func NewPlan(stream DetectionStream, s Settings) (*Plan, error) {
 			dropouts:     dropouts,
 			settingsHash: planSettingsHash(s, flip),
 			videoPath:    stream.AnalysisVideoPath(),
+			analysisFPS:  streamFPS,
 		}, nil
 	}
 
@@ -334,6 +340,7 @@ func NewPlan(stream DetectionStream, s Settings) (*Plan, error) {
 		dropouts:     dropouts,
 		settingsHash: planSettingsHash(s, flip),
 		videoPath:    stream.AnalysisVideoPath(),
+		analysisFPS:  streamFPS,
 	}, nil
 }
 
