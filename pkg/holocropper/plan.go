@@ -262,29 +262,34 @@ func NewPlan(stream DetectionStream, s Settings) (*Plan, error) {
 		crop := Rect{X: out.CropCx - out.CropW/2, Y: out.CropCy - out.CropH/2, W: out.CropW, H: out.CropH}
 		bb := rectOf(bbox)
 		em := rectOf(out.EMA)
+		cent := sm.centroid()
 		dbg.line(i+1, int(sm.subjects), bbox, out.EMA, out.CropCx, out.CropCy, out.CropW, out.CropH, out.TargetH, out.WalkTgt)
 
 		records = append(records, FrameRecord{
-			Frame:       i + 1,
-			Subjects:    int(sm.subjects),
-			BBox:        bb,
-			EMA:         em,
-			Crop:        crop,
-			TargetH:     out.TargetH,
-			WalkTgt:     out.WalkTgt,
-			WalkActive:  out.WalkTgt != 0,
-			SubjectLost: out.SubjectLost,
-			SceneCut:    out.SceneCut,
-			Grounded:    out.Grounded,
+			Frame:         i + 1,
+			Subjects:      int(sm.subjects),
+			BBox:          bb,
+			EMA:           em,
+			Crop:          crop,
+			Centroid:      pointOf(cent),
+			CentroidKnown: !cent.Eq(image.Point{}),
+			TargetH:       out.TargetH,
+			WalkTgt:       out.WalkTgt,
+			WalkActive:    out.WalkTgt != 0,
+			SubjectLost:   out.SubjectLost,
+			SceneCut:      out.SceneCut,
+			Grounded:      out.Grounded,
 			Norm: SpaceRects{
-				BBox: normalizeRect(bb, faw, fah),
-				EMA:  normalizeRect(em, faw, fah),
-				Crop: normalizeRect(crop, faw, fah),
+				BBox:     normalizeRect(bb, faw, fah),
+				EMA:      normalizeRect(em, faw, fah),
+				Crop:     normalizeRect(crop, faw, fah),
+				Centroid: normalizePoint(cent, faw, fah),
 			},
 			Out: SpaceRects{
-				BBox: mapRectToOutput(bb, crop, w, h),
-				EMA:  mapRectToOutput(em, crop, w, h),
-				Crop: mapRectToOutput(crop, crop, w, h),
+				BBox:     mapRectToOutput(bb, crop, w, h),
+				EMA:      mapRectToOutput(em, crop, w, h),
+				Crop:     mapRectToOutput(crop, crop, w, h),
+				Centroid: mapPointToOutput(cent, crop, w, h),
 			},
 		})
 		cropRects = append(cropRects, out.CropRect)

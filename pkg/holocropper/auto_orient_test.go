@@ -107,7 +107,7 @@ func syntheticFrame(w, h int, rects []image.Rectangle) *image.RGBA {
 func TestDetectFrameSyntheticSubjects(t *testing.T) {
 	// One tall solo dancer: master bbox == its own box, AR ~ 0.375.
 	lastThr := -1.0
-	bbox, subj := detectFrame(syntheticFrame(854, 480,
+	bbox, subj, _ := detectFrame(syntheticFrame(854, 480,
 		[]image.Rectangle{image.Rect(300, 90, 420, 410)}), &lastThr)
 	if subj != 1 {
 		t.Fatalf("solo subject count %d, want 1", subj)
@@ -118,7 +118,7 @@ func TestDetectFrameSyntheticSubjects(t *testing.T) {
 
 	// Three side-by-side dancers: union master bbox is wide, AR ~ 2.29.
 	lastThr = -1.0
-	bbox, subj = detectFrame(syntheticFrame(854, 480, []image.Rectangle{
+	bbox, subj, _ = detectFrame(syntheticFrame(854, 480, []image.Rectangle{
 		image.Rect(100, 100, 180, 380), image.Rect(380, 100, 460, 380), image.Rect(660, 100, 740, 380),
 	}), &lastThr)
 	if subj != 3 {

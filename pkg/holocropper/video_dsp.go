@@ -274,7 +274,11 @@ func subjectsFromBinary(binaryImg *image.Gray) (image.Rectangle, int) {
 // start at -1) -> binary -> subjectsFromBinary. The embeddable detect pass
 // streams frames through it, so the DetectionStream carries the same
 // decisions the pipeline's STEP 3 produces.
-func detectFrame(img *image.RGBA, lastThr *float64) (image.Rectangle, int) {
+//
+// It also reports the centroid: the centre of mass of the subject-mask
+// pixels inside the master bbox — the same point the original 1-1 project
+// drew as its red cross (U3/761 telemetry). Zero when there is no subject.
+func detectFrame(img *image.RGBA, lastThr *float64) (image.Rectangle, int, image.Point) {
 	gray := convertToMonochrome(img)
 	thr := float64(otsuThreshold(gray))
 	if *lastThr < 0 {
@@ -283,7 +287,31 @@ func detectFrame(img *image.RGBA, lastThr *float64) (image.Rectangle, int) {
 		*lastThr = clampF(thr, *lastThr-10, *lastThr+10)
 	}
 	binaryImg := applyThreshold(gray, uint8(*lastThr))
-	return subjectsFromBinary(binaryImg)
+	bbox, subjects := subjectsFromBinary(binaryImg)
+	if bbox.Empty() {
+		return bbox, subjects, image.Point{}
+	}
+	return bbox, subjects, maskCentroid(binaryImg, bbox)
+}
+
+// maskCentroid is the integer centre of mass of the white mask pixels inside
+// bbox (the 1-1 project's calculateCentroid: sum pixel coords over white
+// pixels, divide by the count). Returns zero when bbox contains no white.
+func maskCentroid(img *image.Gray, bbox image.Rectangle) image.Point {
+	var totalX, totalY, count int64
+	for y := bbox.Min.Y; y < bbox.Max.Y; y++ {
+		for x := bbox.Min.X; x < bbox.Max.X; x++ {
+			if img.GrayAt(x, y).Y == 255 {
+				totalX += int64(x)
+				totalY += int64(y)
+				count++
+			}
+		}
+	}
+	if count == 0 {
+		return image.Point{}
+	}
+	return image.Point{X: int(totalX / count), Y: int(totalY / count)}
 }
 
 // aspectLockedTargetCalc computes the desired crop from a (smoothed) subject

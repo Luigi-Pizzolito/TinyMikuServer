@@ -23,8 +23,8 @@ fit resize itself, and a real render through the API chain. */
 func TestFitPlanRecords(t *testing.T) {
 	samples := walkingSamples(12, 100, 4, 120, 300)
 	// Two subject-less frames mid-run -> one dropout span, framing unaffected.
-	samples[2] = newStreamSample(image.ZR, 0)
-	samples[3] = newStreamSample(image.ZR, 0)
+	samples[2] = newStreamSample(image.ZR, 0, image.Point{})
+	samples[3] = newStreamSample(image.ZR, 0, image.Point{})
 	stream := newTestStream(samples, 854, 480, 1280, 720)
 
 	p, err := NewFitPlan(stream, Settings{Width: 320, Height: 240, FPS: 20})
@@ -129,7 +129,7 @@ func TestFitAutoOrientPicksLeastBars(t *testing.T) {
 	// Subjectless clip: geometry decision anyway...
 	empty := make([]streamSample, 8)
 	for i := range empty {
-		empty[i] = newStreamSample(image.ZR, 0)
+		empty[i] = newStreamSample(image.ZR, 0, image.Point{})
 	}
 	pFit, err := NewFitPlan(newTestStream(empty, 854, 480, 1280, 720),
 		Settings{Width: 240, Height: 420, AutoOrient: true})

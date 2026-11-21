@@ -30,7 +30,7 @@ func walkingSamples(n int, x0, step, w, h int) []streamSample {
 	s := make([]streamSample, n)
 	for i := 0; i < n; i++ {
 		x := x0 + step*i
-		s[i] = newStreamSample(image.Rect(x, 60, x+w, 60+h), 1)
+		s[i] = newStreamSample(image.Rect(x, 60, x+w, 60+h), 1, image.Point{})
 	}
 	return s
 }
@@ -60,7 +60,7 @@ func TestNewPlanStreamIncompatible(t *testing.T) {
 
 	// The incompatible height is the EFFECTIVE one after auto-orient flip.
 	portrait := newTestStream(
-		[]streamSample{newStreamSample(image.Rect(300, 60, 420, 460), 1)},
+		[]streamSample{newStreamSample(image.Rect(300, 60, 420, 460), 1, image.Point{})},
 		640, 360, 960, 540)
 	_, err = NewPlan(portrait, Settings{Width: 648, Height: 200, FPS: 24, AutoOrient: true})
 	if !errors.Is(err, ErrStreamIncompatible) {
@@ -162,7 +162,7 @@ func TestNewPlanWalkTelemetry(t *testing.T) {
 	// frame falls back to subject centering while the gate stays active.
 	wide := newTestStream([]streamSample{}, 1280, 720, 1280, 720)
 	for i := 0; i < 1200; i++ {
-		wide.data.samples = append(wide.data.samples, newStreamSample(image.Rect(10, 260, 1270, 460), 1))
+		wide.data.samples = append(wide.data.samples, newStreamSample(image.Rect(10, 260, 1270, 460), 1, image.Point{}))
 	}
 	p2, err := NewPlan(wide, Settings{Width: 648, Height: 200, FPS: 24})
 	if err != nil {
@@ -271,7 +271,7 @@ func TestPlanNormCropCarriesLandscapeStagePadding(t *testing.T) {
 		if x+350 > 854 {
 			x = 854 - 350
 		}
-		samples[i] = newStreamSample(image.Rect(x, 180, x+350, 480), 1) // feet on the frame floor
+		samples[i] = newStreamSample(image.Rect(x, 180, x+350, 480), 1, image.Point{}) // feet on the frame floor
 	}
 	p, err := NewPlan(newTestStream(samples, 854, 480, 1280, 720), Settings{Width: 648, Height: 200, FPS: 24})
 	if err != nil {

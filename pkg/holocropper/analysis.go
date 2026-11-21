@@ -54,9 +54,26 @@ no work at all: any complete cache answers a fit Analyze immediately. */
 type streamSample struct {
 	x0, y0, x1, y1 int16
 	subjects       uint16
+	// Centroid is the centre of mass of the subject-mask pixels inside the
+	// master bbox (761/U3, stream v2). 0,0 means "not recorded": a v1-format
+	// stream loaded from an old cache, a synthetic fit sample, or a lost frame.
+	cx, cy int16
 }
 
-func newStreamSample(bbox image.Rectangle, subjects int) streamSample {
+// streamRecordBytes is the packed size of one v2 stream sample. v1 was 10 B
+// (no centroid); readStreamFile still decodes a v1 file, with Centroid left
+// unrecorded, so a cache written by an older build loads with degraded
+// telemetry instead of failing.
+const streamVersion = 2
+
+func streamRecordBytes(version int) int {
+	if version >= streamVersion {
+		return 14
+	}
+	return 10
+}
+
+func newStreamSample(bbox image.Rectangle, subjects int, centroid image.Point) streamSample {
 	if bbox.Empty() {
 		return streamSample{}
 	}
@@ -66,6 +83,8 @@ func newStreamSample(bbox image.Rectangle, subjects int) streamSample {
 		x1:       int16(bbox.Max.X),
 		y1:       int16(bbox.Max.Y),
 		subjects: uint16(subjects),
+		cx:       int16(centroid.X),
+		cy:       int16(centroid.Y),
 	}
 	return s
 }
@@ -75,6 +94,13 @@ func (s streamSample) bbox() image.Rectangle {
 		return image.ZR
 	}
 	return image.Rect(int(s.x0), int(s.y0), int(s.x1), int(s.y1))
+}
+
+func (s streamSample) centroid() image.Point {
+	if s.cx == 0 && s.cy == 0 {
+		return image.Point{}
+	}
+	return image.Point{X: int(s.cx), Y: int(s.cy)}
 }
 
 // streamData is the growable backing store; a running detect pass appends
@@ -137,10 +163,13 @@ func (d *streamData) snapshot() (samples []streamSample, analysisW, analysisH, s
 }
 
 // DetectionFrame is one stream frame: the master subject box covering ALL
-// detected subjects (empty when the subject was lost) and the subject count.
+// detected subjects (empty when the subject was lost), the subject count and
+// the centroid of the subject-mask pixels inside that box (zero when the
+// stream predates centroid recording or the frame has no subject).
 type DetectionFrame struct {
-	BBox     Rect `json:"bbox"` // analysis px
-	Subjects int  `json:"subjects"`
+	BBox     Rect  `json:"bbox"` // analysis px
+	Subjects int   `json:"subjects"`
+	Centroid Point `json:"centroid"` // analysis px; zero = not recorded
 }
 
 // DetectionStream is the immutable-by-contract view of a detect pass's
@@ -170,7 +199,7 @@ func (s DetectionStream) Frame(i int) DetectionFrame {
 		return DetectionFrame{}
 	}
 	sm := s.data.samples[i]
-	return DetectionFrame{BBox: rectOf(sm.bbox()), Subjects: int(sm.subjects)}
+	return DetectionFrame{BBox: rectOf(sm.bbox()), Subjects: int(sm.subjects), Centroid: pointOf(sm.centroid())}
 }
 
 // Complete reports whether the producing detect pass finished all frames.
@@ -238,7 +267,11 @@ func (s DetectionStream) AnalysisVideoPath() string {
 // v2 (mode-aware analysis, plan §2/U1): meta.json carries "detected"
 // (true = the stream holds measured boxes; false = fit-mode synthetic
 // geometry samples, resumable with a detect-only pass).
-const analysisFormatVersion = 2
+// v3 (richer frame telemetry, plan U3): the stream carries a per-frame
+// subject centroid (stream v2 samples, recorded in meta.stream_version);
+// a stream written under the older 10 B layout still loads, with the
+// centroid simply not recorded for those frames.
+const analysisFormatVersion = 3
 
 // frameAlignmentTag names the prepare encoding mode (§4/S13): frame indices
 // map 1:1 between source, analysis video and stream. Part of the cache key
@@ -269,8 +302,11 @@ type analysisMeta struct {
 	// subject boxes, false when it carries fit-mode synthetic samples - the
 	// analysis video is still the full frame-aligned encode either way, so a
 	// later crop Analyze runs only the detect phase over it.
-	Detected  bool      `json:"detected"`
-	CreatedAt time.Time `json:"created_at"`
+	Detected bool `json:"detected"`
+	// StreamVersion is the stream.bin.gz sample layout the file on disk was
+	// written with (0 = the original 10 B layout, 2 = 14 B with centroid).
+	StreamVersion int       `json:"stream_version,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 // resolvedAnalyze is the validated, cache-keyed form of an AnalyzeRequest.
@@ -769,6 +805,7 @@ func analyzeWork(ctx context.Context, entry *analysisEntry, task *AnalysisTask, 
 		FPS:            sd.fpsLocked(),
 		Alignment:      frameAlignmentTag,
 		Detected:       detected,
+		StreamVersion:  streamVersion,
 		CreatedAt:      time.Now().UTC(),
 	}
 	tmpMeta := scratchName(ra.dir, analysisMetaName, tb.id)
@@ -816,15 +853,20 @@ func runDetectStream(ctx context.Context, videoPath string, tb *taskBase, sd *st
 			return count, err
 		}
 		count++
-		bbox, subj := detectFrame(buf, &lastThr)
-		sd.append(newStreamSample(bbox, subj))
+		bbox, subj, cent := detectFrame(buf, &lastThr)
+		sd.append(newStreamSample(bbox, subj, cent))
 		if batcher.observer != nil && batcher.observer.OnFrames != nil {
 			r := rectOf(bbox)
 			batcher.add(FrameRecord{
-				Frame:    count,
-				Subjects: subj,
-				BBox:     r,
-				Norm:     SpaceRects{BBox: normalizeRect(r, float64(w), float64(h))},
+				Frame:         count,
+				Subjects:      subj,
+				BBox:          r,
+				Centroid:      pointOf(cent),
+				CentroidKnown: !cent.Eq(image.Point{}),
+				Norm: SpaceRects{
+					BBox:     normalizeRect(r, float64(w), float64(h)),
+					Centroid: normalizePoint(cent, float64(w), float64(h)),
+				},
 			})
 		}
 		tb.setDone(count)
@@ -891,13 +933,15 @@ func (d *streamData) fpsLocked() float64 {
 func writeStreamFile(path string, sd *streamData) error {
 	samples, _, _, _, _, _, _ := sd.snapshot()
 	var raw bytes.Buffer
-	var scratch [10]byte
+	var scratch [14]byte
 	for _, s := range samples {
 		binary.LittleEndian.PutUint16(scratch[0:2], uint16(s.x0))
 		binary.LittleEndian.PutUint16(scratch[2:4], uint16(s.y0))
 		binary.LittleEndian.PutUint16(scratch[4:6], uint16(s.x1))
 		binary.LittleEndian.PutUint16(scratch[6:8], uint16(s.y1))
 		binary.LittleEndian.PutUint16(scratch[8:10], s.subjects)
+		binary.LittleEndian.PutUint16(scratch[10:12], uint16(s.cx))
+		binary.LittleEndian.PutUint16(scratch[12:14], uint16(s.cy))
 		raw.Write(scratch[:])
 	}
 	var gz bytes.Buffer
@@ -912,7 +956,11 @@ func writeStreamFile(path string, sd *streamData) error {
 	return os.WriteFile(path, gz.Bytes(), 0o644)
 }
 
-func readStreamFile(path string) ([]streamSample, error) {
+// readStreamFile decodes stream.bin.gz written under `version`'s layout:
+// v2 is 14 B per sample (bbox + subjects + centroid); the original v1 10 B
+// layout loads with the centroid simply not recorded (degraded telemetry —
+// the plan U3 law for caches an older build wrote).
+func readStreamFile(path string, version int) ([]streamSample, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -927,19 +975,25 @@ func readStreamFile(path string) ([]streamSample, error) {
 		return nil, err
 	}
 	b := raw.Bytes()
-	if len(b)%10 != 0 {
-		return nil, fmt.Errorf("corrupt detection stream %s: %d bytes not a multiple of 10", path, len(b))
+	rec := streamRecordBytes(version)
+	if len(b)%rec != 0 {
+		return nil, fmt.Errorf("corrupt detection stream %s: %d bytes not a multiple of %d", path, len(b), rec)
 	}
-	samples := make([]streamSample, len(b)/10)
+	samples := make([]streamSample, len(b)/rec)
 	for i := range samples {
-		o := i * 10
-		samples[i] = streamSample{
+		o := i * rec
+		s := streamSample{
 			x0:       int16(binary.LittleEndian.Uint16(b[o:])),
 			y0:       int16(binary.LittleEndian.Uint16(b[o+2:])),
 			x1:       int16(binary.LittleEndian.Uint16(b[o+4:])),
 			y1:       int16(binary.LittleEndian.Uint16(b[o+6:])),
 			subjects: binary.LittleEndian.Uint16(b[o+8:]),
 		}
+		if rec >= 14 {
+			s.cx = int16(binary.LittleEndian.Uint16(b[o+10:]))
+			s.cy = int16(binary.LittleEndian.Uint16(b[o+12:]))
+		}
+		samples[i] = s
 	}
 	return samples, nil
 }
@@ -964,12 +1018,15 @@ func loadAnalysis(ra resolvedAnalyze) (*Analysis, error) {
 		meta.Alignment != frameAlignmentTag {
 		return nil, fmt.Errorf("holocropper: stale or mismatched analysis cache metadata")
 	}
+	if meta.StreamVersion > streamVersion {
+		return nil, fmt.Errorf("holocropper: analysis cache %s was written by a newer stream format (%d)", ra.dir, meta.StreamVersion)
+	}
 
 	vst, err := os.Stat(filepath.Join(ra.dir, analysisVideoName))
 	if err != nil || vst.Size() == 0 {
 		return nil, fmt.Errorf("holocropper: analysis video missing from cache")
 	}
-	samples, err := readStreamFile(filepath.Join(ra.dir, analysisStreamName))
+	samples, err := readStreamFile(filepath.Join(ra.dir, analysisStreamName), meta.StreamVersion)
 	if err != nil {
 		return nil, err
 	}

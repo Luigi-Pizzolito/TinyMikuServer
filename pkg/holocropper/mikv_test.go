@@ -445,7 +445,7 @@ func TestMikVRequestValidation(t *testing.T) {
 }
 
 func TestRenderMikVRejectsFractionalFPS(t *testing.T) {
-	stream := newTestStream([]streamSample{newStreamSample(image.Rect(300, 120, 360, 240), 1)}, 480, 270, 960, 540)
+	stream := newTestStream([]streamSample{newStreamSample(image.Rect(300, 120, 360, 240), 1, image.Point{})}, 480, 270, 960, 540)
 	p, err := NewPlan(stream, Settings{Width: 40, Height: 40, FPS: 23.5})
 	if err != nil {
 		t.Fatal(err)

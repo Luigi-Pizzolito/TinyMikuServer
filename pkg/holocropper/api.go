@@ -180,10 +180,47 @@ func (r Rect) toImage() image.Rectangle {
 }
 
 // SpaceRects carries the same three boxes in one derived coordinate space.
+// Point is one integer coordinate in analysis-frame pixels (the subject
+// centroid). Zero is "not recorded", not a real corner hit: centroid frames
+// are only reported for measured subjects.
+type Point struct {
+	X int `json:"x"`
+	Y int `json:"y"`
+}
+
+// NormPoint is a point in the same space as its SpaceRects member: Norm
+// carries it 0..1 over the analysis frame, Out in output-frame pixels.
+type NormPoint struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+}
+
+func pointOf(p image.Point) Point { return Point{X: p.X, Y: p.Y} }
+
+func normalizePoint(p image.Point, w, h float64) NormPoint {
+	if w <= 0 || h <= 0 {
+		return NormPoint{}
+	}
+	return NormPoint{X: float64(p.X) / w, Y: float64(p.Y) / h}
+}
+
+// mapPointToOutput maps an analysis-space point through the applied crop
+// rect exactly as mapRectToOutput maps rects.
+func mapPointToOutput(p image.Point, crop Rect, outW, outH int) NormPoint {
+	if crop.W <= 0 || crop.H <= 0 {
+		return NormPoint{}
+	}
+	return NormPoint{
+		X: (float64(p.X) - crop.X) * (float64(outW) / crop.W),
+		Y: (float64(p.Y) - crop.Y) * (float64(outH) / crop.H),
+	}
+}
+
 type SpaceRects struct {
-	BBox Rect `json:"bbox"`
-	EMA  Rect `json:"ema"`
-	Crop Rect `json:"crop"`
+	BBox     Rect      `json:"bbox"`
+	EMA      Rect      `json:"ema"`
+	Crop     Rect      `json:"crop"`
+	Centroid NormPoint `json:"centroid"`
 }
 
 // FrameRecord is one frame of the framing replay. Raw boxes are analysis-
@@ -194,11 +231,13 @@ type FrameRecord struct {
 	Frame    int `json:"frame"` // 1-based, matches the debug CSV
 	Subjects int `json:"subjects"`
 
-	BBox    Rect    `json:"bbox"` // master subject bbox (zero when lost)
-	EMA     Rect    `json:"ema"`  // smoothed subject box (zero before first subject)
-	Crop    Rect    `json:"crop"` // applied crop rectangle
-	TargetH float64 `json:"target_h"`
-	WalkTgt float64 `json:"walk_tgt"` // 0 = walk leash inactive
+	BBox          Rect    `json:"bbox"`           // master subject bbox (zero when lost)
+	EMA           Rect    `json:"ema"`            // smoothed subject box (zero before first subject)
+	Crop          Rect    `json:"crop"`           // applied crop rectangle
+	Centroid      Point   `json:"centroid"`       // subject-mask centre of mass inside BBox (analysis px)
+	CentroidKnown bool    `json:"centroid_known"` // false when the stream predates centroid recording
+	TargetH       float64 `json:"target_h"`
+	WalkTgt       float64 `json:"walk_tgt"` // 0 = walk leash inactive
 	// WalkActive reports the per-frame walk state: the render-level walk gate
 	// is active AND this frame actually has a live leash target (the raw
 	// walk_tgt value). A gated render may still fall back to centering on
