@@ -50,27 +50,46 @@ const previewRetention = 3
 const (
 	previewVP9CRF     = 30
 	previewVP9CPUUsed = 4
-	// previewGOPMaxFrames is the frame-count ceiling the measured Chromium
-	// play zone established for vp9-webm previews (see muxFrameSequence).
+	// previewGOPMaxFrames is the frame-count ceiling for a preview's keyframe
+	// interval: one second of scrubbing worth of frames at most, so a seek
+	// lands on a keyframe quickly whatever the plan's fps (see
+	// muxFrameSequence). It is NOT the decode-playability law - that is the
+	// colour range below.
 	previewGOPMaxFrames = 24
+)
+
+// The vp9-webm preview colour law. Preview frames are born as JPEG stills,
+// which are full range (0-255); a stream that keeps them that way and leaves
+// the range undeclared is one Chromium's HARDWARE VP9 decoder refuses - the
+// VA-API decoder answers "DecoderStatus::1: error decoding stream" a second
+// into playback (MEDIA_ERR_DECODE), while every software decoder - libvpx,
+// ffvp9, Chromium's own software path - reads the same bytes fine. Converting
+// the stills to limited range, and stamping the stream with that range, puts
+// the preview back inside what hardware decoders accept. Measured on the QA
+// rig (Mesa VA-API, AMD raphael): same frames, same encoder settings, same
+// GOP - full-range builds die on the first hardware decode, limited-range
+// builds play end to end (docs/current/VIDEO_SECTION_V2.md §6).
+const (
+	// previewRangeFilter converts the JPEG stills to limited range as they
+	// enter the encoder, so the preview's levels match the source video's.
+	previewRangeFilter = "scale=in_range=jpeg:out_range=tv"
+	// previewColorRange is the range the muxer stamps on the stream.
+	previewColorRange = "tv"
 )
 
 // PreviewLaw stamps every preview sidecar with the engine's preview ENCODE
 // law at build time. It is bumped when a build law changes in a way that
-// makes older files suspect - law 1 is the vp9 GOP ceiling (see
-// muxFrameSequence): files encoded before it sit in the zone Chromium's VP9
-// decoder refuses for some content, so retained-file reuse must skip them
-// and the next use re-encodes. Sidecars predating the field read as law 0:
-// never current.
-const PreviewLaw = 1
+// makes older files suspect. Law 1 capped the keyframe interval; law 2 is the
+// limited-range colour encode above - law-1 files carry full-range JPEG
+// stills, which hardware VP9 decoders refuse, so retained-file reuse must
+// skip them and the next use re-encodes. Sidecars predating the field (and
+// law 1 itself) read as not current.
+const PreviewLaw = 2
 
 // previewGOPFrames is the keyframe interval the vp9-webm preview mux hands
-// ffmpeg: at most one second of frames, never more than previewGOPMaxFrames.
-// Chromium's VP9 decoder refuses previews whose keyframes sit 48+ frames
-// apart - or whose whole clip is one such GOP - on the QA rig's content
-// (see muxFrameSequence); 24-frame intervals play. The cap keeps every
-// preview inside the measured zone no matter the plan's fps. Never below 2 -
-// ffmpeg rejects -g 1 as a GOP size.
+// ffmpeg: at most one second of frames, never more than previewGOPMaxFrames,
+// so a seek has a keyframe close by at any plan fps. Never below 2 - ffmpeg
+// rejects -g 1 as a GOP size.
 func previewGOPFrames(fps float64) int {
 	g := int(math.Round(fps))
 	if g > previewGOPMaxFrames {
@@ -588,21 +607,28 @@ func muxFrameSequence(ctx context.Context, ffmpegPath, framesDir, audioSource st
 		// Constant-quality VP9 with a deadline the preview pass can actually
 		// afford: a preview is a framing check, not an archive master.
 		//
-		// -g is not cosmetics. Chromium/blink's VP9 decoder refuses some
-		// previews outright (MEDIA_ERR_DECODE straight after
-		// loadedmetadata, while every other decoder - libvpx itself
-		// included - reads the same bytes fine), and the refusal follows
-		// the keyframe interval, not the encoder settings: measured on the
-		// same 96-frame JPEG preview content at 24 fps, a GOP of 24 frames
-		// or less plays, a GOP of 48 or more does not, and clips of 48
-		// frames play at any interval. The encode therefore caps its key
-		// interval at ONE second of frames - half of libvpx's default 128 -
-		// and the preview stays playable by construction instead of by
-		// luck.
-		args = append(args, "-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p",
+		// Two args are law, not taste:
+		//
+		// -vf + -color_range carry the preview out of the refusal zone.
+		// The frames are full-range JPEG stills, and a full-range vp9
+		// stream with the range left undeclared is what Chromium's HARDWARE
+		// VP9 decoder refuses: the VA-API decoder answers "error decoding
+		// stream" (MEDIA_ERR_DECODE) while libvpx, ffvp9 and Chromium's own
+		// software path read the same bytes happily. Converting the stills
+		// to limited range and stamping that on the stream fixes it.
+		//
+		// -g keeps a keyframe within one second of any seek. Note the
+		// correction of an earlier reading here: the refusal was first
+		// blamed on the keyframe interval because the failing previews
+		// happened to fail near a GOP boundary, but the measured matrix
+		// shows full-range builds die at GOP 128, 48, 24, 12 and all-intra
+		// alike, while limited-range builds play at every one of them.
+		args = append(args, "-vf", previewRangeFilter,
+			"-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p",
 			"-crf", strconv.Itoa(previewVP9CRF), "-b:v", "0",
 			"-deadline", "good", "-cpu-used", strconv.Itoa(previewVP9CPUUsed),
-			"-g", strconv.Itoa(previewGOPFrames(fps)))
+			"-g", strconv.Itoa(previewGOPFrames(fps)),
+			"-color_range", previewColorRange)
 	} else {
 		args = append(args, "-c:v", "mjpeg", "-q:v", "6")
 	}

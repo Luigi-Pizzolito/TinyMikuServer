@@ -1015,12 +1015,13 @@ func TestPreviewGOPFramesLaw(t *testing.T) {
 	}
 }
 
-// TestRenderPreviewVP9GOPChains pins the decode-compatibility reason the GOP
-// cap exists: the standard fixture is 4 seconds, so a default-keyint vp9 pass
-// renders it as ONE inter-frame chain. Chromium's VP9 decoder refuses such a
-// preview (MEDIA_ERR_DECODE straight after loadedmetadata, while libvpx and
-// ffvp9 read the same bytes fine) - so every chain in a preview must be at
-// most previewGOPMaxFrames long, which a keyframe interval proves.
+// TestRenderPreviewVP9GOPChains pins the seek-responsiveness half of the mux:
+// a preview must carry a keyframe every previewGOPMaxFrames frames so a scrub
+// lands quickly. (The decode-playability half is the colour range - see
+// TestRenderPreviewLimitedRange. The first reading of the Chromium refusal
+// blamed the keyframe interval because the failing previews died near a GOP
+// boundary; the measured matrix shows they die at every interval while the
+// colour range is full, so the interval was never the law.)
 func TestRenderPreviewVP9GOPChains(t *testing.T) {
 	ffmpeg := requireFFmpeg(t)
 	a, p := setupRenderFixture(t, ffmpeg, 240, 240)
@@ -1038,9 +1039,60 @@ func TestRenderPreviewVP9GOPChains(t *testing.T) {
 	}
 	keyframes := countVideoKeyframes(t, vp9.CropVideoPath)
 	if keyframes < 2 {
-		t.Errorf("vp9 preview %s carries %d keyframe(s): a whole preview would hang off one inter-frame chain, and Chromium refuses exactly those",
+		t.Errorf("vp9 preview %s carries %d keyframe(s): a scrub through a whole-preview inter-frame chain has no keyframe to land on",
 			vp9.CropVideoPath, keyframes)
 	}
+}
+
+// TestRenderPreviewLimitedRange pins the playability law: the mux must convert
+// its JPEG stills to limited range and stamp that on the stream. A preview
+// that keeps the stills' native full range decodes happily in every software
+// decoder and is refused by Chromium's hardware VP9 path (MEDIA_ERR_DECODE a
+// second into playback) - which is the whole framing preview being unreadable
+// in the app's own browser.
+func TestRenderPreviewLimitedRange(t *testing.T) {
+	ffmpeg := requireFFmpeg(t)
+	a, p := setupRenderFixture(t, ffmpeg, 240, 240)
+
+	task, err := a.RenderPreview(context.Background(), p, PreviewRequest{
+		FFmpegPath: ffmpeg,
+		Options:    PreviewOptions{Kind: PreviewCrop, MuxVideo: PreviewMuxVP9WebM},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vp9, err := task.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := ffprobeColorRange(t, vp9.CropVideoPath)
+	if got != previewColorRange && got != "limited" {
+		t.Errorf("vp9 preview %s carries colour range %q, want %q (limited): hardware VP9 decoders refuse the full-range build",
+			vp9.CropVideoPath, got, previewColorRange)
+	}
+	if law := a.Previews(); len(law) > 0 {
+		for _, ref := range law {
+			if ref.Law != PreviewLaw {
+				t.Errorf("preview %s carries law %d, want %d", ref.Path, ref.Law, PreviewLaw)
+			}
+		}
+	}
+}
+
+// ffprobeColorRange reports the colour range ffprobe reads on a file's video
+// stream ("tv"/"limited" for limited range, "pc"/"full" for full range).
+func ffprobeColorRange(t *testing.T, path string) string {
+	t.Helper()
+	ffprobe, err := exec.LookPath("ffprobe")
+	if err != nil {
+		t.Fatalf("ffprobe is not on PATH and this test pins the colour range: %v", err)
+	}
+	out, err := exec.Command(ffprobe, "-v", "error", "-select_streams", "v:0",
+		"-show_entries", "stream=color_range", "-of", "csv=p=0", path).Output()
+	if err != nil {
+		t.Fatalf("ffprobe %s: %v", path, err)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // countVideoKeyframes counts the packets ffprobe flags as keyframes.

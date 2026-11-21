@@ -497,8 +497,9 @@ type PreviewRef struct {
 	MuxVideo     PreviewMux  `json:"mux_video"`
 	SettingsHash string      `json:"settings_hash"`
 	// Law names the engine's preview ENCODE law this file was built under
-	// (PreviewLaw). Sidecars older than the current law carry 0, so a
-	// consumer reuses only files the current encoder considers playable.
+	// (PreviewLaw). Anything not stamped with the current law - an older
+	// law, or a pre-field sidecar that reads as 0 - is never reuse-current,
+	// so a consumer reuses only files the current encoder considers playable.
 	Law       int       `json:"law,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	Width     int       `json:"width"`
