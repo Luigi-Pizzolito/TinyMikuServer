@@ -372,7 +372,7 @@ func renderMikVWork(ctx context.Context, a *Analysis, task *MikVTask, p *Plan, r
 	if jpegQuality == 0 {
 		jpegQuality = mikvformat.DefaultJPEGQuality
 	}
-	frames, err := plannedFrames(ctx, tb, a, p, sched, PhaseMikVFrames, func(outIdx, srcIdx int, out *image.RGBA) error {
+	frames, err := plannedFrames(ctx, tb, a, p, sched, PhaseMikVFrames, func(outIdx, srcIdx int, _, out *image.RGBA) error {
 		var payload []byte
 		if req.Options.VideoJPEG {
 			var buf jpegBuffer

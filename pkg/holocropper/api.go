@@ -470,6 +470,21 @@ type PreviewOptions struct {
 	Kind        PreviewKind `json:"kind"` // "" = crop_overlay
 	DrawSubject bool        `json:"draw_subject"`
 	DrawCrop    bool        `json:"draw_crop"`
+	// G4 overlay layers (plan Milestone G4, item 761). All default OFF, so a
+	// preview built without them is byte-identical to the pre-G4 engine:
+	// DrawCentroid the subject centre-of-mass marker; DrawCropTarget the
+	// ghosted commanded crop (G2 telemetry, drawn clipped so an off-frame
+	// command reads at the frame edge); DrawAxes the commanded pan-target
+	// axes; DrawReadouts the zoom chip and walk-leash/scene-cut chips;
+	// DrawSubjectBoxes the G3 subject detail's merged pools (cyan) + raw
+	// pre-merge components (magenta accepted / violet rejected); DrawIslands
+	// the island outlines (the judged sheet puts them behind a toggle).
+	DrawCentroid     bool `json:"draw_centroid"`
+	DrawCropTarget   bool `json:"draw_crop_target"`
+	DrawAxes         bool `json:"draw_axes"`
+	DrawReadouts     bool `json:"draw_readouts"`
+	DrawSubjectBoxes bool `json:"draw_subject_boxes"`
+	DrawIslands      bool `json:"draw_islands"`
 	// MuxVideo picks the codec the preview sequences are muxed with. "" or
 	// mjpeg is the engine default: the JPEG sequence is put into an MP4 the
 	// way the CLI mux does it, video only. vp9-webm encodes VP9 video and

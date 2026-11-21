@@ -464,7 +464,14 @@ func previewWork(ctx context.Context, a *Analysis, task *PreviewTask, p *Plan, o
 func runCropLoop(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, cropDir, overlayDir string, opts PreviewOptions, phase Phase) (int, error) {
 	r := p.resolved
 	style := defaultOverlayStyle()
-	return plannedFrames(ctx, tb, a, p, a.frameSchedule(p), phase, func(outIdx, srcIdx int, out *image.RGBA) error {
+	// G4 detail layers need the mask, not just the record. The stream's
+	// threshold-stamped samples let each decoded analysis frame be measured
+	// with the exact binarization the detect pass ran (measureDecodedFrame);
+	// a frame schedule that repeats one analysis frame measures it once.
+	wantDetail := overlayDir != "" && (opts.DrawSubjectBoxes || opts.DrawIslands)
+	stream := a.Stream()
+	memoIdx, memoOK, memo := -1, false, subjectDetail{}
+	return plannedFrames(ctx, tb, a, p, a.frameSchedule(p), phase, func(outIdx, srcIdx int, analysis, out *image.RGBA) error {
 		if cropDir != "" {
 			if err := writeJPEG(cropDir, outIdx+1, out); err != nil {
 				return err
@@ -473,6 +480,15 @@ func runCropLoop(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, cropDi
 		if overlayDir != "" {
 			overlay := image.NewRGBA(image.Rect(0, 0, r.OutputW, r.OutputH))
 			copyRGBA(overlay, out)
+			if wantDetail {
+				if srcIdx != memoIdx {
+					memoIdx = srcIdx
+					memo, memoOK = stream.measureDecodedFrame(srcIdx, analysis)
+				}
+				if memoOK {
+					drawSubjectLayers(overlay, p.records[srcIdx], opts, style, memo)
+				}
+			}
 			drawOverlayBoxes(overlay, p.records[srcIdx], opts, style)
 			if err := writeJPEG(overlayDir, outIdx+1, overlay); err != nil {
 				return err
@@ -490,11 +506,14 @@ func runCropLoop(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, cropDi
 // schedule, so an output pass writes renderFPS seconds-worth of frames even
 // when the analysis clock is different. fn owns what the frame becomes -
 // a JPEG file (runCropLoop) or a MikV frame payload (RenderMikV) - and is told
-// both the output frame it is writing and which analysis frame it replays.
+// both the output frame it is writing and which analysis frame it replays,
+// plus the DECODED analysis frame itself (G4: the overlay pass measures its
+// subject detail from the exact pixels this pass decoded; callers that only
+// want the framed output ignore it).
 //
-// fn receives the same image for every output slot that repeats one analysis
-// frame: it must consume it (encode or copy), never keep it.
-func plannedFrames(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, sched frameSchedule, phase Phase, fn func(outIdx, srcIdx int, out *image.RGBA) error) (int, error) {
+// fn receives the same images for every output slot that repeats one analysis
+// frame: it must consume them (encode, measure, or copy), never keep them.
+func plannedFrames(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, sched frameSchedule, phase Phase, fn func(outIdx, srcIdx int, analysis, framed *image.RGBA) error) (int, error) {
 	video, err := vidio.NewVideo(a.AnalysisVideoPath())
 	if err != nil {
 		return 0, fmt.Errorf("holocropper: open analysis video %s: %w", a.AnalysisVideoPath(), err)
@@ -553,7 +572,7 @@ func plannedFrames(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, sche
 			frame = fillResizeTo(cropped, r.OutputW, r.OutputH)
 		}
 		for out < sched.Frames && sched.SrcFor[out] == src {
-			if err := fn(out, src, frame); err != nil {
+			if err := fn(out, src, buf, frame); err != nil {
 				return out, err
 			}
 			out++

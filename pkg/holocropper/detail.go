@@ -3,6 +3,7 @@ package holocropper
 import (
 	"errors"
 	"fmt"
+	"image"
 )
 
 /* Lazy per-frame subject detail (HOLOCROPPER-API-PLAN.md Milestone G3,
@@ -80,6 +81,31 @@ func (s DetectionStream) FrameIslands(frame int) ([]SubjectIsland, error) {
 		return nil, err
 	}
 	return subjectIslands(d), nil
+}
+
+// measureDecodedFrame is the no-seek twin of measureFrame for the render
+// passes: it measures a frame the caller has ALREADY decoded (the plannedFrames
+// loop holds the analysis frame it just read), re-binarizing it with the
+// threshold the detect pass recorded for sample idx. ok is false - honestly,
+// not approximately - when the sample is out of range or its threshold was
+// never recorded (a fit probe or a pre-G3 cache): the caller simply draws no
+// detail layers. Measuring the frame the pass itself decoded keeps the drawn
+// layers aligned with the pixels the preview ships.
+func (s DetectionStream) measureDecodedFrame(idx int, src *image.RGBA) (subjectDetail, bool) {
+	if s.data == nil || src == nil {
+		return subjectDetail{}, false
+	}
+	s.data.mu.RLock()
+	defer s.data.mu.RUnlock()
+	if idx < 0 || idx >= len(s.data.samples) {
+		return subjectDetail{}, false
+	}
+	sm := s.data.samples[idx]
+	if sm.thr == thrUnrecorded {
+		return subjectDetail{}, false
+	}
+	gray := convertToMonochrome(src)
+	return subjectDetailFromBinary(applyThreshold(gray, uint8(sm.thr))), true
 }
 
 // measureFrame re-runs the full subject measurement of one frame from the
