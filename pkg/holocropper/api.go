@@ -496,11 +496,15 @@ type PreviewRef struct {
 	Path         string      `json:"path"`
 	MuxVideo     PreviewMux  `json:"mux_video"`
 	SettingsHash string      `json:"settings_hash"`
-	CreatedAt    time.Time   `json:"created_at"`
-	Width        int         `json:"width"`
-	Height       int         `json:"height"`
-	FPS          float64     `json:"fps"`
-	Frames       int         `json:"frames"`
+	// Law names the engine's preview ENCODE law this file was built under
+	// (PreviewLaw). Sidecars older than the current law carry 0, so a
+	// consumer reuses only files the current encoder considers playable.
+	Law       int       `json:"law,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	Width     int       `json:"width"`
+	Height    int       `json:"height"`
+	FPS       float64   `json:"fps"`
+	Frames    int       `json:"frames"`
 }
 
 // PreviewResult is what a finished PreviewTask Wait() returns.

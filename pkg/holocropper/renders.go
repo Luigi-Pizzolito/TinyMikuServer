@@ -55,6 +55,15 @@ const (
 	previewGOPMaxFrames = 24
 )
 
+// PreviewLaw stamps every preview sidecar with the engine's preview ENCODE
+// law at build time. It is bumped when a build law changes in a way that
+// makes older files suspect - law 1 is the vp9 GOP ceiling (see
+// muxFrameSequence): files encoded before it sit in the zone Chromium's VP9
+// decoder refuses for some content, so retained-file reuse must skip them
+// and the next use re-encodes. Sidecars predating the field read as law 0:
+// never current.
+const PreviewLaw = 1
+
 // previewGOPFrames is the keyframe interval the vp9-webm preview mux hands
 // ffmpeg: at most one second of frames, never more than previewGOPMaxFrames.
 // Chromium's VP9 decoder refuses previews whose keyframes sit 48+ frames
@@ -388,7 +397,7 @@ func previewWork(ctx context.Context, a *Analysis, task *PreviewTask, p *Plan, o
 		out.CropVideoPath = final
 		if err := writePreviewSidecar(PreviewRef{
 			Version: v, Kind: PreviewCrop, Path: final, MuxVideo: mux, SettingsHash: out.SettingsHash,
-			CreatedAt: time.Now().UTC(), Width: r.OutputW, Height: r.OutputH, FPS: out.FPS, Frames: frames,
+			CreatedAt: time.Now().UTC(), Width: r.OutputW, Height: r.OutputH, FPS: out.FPS, Frames: frames, Law: PreviewLaw,
 		}); err != nil {
 			return nil, err
 		}
@@ -409,7 +418,7 @@ func previewWork(ctx context.Context, a *Analysis, task *PreviewTask, p *Plan, o
 		out.OverlayVideoPath = final
 		if err := writePreviewSidecar(PreviewRef{
 			Version: v, Kind: PreviewOverlay, Path: final, MuxVideo: mux, SettingsHash: out.SettingsHash,
-			CreatedAt: time.Now().UTC(), Width: r.OutputW, Height: r.OutputH, FPS: out.FPS, Frames: frames,
+			CreatedAt: time.Now().UTC(), Width: r.OutputW, Height: r.OutputH, FPS: out.FPS, Frames: frames, Law: PreviewLaw,
 		}); err != nil {
 			return nil, err
 		}

@@ -1063,3 +1063,59 @@ func countVideoKeyframes(t *testing.T, path string) int {
 	}
 	return n
 }
+
+// TestPreviewSidecarCarriesLaw pins the reuse guard: a sidecar records the
+// encode law that built its file, and a sidecar older than the law (written
+// before the field existed) reads as zero - never current. A consumer's
+// retained-file reuse can therefore only land on files the current engine
+// considers playable, and a pre-law preview self-heals on the next use.
+func TestPreviewSidecarCarriesLaw(t *testing.T) {
+	ffmpeg := requireFFmpeg(t)
+	a, p := setupRenderFixture(t, ffmpeg, 240, 240)
+	task, err := a.RenderPreview(context.Background(), p, PreviewRequest{
+		FFmpegPath: ffmpeg,
+		Options:    PreviewOptions{Kind: PreviewCrop, MuxVideo: PreviewMuxVP9WebM},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := task.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	refs := a.Previews()
+	if len(refs) == 0 {
+		t.Fatal("no preview refs to check the law stamp on")
+	}
+	for _, ref := range refs {
+		if ref.Law != PreviewLaw {
+			t.Errorf("preview %s carries law %d, want %d", ref.Path, ref.Law, PreviewLaw)
+		}
+	}
+
+	legacy := filepath.Join(a.PreviewsDir(), "legacy-240x240-v99.webm")
+	if err := os.WriteFile(legacy, []byte("not really a video"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePreviewSidecar(PreviewRef{
+		Version: 99, Kind: PreviewCrop, Path: legacy, MuxVideo: PreviewMuxMJPEG,
+		SettingsHash: "whatever", CreatedAt: time.Now().UTC(), Width: 240, Height: 240,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reread, err := readPreviewRefs(a.PreviewsDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, ref := range reread {
+		if ref.Path == legacy {
+			found = true
+			if ref.Law != 0 {
+				t.Errorf("legacy sidecar read law %d, want 0 (pre-law files must never look current)", ref.Law)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("the legacy sidecar was not read back")
+	}
+}
