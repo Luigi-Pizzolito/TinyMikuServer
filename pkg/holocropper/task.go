@@ -59,9 +59,13 @@ type taskBase struct {
 
 	observer *Observer
 	lastEmit time.Time
-	warnings []string // ffmpeg diagnostics: OnWarning events live, Warnings() on the Task, results embed them
+	warnings []string       // distinct ffmpeg diagnostics, in the order they first appeared
+	warnSeen map[string]int // per-Task repeat counts behind those distinct entries
 	terminal chan struct{}
 }
+
+// maxTaskWarnings bounds the distinct diagnostic list a Task keeps.
+const maxTaskWarnings = 200
 
 // newTaskBase creates a queued Task under a cancellable context derived
 // from ctx. The runner must call begin() when it starts and finish(err)
@@ -193,19 +197,50 @@ func (tb *taskBase) advanceTo(done int) {
 	tb.publish(info, false) // throttled
 }
 
-// warn surfaces an ffmpeg diagnostics line through Observer.OnWarning and
-// records it for Result.Warnings (bounded, so a chatty ffmpeg cannot grow it
-// without limit).
+// warn surfaces an ffmpeg diagnostic through Observer.OnWarning and records it
+// for Result.Warnings. A chatty ffmpeg repeats the same line per frame — a
+// decode error is a per-frame event — so each DISTINCT message fires ONCE per
+// Task (the plan U3 "once per pass" law) and its repeat count is available
+// from WarningCounts(). Bounded, so a chatty ffmpeg cannot grow it without
+// limit.
 func (tb *taskBase) warn(msg string) {
 	tb.mu.Lock()
+	if tb.warnSeen == nil {
+		tb.warnSeen = make(map[string]int)
+	}
+	if n, seen := tb.warnSeen[msg]; seen {
+		tb.warnSeen[msg] = n + 1
+		tb.mu.Unlock()
+		return // already surfaced this pass
+	}
+	tb.warnSeen[msg] = 1
 	tb.warnings = append(tb.warnings, msg)
-	if len(tb.warnings) > 200 {
-		tb.warnings = tb.warnings[len(tb.warnings)-200:]
+	if len(tb.warnings) > maxTaskWarnings {
+		// Keep the newest ones; a dropped message may surface again later.
+		dropped := tb.warnings[0]
+		tb.warnings = tb.warnings[1:]
+		delete(tb.warnSeen, dropped)
 	}
 	tb.mu.Unlock()
 	if tb.observer != nil && tb.observer.OnWarning != nil {
 		tb.observer.OnWarning(msg)
 	}
+}
+
+// WarningCounts reports how many times each distinct diagnostic fired during
+// this Task, keyed by the same text Warnings() returns. A message that fired
+// once maps to 1; the count is how loud ffmpeg actually was.
+func (tb *taskBase) WarningCounts() map[string]int {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if len(tb.warnSeen) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(tb.warnSeen))
+	for k, v := range tb.warnSeen {
+		out[k] = v
+	}
+	return out
 }
 
 // finish closes out the Task exactly once, deriving the terminal state:

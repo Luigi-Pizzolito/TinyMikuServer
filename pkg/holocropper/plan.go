@@ -260,6 +260,7 @@ func NewPlan(stream DetectionStream, s Settings) (*Plan, error) {
 		out := dec.step(i+1, bbox, int(sm.subjects), bounds)
 
 		crop := Rect{X: out.CropCx - out.CropW/2, Y: out.CropCy - out.CropH/2, W: out.CropW, H: out.CropH}
+		target := Rect{X: out.CmdCx - out.CmdW/2, Y: out.CmdCy - out.CmdH/2, W: out.CmdW, H: out.CmdH}
 		bb := rectOf(bbox)
 		em := rectOf(out.EMA)
 		cent := sm.centroid()
@@ -279,17 +280,25 @@ func NewPlan(stream DetectionStream, s Settings) (*Plan, error) {
 			SubjectLost:   out.SubjectLost,
 			SceneCut:      out.SceneCut,
 			Grounded:      out.Grounded,
+			CropTarget:    target,
+			PanTarget:     FPoint{X: out.PanX, Y: out.PanY},
+			ZoomCurrent:   out.ZoomCurrent,
+			ZoomTarget:    out.ZoomTarget,
 			Norm: SpaceRects{
-				BBox:     normalizeRect(bb, faw, fah),
-				EMA:      normalizeRect(em, faw, fah),
-				Crop:     normalizeRect(crop, faw, fah),
-				Centroid: normalizePoint(cent, faw, fah),
+				BBox:       normalizeRect(bb, faw, fah),
+				EMA:        normalizeRect(em, faw, fah),
+				Crop:       normalizeRect(crop, faw, fah),
+				CropTarget: normalizeRect(target, faw, fah),
+				Centroid:   normalizePoint(cent, faw, fah),
+				PanTarget:  normalizeXY(out.PanX, out.PanY, faw, fah),
 			},
 			Out: SpaceRects{
-				BBox:     mapRectToOutput(bb, crop, w, h),
-				EMA:      mapRectToOutput(em, crop, w, h),
-				Crop:     mapRectToOutput(crop, crop, w, h),
-				Centroid: mapPointToOutput(cent, crop, w, h),
+				BBox:       mapRectToOutput(bb, crop, w, h),
+				EMA:        mapRectToOutput(em, crop, w, h),
+				Crop:       mapRectToOutput(crop, crop, w, h),
+				CropTarget: mapRectToOutput(target, crop, w, h),
+				Centroid:   mapPointToOutput(cent, crop, w, h),
+				PanTarget:  mapXYToOutput(out.PanX, out.PanY, crop, w, h),
 			},
 		})
 		cropRects = append(cropRects, out.CropRect)

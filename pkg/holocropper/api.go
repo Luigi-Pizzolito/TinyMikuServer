@@ -195,32 +195,50 @@ type NormPoint struct {
 	Y float64 `json:"y"`
 }
 
+// FPoint is a float coordinate pair in analysis-frame pixels: the framing
+// controller's setpoints (pan targets, commanded crop centres) are float,
+// unlike the stream-packed centroid, which is int16.
+type FPoint struct {
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+}
+
 func pointOf(p image.Point) Point { return Point{X: p.X, Y: p.Y} }
 
 func normalizePoint(p image.Point, w, h float64) NormPoint {
+	return normalizeXY(float64(p.X), float64(p.Y), w, h)
+}
+
+func normalizeXY(x, y, w, h float64) NormPoint {
 	if w <= 0 || h <= 0 {
 		return NormPoint{}
 	}
-	return NormPoint{X: float64(p.X) / w, Y: float64(p.Y) / h}
+	return NormPoint{X: x / w, Y: y / h}
 }
 
 // mapPointToOutput maps an analysis-space point through the applied crop
 // rect exactly as mapRectToOutput maps rects.
 func mapPointToOutput(p image.Point, crop Rect, outW, outH int) NormPoint {
+	return mapXYToOutput(float64(p.X), float64(p.Y), crop, outW, outH)
+}
+
+func mapXYToOutput(x, y float64, crop Rect, outW, outH int) NormPoint {
 	if crop.W <= 0 || crop.H <= 0 {
 		return NormPoint{}
 	}
 	return NormPoint{
-		X: (float64(p.X) - crop.X) * (float64(outW) / crop.W),
-		Y: (float64(p.Y) - crop.Y) * (float64(outH) / crop.H),
+		X: (x - crop.X) * (float64(outW) / crop.W),
+		Y: (y - crop.Y) * (float64(outH) / crop.H),
 	}
 }
 
 type SpaceRects struct {
-	BBox     Rect      `json:"bbox"`
-	EMA      Rect      `json:"ema"`
-	Crop     Rect      `json:"crop"`
-	Centroid NormPoint `json:"centroid"`
+	BBox       Rect      `json:"bbox"`
+	EMA        Rect      `json:"ema"`
+	Crop       Rect      `json:"crop"`
+	CropTarget Rect      `json:"crop_target"` // commanded crop (G2); in Out it maps through the APPLIED crop
+	Centroid   NormPoint `json:"centroid"`
+	PanTarget  NormPoint `json:"pan_target"` // pan setpoints this frame (G2)
 }
 
 // FrameRecord is one frame of the framing replay. Raw boxes are analysis-
@@ -238,6 +256,19 @@ type FrameRecord struct {
 	CentroidKnown bool    `json:"centroid_known"` // false when the stream predates centroid recording
 	TargetH       float64 `json:"target_h"`
 	WalkTgt       float64 `json:"walk_tgt"` // 0 = walk leash inactive
+
+	// Framing telemetry (plan Milestone G2): what the controllers COMMANDED
+	// this frame, before containment granted it. CropTarget is the commanded
+	// crop box (before the padded-width fold and the frame clamps) — the gap
+	// between it and Crop is what clamping took away. PanTarget is the pair of
+	// setpoints the axis PIDs were fed (a grounded frame's vertical setpoint IS
+	// the floor pin). Zoom* are frame-height-relative: 1 = full frame, 0 = no
+	// reading. Fit-mode records leave this whole block zero: there is no
+	// controller in a bars fit.
+	CropTarget  Rect    `json:"crop_target"`
+	PanTarget   FPoint  `json:"pan_target"`
+	ZoomCurrent float64 `json:"zoom_current"`
+	ZoomTarget  float64 `json:"zoom_target"`
 	// WalkActive reports the per-frame walk state: the render-level walk gate
 	// is active AND this frame actually has a live leash target (the raw
 	// walk_tgt value). A gated render may still fall back to centering on

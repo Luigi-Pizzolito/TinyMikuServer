@@ -3,6 +3,7 @@ package holocropper
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -60,13 +61,38 @@ func TestTaskWarningsSnapshot(t *testing.T) {
 		t.Errorf("Warnings() after finish(err) = %v, want both kept", after)
 	}
 
-	// Bounded: a chatty ffmpeg keeps only the newest 200.
-	chatty := newTaskBase(context.Background(), TaskRenderFinal, nil)
+	// Bounded AND deduped (plan U3 "once per pass"): a per-frame ffmpeg
+	// diagnostic fires hundreds of times in one pass; the Task surfaces it
+	// once, counts the repeats, and the Observer fires once per message.
+	observed := 0
+	chatty := newTaskBase(context.Background(), TaskRenderFinal, &Observer{
+		OnWarning: func(string) { observed++ },
+	})
 	for i := 0; i < 250; i++ {
-		chatty.warn("tok")
+		chatty.warn("Error decoding frame")
 	}
-	if w := chatty.Warnings(); len(w) != 200 {
-		t.Errorf("chatty Task kept %d warnings, want the 200 cap", len(w))
+	if w := chatty.Warnings(); len(w) != 1 || w[0] != "Error decoding frame" {
+		t.Errorf("chatty Task warnings = %v, want the single distinct message", w)
+	}
+	if n := chatty.WarningCounts()["Error decoding frame"]; n != 250 {
+		t.Errorf("repeat count = %d, want 250", n)
+	}
+	if observed != 1 {
+		t.Errorf("Observer.OnWarning fired %d times, want once per message per Task", observed)
+	}
+
+	// Distinct messages still bound at the cap, oldest first, and a dropped
+	// message can surface again as a fresh event.
+	big := newTaskBase(context.Background(), TaskRenderFinal, nil)
+	for i := 0; i < 250; i++ {
+		big.warn(fmt.Sprintf("distinct %d", i))
+	}
+	if w := big.Warnings(); len(w) != maxTaskWarnings || w[0] != "distinct 50" || w[len(w)-1] != "distinct 249" {
+		t.Errorf("cap behaviour: kept %d entries, first %q, last %q", len(w), w[0], w[len(w)-1])
+	}
+	big.warn("distinct 0")
+	if w := big.Warnings(); w[len(w)-1] != "distinct 0" || len(w) != maxTaskWarnings {
+		t.Errorf("evicted message did not re-enter as a fresh event: %q (len %d)", w[len(w)-1], len(w))
 	}
 }
 

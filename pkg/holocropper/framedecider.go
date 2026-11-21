@@ -46,6 +46,17 @@ type framingOutput struct {
 	SceneCut    bool    // bbox jump / subject-count break reset the tracking
 	Grounded    bool    // landscape floor pin applied this frame (§12.10)
 	CropRect    image.Rectangle
+
+	// Overlay telemetry (plan Milestone G2): the framing the controllers
+	// COMMANDED this frame, which containment then may not grant.
+	// Cmd* is the box before the padded-width fold and the frame clamps, so
+	// the gap between it and Crop* is exactly what clamping took away.
+	// PanX/PanY are the setpoints the axis PIDs were actually fed (a grounded
+	// frame has no vertical setpoint: the floor pin replaced it, so PanY is
+	// that pin). Zoom* are frame-height-relative zoom factors: 1 = full frame.
+	CmdCx, CmdCy, CmdW, CmdH float64
+	PanX, PanY               float64
+	ZoomCurrent, ZoomTarget  float64
 }
 
 // framingDecider is the whole controller plant + tracking state. It is not
@@ -239,6 +250,7 @@ func (d *framingDecider) step(frame int, bbox image.Rectangle, subjects int, bou
 	// velocity lead kills the walk lag.
 	d.cropH = applyZoomPIDCalc(d.pidZ, &d.cmdZ, d.cropH, d.tgtH, d.dt, d.frameH, d.cropFloor)
 	cropW := d.cropH * d.aspect
+	cmdW, cmdH := cropW, d.cropH // commanded geometry, before the padded-width fold
 	if cropW > d.maxCropW {
 		// Keep the aspect lock when the crop hits the padded width cap
 		cropW = d.maxCropW
@@ -251,6 +263,7 @@ func (d *framingDecider) step(frame int, bbox image.Rectangle, subjects int, bou
 	// to the centered target + lead, which keeps her in-bounds exactly as
 	// before.
 	tgtX := d.tgtCx + velLeadFrames*d.vx
+	tgtY := d.tgtCy + velLeadFrames*d.vy
 	walkTgt := 0.0
 	if d.walkActive && d.haveEMA && !lost {
 		if leash, ok := walkLeashTarget(d.cropCx, d.emaF, cropW); ok {
@@ -265,9 +278,11 @@ func (d *framingDecider) step(frame int, bbox image.Rectangle, subjects int, bou
 		// the zoom plant or target EMA.
 		d.cropCy = d.frameH - d.cropH/2
 		d.cmdY = 0
+		tgtY = d.cropCy // no vertical setpoint this frame: the pin is what the plant holds
 	} else {
-		d.cropCy = applyAxisPIDCalc(d.panY, &d.cmdY, d.cropCy, d.tgtCy+velLeadFrames*d.vy, d.dt, d.cropH, panFloorY)
+		d.cropCy = applyAxisPIDCalc(d.panY, &d.cmdY, d.cropCy, tgtY, d.dt, d.cropH, panFloorY)
 	}
+	cmdCx, cmdCy := d.cropCx, d.cropCy // commanded centre, before the containment clamps below
 
 	// Clamp plant to frame: vertical always fully inside; horizontally the
 	// crop may extend past the frame edges by up to landscapePad per side
@@ -288,7 +303,21 @@ func (d *framingDecider) step(frame int, bbox image.Rectangle, subjects int, bou
 		SceneCut:    sceneCut,
 		Grounded:    grounded,
 		CropRect:    cropRectFromFramingCalc(d.cropCx, d.cropCy, cropW, d.cropH, d.landscapePad, bounds),
+
+		CmdCx: cmdCx, CmdCy: cmdCy, CmdW: cmdW, CmdH: cmdH,
+		PanX: tgtX, PanY: tgtY,
+		ZoomCurrent: zoomFactor(d.frameH, d.cropH), ZoomTarget: zoomFactor(d.frameH, d.tgtH),
 	}
+}
+
+// zoomFactor states the crop size as a zoom factor relative to the full
+// analysis frame: 1 = the whole frame, 2 = a half-height crop. Zero for a
+// degenerate height, which the overlay layer reads as "no reading" (plan G2).
+func zoomFactor(frameH, cropH float64) float64 {
+	if cropH <= 0 {
+		return 0
+	}
+	return frameH / cropH
 }
 
 // WalkGate reports the render-level walk gate state derived from the first
