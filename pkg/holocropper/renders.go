@@ -517,7 +517,11 @@ func plannedFrames(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, sche
 			vFPS, sched.AnalysisFPS))
 	}
 	if sched.Resampled {
-		tb.warn(fmt.Sprintf("the analysis runs at %g fps and the plan replays at %g: %d analysis frames become %d output frames",
+		// 739's honest wording: the number users can actually recognize is
+		// THEIR video's frame rate, not the internal analysis clock - the
+		// analysis always runs at the source fps, and nothing the user can
+		// set changes it. The plan clock is the preset/output fps.
+		tb.warn(fmt.Sprintf("source runs at %g fps and the plan replays at %g: %d source frames become %d output frames",
 			sched.AnalysisFPS, sched.RenderFPS, len(p.records), sched.Frames))
 	}
 

@@ -138,8 +138,8 @@ func probeMediaDuration(t *testing.T, path string) float64 {
 func warnedResample(warnings []string) bool {
 	for _, w := range warnings {
 		// The frame-clock warning's own words, so a warning about something
-		// else never stands in for it.
-		if strings.Contains(w, "the analysis runs at") {
+		// else never stands in for it (739 wording: the source's own fps).
+		if strings.Contains(w, "source runs at") {
 			return true
 		}
 	}
