@@ -168,6 +168,45 @@ func TestPlanTelemetryGroundedPinAndWalkLeash(t *testing.T) {
 	}
 }
 
+// TestPlanTelemetryGroundedPinSquare (793, Horidashimi #48 report): the same
+// floor-standing stream at a 1:1 output. The hard floor pin that landscape has
+// carried since §12.10 now holds for squares too: every settled grounded frame
+// rests the crop bottom exactly on the frame floor, the pin IS the vertical
+// setpoint, and nothing diverges between commanded and applied.
+func TestPlanTelemetryGroundedPinSquare(t *testing.T) {
+	const aw, ah = 1280, 540
+	stream := newTestStream(floorStandingStream(120), aw, ah, aw, ah)
+	plan, err := NewPlan(stream, Settings{Width: 240, Height: 240, FPS: 24})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recs := plan.Records()
+
+	grounded := 0
+	for _, r := range recs[60:] {
+		cropCy := r.Crop.Y + r.Crop.H/2
+		if !r.Grounded {
+			t.Fatalf("frame %d: a floor-standing subject at a 1:1 output is not grounded", r.Frame)
+		}
+		grounded++
+		if math.Abs(r.PanTarget.Y-cropCy) > 1e-9 {
+			t.Fatalf("frame %d: grounded pan target y %.6f != the pinned crop centre %.6f", r.Frame, r.PanTarget.Y, cropCy)
+		}
+		if r.CropTarget != r.Crop {
+			t.Fatalf("frame %d: a grounded square frame whose crop containment grants in full shows a divergence: commanded %v applied %v", r.Frame, r.CropTarget, r.Crop)
+		}
+		if math.Abs(r.Crop.Y+r.Crop.H-ah) > 1e-9 {
+			t.Fatalf("frame %d: grounded square crop %v does not rest on the frame floor %d", r.Frame, r.Crop, ah)
+		}
+		if r.Crop.W != r.Crop.H {
+			t.Fatalf("frame %d: 1:1 output crop %v is not square", r.Frame, r.Crop)
+		}
+	}
+	if grounded == 0 {
+		t.Fatal("no settled frame of a floor-standing subject is grounded")
+	}
+}
+
 func TestPlanTelemetryOpensToFullFrameWhileLost(t *testing.T) {
 	samples := edgePinnedStream(30)
 	for i := 0; i < 15; i++ {

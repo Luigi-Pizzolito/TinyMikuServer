@@ -238,10 +238,11 @@ func (d *framingDecider) step(frame int, bbox image.Rectangle, subjects int, bou
 		}
 	}
 
-	// Grounded (landscape, §12.10): the EMA bbox bottom sits in the
-	// floor-proximity band, i.e. the subject stands on the stage floor even
-	// if the mask missed the feet. Used for the hard floor pin below.
-	grounded := d.aspect >= 2 && d.haveEMA &&
+	// Grounded (landscape, §12.10 - and square too since 793, the same floor
+	// law for 1:1 outputs): the EMA bbox bottom sits in the floor-proximity
+	// band, i.e. the subject stands on the stage floor even if the mask missed
+	// the feet. Used for the hard floor pin below.
+	grounded := (d.aspect >= 2 || d.aspect == 1) && d.haveEMA &&
 		d.frameH-d.emaF[3] <= landscapeGroundSnapFrac*d.frameH
 
 	// Plant updates. Zoom first so pan spans see this frame's crop size;

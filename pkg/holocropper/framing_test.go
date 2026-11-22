@@ -171,19 +171,73 @@ func TestZoomRetargetAllowanceGated(t *testing.T) {
 
 /* aspect-locked target geometry tests (Phase 1 / Phase 4 / §12.7) */
 
+// TestAspectLockedTargetSquare1to1: the shipped 1:1 policy. This subject (feet
+// 28 px off the floor, inside the 18% band) is GROUNDED, so since 793 it takes
+// the ground snap + feet anchor: the fit 1.12*(480-30) clamps to the frame
+// height and the crop bottom pins to the frame floor exactly.
 func TestAspectLockedTargetSquare1to1(t *testing.T) {
 	hc := &HoloCropper{Height: 240, srcH: 1080}
 	// subject bbox 111x422 in an 854x480 analysis frame from a 1080-tall source
 	bbox := image.Rect(300, 30, 411, 452)
 	w, h, _, cy := aspectLockedTargetCalc(hc.framingParams(), bbox, 854, 480, 1)
-	if h < 470 || h > 476 {
-		t.Fatalf("square crop height %.1f not ~473 (1.12x of 422)", h)
+	if h < 479 || h > 481 {
+		t.Fatalf("square crop height %.1f not the snapped fit clamped to frame height 480", h)
+	}
+	if w != h {
+		t.Fatalf("square output must produce square crop, got %.1fx%.1f", w, h)
+	}
+	if math.Abs(cy+h/2-480) > 0.5 {
+		t.Fatalf("crop bottom %.1f not pinned to the frame floor 480", cy+h/2)
+	}
+	if top := cy - h/2; top > float64(bbox.Min.Y) {
+		t.Fatalf("crop top %.1f below subject top %d: head would clip", top, bbox.Min.Y)
+	}
+}
+
+// TestAspectLockedTargetSquareGroundSnapPinsFloor (793, Horidashimi #48 report):
+// dissapearance-style geometry at a 1:1 output. The mask misses the dark boots:
+// the bbox (139x329) ends 53 px above the stage floor although she stands on
+// it. The landscape law (§12.10) extends to squares: snap -> fit
+// 1.12*(480-98)~427.8 -> feet anchor -> clamp: crop bottom pinned to 480,
+// head clear of the crop top. Before 793 this crop centered on the bbox and
+// its bottom rested ~33 px above the floor - feet clipped in the previews.
+func TestAspectLockedTargetSquareGroundSnapPinsFloor(t *testing.T) {
+	hc := &HoloCropper{Height: 240, srcH: 1080}
+	bbox := image.Rect(341, 98, 480, 427) // 139x329, 53 px floor gap
+	w, h, _, cy := aspectLockedTargetCalc(hc.framingParams(), bbox, 854, 480, 1)
+	if h < 427 || h > 428 {
+		t.Fatalf("crop height %.1f not the snapped fit 1.12*(480-98)~427.8", h)
+	}
+	if w != h {
+		t.Fatalf("square output must produce square crop, got %.1fx%.1f", w, h)
+	}
+	if math.Abs(cy+h/2-480) > 0.5 {
+		t.Fatalf("crop bottom %.1f not pinned to the frame floor 480", cy+h/2)
+	}
+	if top := cy - h/2; top > float64(bbox.Min.Y) {
+		t.Fatalf("crop top %.1f below bbox top %d: head would clip", top, bbox.Min.Y)
+	}
+}
+
+// TestAspectLockedTargetSquareAirborneNoSnap: a bbox bottom 120 px above the
+// frame floor is outside the 18% snap band (a jump). No snap, no anchor: the
+// airborne square stays bbox-centered on the untouched 1:1 dominant-axis fit,
+// 1.12*300~336.
+func TestAspectLockedTargetSquareAirborneNoSnap(t *testing.T) {
+	hc := &HoloCropper{Height: 240, srcH: 1080}
+	bbox := image.Rect(300, 60, 500, 360) // 200x300, 120 px floor gap
+	w, h, _, cy := aspectLockedTargetCalc(hc.framingParams(), bbox, 854, 480, 1)
+	if h < 335 || h > 337 {
+		t.Fatalf("crop height %.1f not 1.12*300~336: the snap fired on an airborne subject", h)
 	}
 	if w != h {
 		t.Fatalf("square output must produce square crop, got %.1fx%.1f", w, h)
 	}
 	if math.Abs(cy-float64(bbox.Dy())/2-float64(bbox.Min.Y)) > 1 {
-		t.Fatalf("square mode should center on bbox center, cy=%.1f", cy)
+		t.Fatalf("airborne square must center on bbox center, cy=%.1f", cy)
+	}
+	if bot := cy + h/2; bot > float64(480)-landscapeGroundSnapFrac*480 {
+		t.Fatalf("airborne crop bottom %.1f reaches the floor snap band it never entered", bot)
 	}
 }
 

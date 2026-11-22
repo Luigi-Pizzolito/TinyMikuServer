@@ -280,13 +280,23 @@ func maskCentroid(img *image.Gray, bbox image.Rectangle) image.Point {
 //     landscape this can require black padding beyond the frame's left/
 //     right edges (capped at landscapeMaxCropW, which guarantees the full
 //     frame height always fits, §12.9), and the crop is anchored so the
-//     feet sit at the stage floor (frame bottom). Square outputs center.
+//     feet sit at the stage floor (frame bottom). Square outputs center —
+//     a GROUNDED square takes the same ground snap and feet anchor
+//     (squareGrounded below, Horidashimi 793).
 //
 // Returns (width, height, centerX, centerY) in analysis-frame pixels.
 // framingParams carries the zoom margin, the maxZoom policy cap and the
 // output/source heights the zoom floors need.
 func aspectLockedTargetCalc(params framingParams, bbox image.Rectangle, frameW, frameH, aspect float64) (float64, float64, float64, float64) {
 	margin := params.Margin
+
+	// 793 (Horidashimi #48 report): the ground snap (§12.10) was landscape-only,
+	// so a 1:1 output over a floor-standing subject centered its crop on the
+	// bbox and the crop bottom could rest ABOVE the frame floor - feet clipped
+	// in the previews. A grounded square (bbox bottom in the floor band) now
+	// takes the snap and the feet anchor. Airborne squares keep the untouched
+	// bbox-centered 1:1 law.
+	squareGrounded := aspect == 1 && float64(frameH)-float64(bbox.Max.Y) <= landscapeGroundSnapFrac*float64(frameH)
 
 	var h float64
 	if aspect < 0.5 {
@@ -326,8 +336,13 @@ func aspectLockedTargetCalc(params framingParams, bbox image.Rectangle, frameW, 
 		// than the crop ballooning. Landscape outputs (aspect > 1) carry the
 		// width fit at the landscape containment margin instead: subjects
 		// must never fill the crop edge-to-edge (§14 review - empty stage
-		// padding left/right "like the headroom on top"). Square 1:1 keeps
-		// the original look untouched.
+		// padding left/right "like the headroom on top"). An airborne square
+		// 1:1 keeps the original look untouched; a grounded square first
+		// extends the bbox to the floor (same phantom-feet cure as landscape,
+		// §12.10 / 793) so the fit reaches the real feet.
+		if squareGrounded {
+			bbox.Max.Y = int(math.Round(frameH))
+		}
 		h = float64(bbox.Dy()) * margin
 		hw := float64(bbox.Dx()) * widthCoverFrac(aspect) / aspect
 		if aspect > 1 {
@@ -384,6 +399,13 @@ func aspectLockedTargetCalc(params framingParams, bbox image.Rectangle, frameW, 
 		// In these videos the stage floor is the frame bottom, so for
 		// grounded subjects the clamp below pins the crop bottom exactly to
 		// the frame floor - the feet line is geometrically stable.
+		cy = float64(bbox.Max.Y) - h/2 + feetPadFraction*h
+		cy = clampF(cy, h/2, frameH-h/2)
+	case squareGrounded:
+		// 793: the same feet-priority anchor for a grounded 1:1 output - with
+		// the snap above the feet rest on the frame floor, and the clamp pins
+		// the crop bottom exactly there. An airborne square matches no case
+		// and stays bbox-centered.
 		cy = float64(bbox.Max.Y) - h/2 + feetPadFraction*h
 		cy = clampF(cy, h/2, frameH-h/2)
 	}
