@@ -11,7 +11,7 @@ TinyMikuServer is a specialized video streaming server designed to serve content
 - **Custom MikV Format**: A lightweight binary format optimized for storing synchronized video and audio frames - DEFLATEd RGB565 video with raw PCM audio by default, with header-recorded payload encodings for JPEG video (MJPEG-in-MikV) and OGG-Opus audio. A container's sound is exactly as long as its frames, and reading is strict: a file cut inside a frame record is refused, not reported as a shorter valid video
 - **Streaming Server**: HTTP-based server for real-time streaming of MikV content
 - **Video Converter**: Tool to convert MP4 files to the MikV format, including `-jpeg` and `-opus` payload encodings
-- **HoloCropper**: Content-aware video cropping tool for preparing hologram-style videos at any output aspect ratio (1:1, portrait, landscape), with auto-orient and walk mode - plus a **fit mode** (`-fit`) for non-hologram videos: whole-frame scale-to-fit with black bars - **MikV output** (`-mikv`) that writes the firmware container straight from the render, MJPEG+OGG-Opus pairing included - and previews that render at the plan's frame rate with an optional **VP9 + Opus WebM mux** (`Options.MuxVideo: "vp9-webm"`) for watchable previews in a browser
+- **HoloCropper**: Content-aware video cropping tool for preparing hologram-style videos at any output aspect ratio (1:1, portrait, landscape), with auto-orient and walk mode - plus a **fit mode** (`-fit`) for non-hologram videos: the source's own black container bars are measured and cut, then the content is scaled to fit on the remaining bars - **MikV output** (`-mikv`) that writes the firmware container straight from the render, MJPEG+OGG-Opus pairing included - and previews that render at the plan's frame rate with an optional **VP9 + Opus WebM mux** (`Options.MuxVideo: "vp9-webm"`) for watchable previews in a browser
 - **Optimized for Edge Devices**: Designed for efficient streaming to embedded systems and IoT devices
 
 ## Project Structure
@@ -131,7 +131,7 @@ Leaving `-jpeg`/`-opus` off produces the original encoding exactly. The firmware
 
 ### 3. Cropping Videos with HoloCropper
 
-HoloCropper performs content-aware cropping suitable for holographic displays. Any output aspect ratio works - 1:1, tall portrait `200x648`, wide landscape `648x200` - framing is aspect-locked to the requested output. For **non-hologram videos** (normal full-frame 4:3/16:9 sources like MVs) the `-fit` flag replaces the content-aware crop with a whole-frame scale-to-fit on black bars:
+HoloCropper performs content-aware cropping suitable for holographic displays. Any output aspect ratio works - 1:1, tall portrait `200x648`, wide landscape `648x200` - framing is aspect-locked to the requested output. For **non-hologram videos** (normal 4:3/16:9 sources like MVs) the `-fit` flag replaces the content-aware crop with a scale-to-fit on black bars, after measuring and cutting any black bars the source file itself carries:
 
 ```bash
 ./bin/holocropper -i input.mp4 -o ./output -w 240 -h 240 -fps 20    # 1:1
@@ -149,8 +149,8 @@ Options:
 - `-analysis-height`: Internal analysis frame height (0 = default 480, never below `-h`)
 - `-zoom-margin`: Subject bbox padding factor (0 = default 1.12; landscape and portrait fits enforce a 1.18 padding floor)
 - `-max-zoom`: Maximum zoom-in factor (0 = default 2.0)
-- `-auto-orient`: Pick portrait (`HxW`) or landscape (`WxH`) output orientation from the subjects' aspect ratios; skipped for 1:1 outputs. With `-fit` it instead picks the orientation with the least bars
-- `-fit`: **Fit mode** for non-hologram videos: scale the whole frame to fit the output resolution, centered on black bars - no content-aware crop, no zoom
+- `-auto-orient`: Pick portrait (`HxW`) or landscape (`WxH`) output orientation from the subjects' aspect ratios; skipped for 1:1 outputs. With `-fit` it instead picks the orientation with the least bars, scored on the content aspect (source bars cut)
+- `-fit`: **Fit mode** for non-hologram videos: measure and cut the black bars the source file itself carries, then scale the remaining content to fit the output resolution, centered on the remaining bars - no subject crop, no zoom
 - `-mikv`: Write the final output as a **MikV container** (the firmware format) instead of mp4; the file is `<basename>-<WxH>.mikv`
 - `-mikv-jpeg`: With `-mikv`: store video frames as JPEG (video encoding `0x01`, MJPEG-in-MikV) instead of DEFLATEd RGB565; `-jpeg-quality` sets the quality (default 90)
 - `-mikv-opus`: With `-mikv`: store audio as OGG-Opus cut into per-frame segments (audio encoding `0x01`) instead of raw PCM; uses 48000 Hz audio, `-opus-bitrate` in kbps overrides the encoder default
@@ -172,12 +172,13 @@ Give any output resolution - e.g. `-w 648 -h 200` - and let the cropper pick the
 
 #### Fit mode (`-fit`)
 
-Not every job is a hologram crop. A normal music video or full-frame clip should keep its whole picture - it just needs to land in a different shape (16:9 source, square social output). `-fit` is that mode: the **whole frame is scaled aspect-preserving to fit inside the output resolution and centered, the rest filled with black bars** (letterbox/pillarbox). No subject detection drives the framing, nothing is cropped, nothing is zoomed.
+Not every job is a hologram crop. A normal music video or full-frame clip should keep its whole picture - it just needs to land in a different shape (16:9 source, square social output). `-fit` is that mode: the frame's **content is scaled aspect-preserving to fit inside the output resolution and centered, the rest filled with black bars** (letterbox/pillarbox). No subject detection drives the framing, nothing is zoomed.
 
+- **The source's own bars are cut first.** Many files carry black container bars - a 4:3 or 2.35:1 picture letterboxed/pillarboxed inside a 16:9 container. The fit probe measures them (per-side scan at ffmpeg cropdetect's black limit, median over the clip) and the mode crops them out **before** fitting, so the content fills the output the way its own aspect allows instead of shrinking under its own bars. Fades and all-black frames are excluded from the measurement; a source with no bars behaves exactly as before. `plan.Resolved().ContentW/ContentH` report the rect that was cut.
 - Detection still runs underneath: records, overlays, stills and metrics stay populated, and subject boxes map through the fit transform, so an overlay preview draws them at the right spot *inside* the bars.
-- `-auto-orient` with `-fit` becomes pure geometry: the orientation whose aspect is closer to the source's gets fewer bars, and the CLI prints both bar coverages. Unlike crop-mode auto-orient, it decides the same way on videos with no detectable subjects.
+- `-auto-orient` with `-fit` becomes pure geometry: the orientation whose aspect is closer to the **content's** gets fewer bars, and the CLI prints both bar coverages. Unlike crop-mode auto-orient, it decides the same way on videos with no detectable subjects.
 - Matching aspects (e.g. 16:9 source to a 16:9-shaped target) produce an exact resize with no bars at all.
-- The API entry points are `holocropper.NewFitPlan(...)` or `Settings{FitWithBars: true}`; previews and renders treat fit and crop plans as different products (their `SettingsHash` values never match). See [HOLOCROPPER-API-PLAN.md](HOLOCROPPER-API-PLAN.md) §6.10.
+- The API entry points are `holocropper.NewFitPlan(...)` or `Settings{FitWithBars: true}`; previews and renders treat fit and crop plans as different products (their `SettingsHash` values never match). See [HOLOCROPPER-API-PLAN.md](HOLOCROPPER-API-PLAN.md) §6.10 and its Milestone H amendment.
 
 #### MikV output (`-mikv`)
 
@@ -423,9 +424,11 @@ plan, err := holocropper.NewPlan(analysis.Stream(), holocropper.Settings{
 })
 flip := plan.Orientation().Flip // chosen orientation + AR aggregates
 
-// Fit mode (non-hologram videos, §6.10): the WHOLE frame scales into the
-// output on black bars - no crop, no zoom. Previews and the final render
-// below work on a fit Plan exactly as they do on a crop Plan.
+// Fit mode (non-hologram videos, §6.10): the frame's CONTENT - the black
+// container bars a source already carries are measured and cut first - scales
+// into the output on the remaining bars - no subject crop, no zoom. Previews
+// and the final render below work on a fit Plan exactly as they do on a crop
+// Plan. plan.Resolved().ContentW/ContentH report what was cut.
 fitPlan, err := holocropper.NewFitPlan(analysis.Stream(), holocropper.Settings{
 	Width: 240, Height: 240, FPS: 24, FitWithBars: true, AutoOrient: true,
 })

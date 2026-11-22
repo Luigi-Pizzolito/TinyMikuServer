@@ -260,9 +260,11 @@ func cropFile(file string, width, height int, fps float64, analysisHeight int,
 		}
 		if fitBars {
 			// Fit mode: geometry-only decision - bar coverage of the
-			// source aspect at each orientation (1.000 = no bars at all).
-			fmt.Printf("Auto-orient (fit) %s: source %dx%d; bar coverage %.3f at %dx%d vs %.3f at %dx%d -> %s\n",
-				file, r.SourceW, r.SourceH,
+			// CONTENT aspect (the source frame with its own black container
+			// bars cut, §6.10 amendment) at each orientation
+			// (1.000 = no bars at all).
+			fmt.Printf("Auto-orient (fit) %s: source %dx%d, content %dx%d; bar coverage %.3f at %dx%d vs %.3f at %dx%d -> %s\n",
+				file, r.SourceW, r.SourceH, r.ContentW, r.ContentH,
 				st.KeepScore, width, height, st.FlipScore, height, width, decision)
 		} else {
 			fmt.Printf("Auto-orient %s: subjects in %d/%d sampled frames, master bbox AR mean %.2f (geo %.2f, median %.2f); coverage %.3f at %dx%d vs %.3f at %dx%d -> %s\n",

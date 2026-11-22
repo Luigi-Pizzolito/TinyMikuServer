@@ -114,8 +114,10 @@ jobs:
       - name: CLI fit mode (-fit) renders the fixture on bars
         run: |
           set -euo pipefail
-          # Fit mode (§6.10): whole frame scaled to fit, black bars, no crop.
-          # The analysis cache from the previous step is reused (same input).
+          # Fit mode (§6.10 + Milestone H amendment): the source's own black
+          # container bars are measured and cut, then the content scales to
+          # fit on the remaining bars. The analysis cache from the previous
+          # step is reused (same input).
           "$RUNNER_TEMP/holocropper" -i /tmp/ci-cli/in -o /tmp/ci-cli/out \
             -temp-dir /tmp/ci-cli/tmp -w 240 -h 240 -fps 20 -fit
           test -f /tmp/ci-cli/out/dance.mp4 || { echo "fit render lost the legacy name"; exit 1; }

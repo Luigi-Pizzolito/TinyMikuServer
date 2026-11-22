@@ -20,8 +20,9 @@ and CLI renders all execute the same replay, so their framing is identical
 by construction.
 
 Fit mode (Settings.FitWithBars / NewFitPlan, §6.10) is the non-hologram
-variant: no framing controller at all - every frame keeps the full analysis
-frame, and the render fit-resizes it into the output on black bars. */
+variant: no framing controller at all - the frame's CONTENT (black container
+bars cut first, §6.10 amendment / Horidashimi 825) is fit-resized into the
+output on black bars. */
 
 // Plan is an immutable framing replay of one detection stream under one
 // settings set. Safe for concurrent use; never mutated after creation.
@@ -98,15 +99,16 @@ func (p *Plan) SettingsHash() string { return p.settingsHash }
 func (p *Plan) Settings() Settings { return p.settings }
 
 // FitWithBars reports whether this Plan is a fit-mode replay (§6.10): the
-// full frame scaled into the output on black bars, no content-aware framing.
-// Render passes and stills execute it that way, and the SettingsHash keeps
-// fit and crop previews of the same dimensions apart.
+// frame's content scaled into the output on black bars, no content-aware
+// framing. Render passes and stills execute it that way, and the SettingsHash
+// keeps fit and crop previews of the same dimensions apart.
 func (p *Plan) FitWithBars() bool { return p.settings.FitWithBars }
 
 // NewFitPlan is the explicit fit-mode entry point (HOLOCROPPER-API-PLAN.md
-// §6.10), the mode for non-hologram videos: the whole source frame is
+// §6.10), the mode for non-hologram videos: the frame's content - black
+// container bars cut out first, §6.10 amendment / Horidashimi 825 - is
 // scaled to fit inside the output resolution, centered on black bars - no
-// cropping, no zoom, no subject-driven framing. It is exactly NewPlan with
+// subject zoom, no subject-driven framing. It is exactly NewPlan with
 // Settings.FitWithBars set; every other rule (validation, auto-orient,
 // ErrStreamIncompatible, previews, final render) applies unchanged.
 func NewFitPlan(stream DetectionStream, s Settings) (*Plan, error) {
@@ -161,8 +163,18 @@ func NewPlan(stream DetectionStream, s Settings) (*Plan, error) {
 	// (orientationStats) and the same guard against frames whose detection
 	// degenerates to the whole frame (degenerateMasterBBox).
 	// Fit mode: no subjects matter - the measure is the black-bar area, so
-	// the source frame's own aspect is compared against WxH vs HxW
-	// (fitOrientationStats) and it decides identically on subjectless clips.
+	// the CONTENT aspect (black container bars cut first - §6.10 amendment,
+	// Horidashimi 825) is compared against WxH vs HxW (fitOrientationStats)
+	// and it decides identically on subjectless clips.
+	//
+	// The content rect is resolved once per stream (measured by the fit
+	// probe, or lazily from the cached analysis video): the fit replay cuts
+	// it before fitting, and synthetic streams answer the full frame.
+	content := image.Rect(0, 0, aw, ah)
+	if s.FitWithBars {
+		content = stream.data.resolveContentRect(aw, ah)
+	}
+
 	flip := false
 	orientation := OrientationStat{}
 	if s.AutoOrient && w != h {
@@ -174,7 +186,7 @@ func NewPlan(stream DetectionStream, s Settings) (*Plan, error) {
 				}
 			}
 			var ow, oh int
-			ow, oh, orientation = fitOrientationStats(float64(aw)/float64(ah), w, h, len(samples), withSubjects)
+			ow, oh, orientation = fitOrientationStats(float64(content.Dx())/float64(content.Dy()), w, h, len(samples), withSubjects)
 			flip = orientation.Flip
 			w, h = ow, oh
 		} else {
@@ -207,13 +219,14 @@ func NewPlan(stream DetectionStream, s Settings) (*Plan, error) {
 	// C3): when the env var names a file, the replay emits the same CSV
 	// the corpus framing tooling reads - one line per frame, same columns.
 	// The file reflects the most recent plan built in this process. In fit
-	// mode the lines report what the fit path actually applies: the full
-	// frame as the crop, EMA = the raw detection box, no leash.
+	// mode the lines report what the fit path actually applies: the content
+	// rect (bars cut, §6.10 amendment) as the crop, EMA = the raw detection
+	// box, no leash.
 	dbg := newBoxDebugger()
 	defer dbg.close()
 
 	if s.FitWithBars {
-		records, cropRects, dropouts := fitReplay(samples, aw, ah, w, h, dbg)
+		records, cropRects, dropouts := fitReplay(samples, aw, ah, w, h, content, dbg)
 		return &Plan{
 			settings:  s,
 			records:   records,
@@ -226,6 +239,8 @@ func NewPlan(stream DetectionStream, s Settings) (*Plan, error) {
 				AnalysisH: ah,
 				OutputW:   w,
 				OutputH:   h,
+				ContentW:  content.Dx(),
+				ContentH:  content.Dy(),
 			},
 			orientation:  orientation,
 			walk:         WalkSummary{},
@@ -359,27 +374,40 @@ func NewPlan(stream DetectionStream, s Settings) (*Plan, error) {
 }
 
 // fitReplay builds the fit-mode replay (§6.10): the framingDecider never
-// runs. Every frame's "crop" is the full analysis frame, and the render
-// pass fit-resizes it into the output - a constant transform (scale to fit,
-// center, black bars) that also maps the record's Out-space rects, so
-// overlays land on the fitted image inside the bars. EMA mirrors the
+// runs. §6.10 amendment (Horidashimi 825): the frame's CONTENT rect - the
+// analysis frame with its black container bars cut - is every frame's crop,
+// and the render pass fit-resizes that crop into the output: a constant
+// transform (scale to fit, center, black bars) computed ON the content rect,
+// so a letterboxed clip fills the output the way its own aspect allows
+// instead of shrinking twice under its own bars. Unletterboxed clips and
+// streams with no content measurement answer the full frame - the shipped
+// transform, unchanged. The transform also maps the record's Out-space rects,
+// so overlays land on the fitted content inside the bars. EMA mirrors the
 // detection box: fit mode applies no smoothing, and the record does not
 // pretend otherwise. Dropouts still list the spans with no subjects, so a
 // timeline can keep shading subject absence even though framing ignores it.
-func fitReplay(samples []streamSample, aw, ah, w, h int, dbg *boxDebugger) ([]FrameRecord, []image.Rectangle, []IntRange) {
+func fitReplay(samples []streamSample, aw, ah, w, h int, content image.Rectangle, dbg *boxDebugger) ([]FrameRecord, []image.Rectangle, []IntRange) {
 	faw, fah := float64(aw), float64(ah)
-	scale := math.Min(float64(w)/faw, float64(h)/fah)
-	sw, sh := faw*scale, fah*scale
+	contentMinX, contentMinY := float64(content.Min.X), float64(content.Min.Y)
+	fcw, fch := float64(content.Dx()), float64(content.Dy())
+	if fcw < 1 {
+		fcw = faw
+	}
+	if fch < 1 {
+		fch = fah
+	}
+	scale := math.Min(float64(w)/fcw, float64(h)/fch)
+	sw, sh := fcw*scale, fch*scale
 	offX, offY := (float64(w)-sw)/2, (float64(h)-sh)/2
 
-	full := Rect{X: 0, Y: 0, W: faw, H: fah}
+	crop := Rect{X: contentMinX, Y: contentMinY, W: fcw, H: fch}
 	fitted := Rect{X: offX, Y: offY, W: sw, H: sh}
-	wholeNorm := Rect{X: 0, Y: 0, W: 1, H: 1}
+	contentNorm := normalizeRect(crop, faw, fah)
 	mapFit := func(r Rect) Rect {
-		return Rect{X: offX + r.X*scale, Y: offY + r.Y*scale, W: r.W * scale, H: r.H * scale}
+		return Rect{X: offX + (r.X-contentMinX)*scale, Y: offY + (r.Y-contentMinY)*scale, W: r.W * scale, H: r.H * scale}
 	}
 
-	frameCrop := image.Rect(0, 0, aw, ah)
+	frameCrop := content
 	records := make([]FrameRecord, 0, len(samples))
 	cropRects := make([]image.Rectangle, 0, len(samples))
 	var dropouts []IntRange
@@ -391,19 +419,19 @@ func fitReplay(samples []streamSample, aw, ah, w, h int, dbg *boxDebugger) ([]Fr
 		lost := bb.W <= 0 || sm.subjects == 0
 		norm := normalizeRect(bb, faw, fah)
 
-		dbg.line(i+1, int(sm.subjects), bbox, bbox, faw/2, fah/2, faw, fah, fah, 0)
+		dbg.line(i+1, int(sm.subjects), bbox, bbox, contentMinX+fcw/2, contentMinY+fch/2, fcw, fch, fch, 0)
 
 		records = append(records, FrameRecord{
 			Frame:       i + 1,
 			Subjects:    int(sm.subjects),
 			BBox:        bb,
 			EMA:         bb,
-			Crop:        full,
-			TargetH:     fah,
+			Crop:        crop,
+			TargetH:     fch,
 			WalkTgt:     0,
 			WalkActive:  false,
 			SubjectLost: lost,
-			Norm:        SpaceRects{BBox: norm, EMA: norm, Crop: wholeNorm},
+			Norm:        SpaceRects{BBox: norm, EMA: norm, Crop: contentNorm},
 			Out:         SpaceRects{BBox: mapFit(bb), EMA: mapFit(bb), Crop: fitted},
 		})
 		cropRects = append(cropRects, frameCrop)

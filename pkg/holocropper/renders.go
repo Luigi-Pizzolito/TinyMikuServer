@@ -564,9 +564,16 @@ func plannedFrames(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, sche
 		}
 		var frame *image.RGBA
 		if p.settings.FitWithBars {
-			// Fit mode (§6.10): no crop - the whole analysis frame is
-			// scaled aspect-preserving into the output on black bars.
-			frame = fitResizeTo(buf, r.OutputW, r.OutputH)
+			// Fit mode (§6.10 + its 825 amendment): the CONTENT rect - the
+			// analysis frame with black container bars cut - is the crop;
+			// what survives is scaled aspect-preserving into the output on
+			// the remaining bars. An uncut (or unmeasured) clip answers the
+			// full frame, which needs no crop copy at all.
+			if cr := p.cropRectAt(src); cr != buf.Bounds() {
+				frame = fitResizeTo(cropToBBoxCalc(buf, cr), r.OutputW, r.OutputH)
+			} else {
+				frame = fitResizeTo(buf, r.OutputW, r.OutputH)
+			}
 		} else {
 			cropped := cropToBBoxCalc(buf, p.cropRectAt(src))
 			frame = fillResizeTo(cropped, r.OutputW, r.OutputH)

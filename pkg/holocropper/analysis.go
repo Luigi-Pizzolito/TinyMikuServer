@@ -39,8 +39,11 @@ exposes the frames detected so far for live planning.
 Mode law (plan §2/U1): AnalyzeRequest.Mode selects the pass - crop (default)
 runs prepare+detect; fit runs prepare + a geometry probe and NO detection,
 streaming one subject-less sample per analysis frame instead of measured
-boxes. The fit transform never reads the detection, so fit plan replay,
-previews and every render product run against the synthetic stream unchanged.
+boxes. The probe also measures the frame's black container bars (the §6.10
+amendment, Horidashimi 825): their medians land on the stream as the content
+rect the fit replay cuts before fitting. The fit transform never reads the
+detection, so fit plan replay, previews and every render product run against
+the synthetic stream unchanged.
 The cache is resumable across modes: meta.json records detected:true|false,
 and a crop Analyze over a fit cache skips prepare and runs only the detect
 phase over the already-cached analysis video. Switching the other way needs
@@ -140,6 +143,15 @@ type streamData struct {
 	// detected from ("" for synthetic streams). Set once the prepare pass
 	// renames the scratch encode into place; Snapshot/ContactSheet read it.
 	videoPath string
+
+	// contentRect / contentMeasured (§6.10 amendment, Horidashimi 825): the
+	// frame's CONTENT rectangle after the black container bars are cut, in
+	// analysis pixels. The fit probe measures it frame by frame; streams that
+	// never probed one (old caches, crop resumes, synthetic streams) measure
+	// lazily on the first fit plan - see resolveContentRect.
+	// contentMeasured=false means "not measured yet", NOT "no bars".
+	contentRect     image.Rectangle
+	contentMeasured bool
 }
 
 func newStreamData() *streamData { return &streamData{} }
@@ -166,6 +178,51 @@ func (d *streamData) setVideoPath(p string) {
 	d.mu.Lock()
 	d.videoPath = p
 	d.mu.Unlock()
+}
+
+// setContentRect records a freshly measured content rect (§6.10 amendment,
+// Horidashimi 825). The fit probe calls it once per pass with the whole-video
+// aggregate; it always wins over a previously memoized lazy reading.
+func (d *streamData) setContentRect(r image.Rectangle) {
+	d.mu.Lock()
+	d.contentRect, d.contentMeasured = r, true
+	d.mu.Unlock()
+}
+
+// resolveContentRect answers the content rect (analysis px) a fit plan must
+// cut before fitting. A measured stream answers immediately; a stream that
+// never probed one (a cache written before the law, a crop-resumed detect
+// stream, a resume over an old fit cache) measures the analysis video's first
+// barProbeFrames frames ONCE and memoizes; a stream with no analysis video
+// (synthetic replays) answers the full frame, keeping the shipped transform.
+func (d *streamData) resolveContentRect(aw, ah int) image.Rectangle {
+	full := image.Rect(0, 0, aw, ah)
+	d.mu.RLock()
+	measured, memo, vp := d.contentMeasured, d.contentRect, d.videoPath
+	d.mu.RUnlock()
+	if measured {
+		if memo.Empty() {
+			return full
+		}
+		return memo
+	}
+	if vp == "" || aw <= 0 || ah <= 0 {
+		return full
+	}
+	r, ok := contentRectFor(vp, aw, ah)
+	if !ok || r.Empty() {
+		r = full
+	}
+	d.mu.Lock()
+	if !d.contentMeasured { // a completed probe measurement already on file wins
+		d.contentRect, d.contentMeasured = r, true
+	}
+	memo = d.contentRect
+	d.mu.Unlock()
+	if memo.Empty() {
+		return full
+	}
+	return memo
 }
 
 func (d *streamData) len() int {
@@ -787,12 +844,14 @@ func analyzeWork(ctx context.Context, entry *analysisEntry, task *AnalysisTask, 
 			return nil, err
 		}
 	} else {
-		// Fit mode: no subject detection - the fit transform scales the full
-		// frame, so every consumer downstream needs only geometry and frame
-		// count from the stream. One subject-less sample per analysis frame,
-		// counted through the same vidio reader the detect pass and the
-		// render loops use: the stream/records/decoded-frame invariant holds
-		// by construction.
+		// Fit mode: no subject detection - the fit transform scales the
+		// CONTENT of the frame (§6.10 amendment, Horidashimi 825: the probe
+		// measures the black container bars and the replay cuts them before
+		// fitting), so every consumer downstream needs only geometry, frame
+		// count and the content rect from the stream. One subject-less sample
+		// per analysis frame, counted through the same vidio reader the detect
+		// pass and the render loops use: the stream/records/decoded-frame
+		// invariant holds by construction.
 		tb.setPhase(PhaseProbe, srcFrames)
 		frames, err = runFitProbe(ctx, videoPath, tb, sd)
 		if err != nil {
@@ -911,6 +970,12 @@ func runDetectStream(ctx context.Context, videoPath string, tb *taskBase, sd *st
 // through this reader (not the container metadata) keeps the invariant every
 // render pass checks - decoded frames == stream samples == plan records -
 // true by construction.
+//
+// §6.10 amendment (Horidashimi 825): while decoding, the probe also measures
+// the frame's black container bars (contentrect.go). The whole-video medians
+// land on the stream as its content rect - the crop the fit replay applies
+// BEFORE fitting, so letterboxed/pillarboxed clips fill the output instead of
+// shrinking twice. The scan is edge-only, a rounding error on the decode.
 func runFitProbe(ctx context.Context, videoPath string, tb *taskBase, sd *streamData) (int, error) {
 	video, err := vidio.NewVideo(videoPath)
 	if err != nil {
@@ -926,12 +991,14 @@ func runFitProbe(ctx context.Context, videoPath string, tb *taskBase, sd *stream
 	sd.setGeometry(w, h, sd.srcWLocked(), sd.srcHLocked(), video.FPS())
 
 	count := 0
+	acc := newBarAccumulator(w, h)
 	for video.Read() {
 		if err := ctx.Err(); err != nil {
 			tb.setDone(count)
 			return count, err
 		}
 		count++
+		acc.add(buf)
 		// A fit pass never binarized a frame, so there is no threshold to
 		// re-measure it with: the detail verbs report that honestly.
 		sd.append(streamSample{thr: thrUnrecorded})
@@ -941,6 +1008,9 @@ func runFitProbe(ctx context.Context, videoPath string, tb *taskBase, sd *stream
 	}
 	if count == 0 {
 		return 0, fmt.Errorf("holocropper: fit probe decoded zero frames from %s", videoPath)
+	}
+	if r, ok := acc.rect(); ok {
+		sd.setContentRect(r)
 	}
 	tb.setDone(count)
 	return count, nil
