@@ -288,11 +288,20 @@ only in the analysis scale filter.
       `mikv.Save`) and unchanged audio track. PhaseMikVFrames progress now
       comes from the encoder stats. MikV tests green incl. cancel-mid-frames
       and supersede; full suite green.
-- [ ] Step 5 — remove the final render's now-dead helpers usage (keep
-      previews/stills intact); grep check: `bitexact` only in analysis scale;
-      no VP9/WebM added anywhere.
-- [ ] Step 6 — one-off 240x240 old-vs-new parity check (throwaway, tolerance
-      based) on the synthetic fixture; documented numbers.
+- [x] Step 5 — invariant greps clean: `bitexact` appears in non-test code
+      only in the analysis scale filter; VP9/WebM remains exactly where the
+      base branch had it (opt-in preview mux only — final render, MikV and
+      the new pipeline contain none); `cpu-independent` survives only in a
+      comment; `plannedFrames`/`runCropLoop` remain for previews/stills, no
+      dead code added.
+- [x] Step 6 — throwaway 240x240 parity check on the synthetic package
+      fixture (960x540@24, 96 frames): the old render path re-run faithfully
+      (old analysis args cache -> vidio -> `cropToBBoxCalc` + `fillResizeTo`
+      -> JPEG q90 -> today's mux) against the same Plan through the new
+      `RenderFinal`: **psnr(new vs old) 37.66 dB, mean abs luma 0.355** -
+      same framing both sides, so this measures the resize law change alone.
+      Throwaway files deleted (`step6_parity_test.go`, `linearlight_smoke_test.go`);
+      the permanent e2e (Step 7) covers the same comparisons on real fixtures.
 - [ ] Step 7 — `e2e_test.go` (7a-7f) run on the host, 30m timeout; outputs to
       `vids-e2e-test/new/`; timing logged, never asserted.
 - [ ] Step 7.5 — push; CI green (analysis goldens re-recorded for ffmpeg6 via
