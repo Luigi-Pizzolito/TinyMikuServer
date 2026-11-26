@@ -47,9 +47,9 @@ jobs:
     env:
       HOLOCROPPER_REQUIRE_FFMPEG: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: pkg/holocropper/go.mod
           cache-dependency-path: pkg/holocropper/go.sum
@@ -201,9 +201,9 @@ jobs:
     name: server + mikv (build, vet, test)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache-dependency-path: |
