@@ -14,9 +14,13 @@ name: CI
 # (HOLOCROPPER_REGENERATE_GOLDEN=1) - commit the new golden it names.
 
 on:
+  # Version releases only - ordinary pushes and PRs do NOT start CI (Actions
+  # budget). Release tags are package-scoped: pkg/holocropper/vX.Y.Z etc.
+  # A branch can still be checked on demand with a workflow_dispatch run.
   push:
-    branches: [main, "feat/**"]
-  pull_request:
+    tags:
+      - "pkg/**/v*"
+      - "v*"
   workflow_dispatch:
     inputs:
       regenerate_golden:
