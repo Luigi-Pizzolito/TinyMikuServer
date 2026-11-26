@@ -367,11 +367,11 @@ func renderMikVWork(ctx context.Context, a *Analysis, task *MikVTask, p *Plan, r
 		return nil, err
 	}
 
-	// 2. The planned frames, straight into the container. The linear-light
-	// production law (SHARPER_PLAN §4) runs on the full-res source through
-	// the same pipeline as RenderFinal, Sink B: the encoder emits rawvideo
-	// rgb24 frames at exactly the output size and each one goes into the
-	// payload code unchanged (rgb565LE / jpeg.Encode at the setting quality).
+	// 2. The planned frames, straight into the container. The production law
+	// (the judged "H" chain) runs on the full-res source through the same
+	// pipeline as RenderFinal, Sink B: the encoder emits rawvideo rgb24
+	// frames at exactly the output size and each one goes into the payload
+	// code unchanged (rgb565LE / jpeg.Encode at the setting quality).
 	jpegQuality := req.Options.JPEGQuality
 	if jpegQuality == 0 {
 		jpegQuality = mikvformat.DefaultJPEGQuality
@@ -379,15 +379,19 @@ func renderMikVWork(ctx context.Context, a *Analysis, task *MikVTask, p *Plan, r
 	rectFor := func(srcIdx int) image.Rectangle {
 		return scaleRectToSource(p.cropRectAt(srcIdx), r.AnalysisW, r.AnalysisH, r.SourceW, r.SourceH)
 	}
-	chain := linearFillChain(r.OutputW, r.OutputH)
+	mode := finalModeCrop
+	fitW, fitH, padX, padY := r.OutputW, r.OutputH, 0, 0
 	if p.settings.FitWithBars {
-		c := rectFor(0) // the fit content rect resolves once per stream
-		chain = linearFitChain(c.Dx(), c.Dy(), r.OutputW, r.OutputH)
+		// The fit content rect resolves once per stream (plan §6.10), so the
+		// fit box is constant and the pad law can be baked into the chain.
+		mode = finalModeFit
+		fitW, fitH, padX, padY = fitBoxToOutput(rectFor(0).Dx(), rectFor(0).Dy(), r.OutputW, r.OutputH)
 	}
 	err = runSourceRender(ctx, sourceRenderOpts{
 		tb: tb, ffmpegPath: req.FFmpegPath, sourceFile: a.meta.Input,
 		srcW: r.SourceW, srcH: r.SourceH, srcFrames: len(p.records),
-		sched: sched, rectFor: rectFor, chain: chain,
+		sched: sched, rectFor: rectFor, mode: mode, sink: sinkMJPEG,
+		fitW: fitW, fitH: fitH, padX: padX, padY: padY,
 		outW: r.OutputW, outH: r.OutputH, fps: planFPS(p),
 		phase: PhaseMikVFrames, totalOut: sched.Frames,
 		onRawFrame: func(outIdx int, rgb []byte) error {

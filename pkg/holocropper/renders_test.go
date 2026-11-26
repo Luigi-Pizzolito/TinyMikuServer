@@ -160,7 +160,9 @@ func TestRenderPreviewVersionsAndSweep(t *testing.T) {
 	if filepath.Dir(res.CropVideoPath) != a.PreviewsDir() || filepath.Dir(res.OverlayVideoPath) != a.PreviewsDir() {
 		t.Errorf("preview files must live in %s: %+v", a.PreviewsDir(), res)
 	}
-	if base := filepath.Base(res.CropVideoPath); base != "fixture-240x240-v1.mp4" {
+	// The crop video is always the browser-safe vp9-webm encode; the overlay
+	// keeps the requested (default mjpeg) mux.
+	if base := filepath.Base(res.CropVideoPath); base != "fixture-240x240-v1.webm" {
 		t.Errorf("crop preview name %s", base)
 	}
 	if base := filepath.Base(res.OverlayVideoPath); base != "fixture-240x240-overlay-v1.mp4" {
@@ -908,12 +910,14 @@ func probeMediaShape(t *testing.T, path string) (format, videoCodec, audioCodec 
 	return parsed.Format.FormatName, videoCodec, audioCodec
 }
 
-// TestRenderPreviewMuxChoice pins the preview mux plane (Options.MuxVideo):
-// the default stays the engine's own mjpeg-in-MP4 video-only file, vp9-webm
-// writes VP9 video with the source's audio as Opus in a WebM container - the
-// pairing every browser decodes - and every retained preview records which of
-// the two it is, because a UI that skips a render on SettingsHash must also
-// want the codec and container the retained file holds.
+// TestRenderPreviewMuxChoice pins the preview mux plane. Since the crop
+// preview became a shared-pipeline render, the CROP video is ALWAYS the
+// browser-safe VP9+WebM encode carrying the source's audio as Opus (Sink C) -
+// asking for another crop mux is not a choice. Options.MuxVideo steers the
+// OVERLAY video, whose Go-drawn frames ship as mjpeg-in-MP4 (the default) or
+// vp9-webm. Every retained preview records which of the two it is, because a
+// UI that skips a render on SettingsHash must also want the codec and
+// container the retained file holds.
 func TestRenderPreviewMuxChoice(t *testing.T) {
 	ffmpeg := requireFFmpeg(t)
 	a, p := setupRenderFixture(t, ffmpeg, 240, 240)
@@ -925,10 +929,11 @@ func TestRenderPreviewMuxChoice(t *testing.T) {
 		t.Errorf("mux_video validation said %+v, want one error on options.mux_video", errs)
 	}
 
-	// The default: unchanged for every existing caller - mjpeg in an MP4, no audio.
+	// The crop pass, even asking for mjpeg: the file is the vp9-webm browser
+	// encode, and the result labels it as such.
 	defTask, err := a.RenderPreview(context.Background(), p, PreviewRequest{
 		FFmpegPath: ffmpeg,
-		Options:    PreviewOptions{Kind: PreviewCrop},
+		Options:    PreviewOptions{Kind: PreviewCrop, MuxVideo: PreviewMuxMJPEG},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -937,23 +942,48 @@ func TestRenderPreviewMuxChoice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if def.MuxVideo != PreviewMuxMJPEG {
-		t.Errorf("default preview mux = %q, want %q", def.MuxVideo, PreviewMuxMJPEG)
+	if def.MuxVideo != PreviewMuxVP9WebM {
+		t.Errorf("crop preview mux = %q, want %q (the crop encode is always vp9-webm)", def.MuxVideo, PreviewMuxVP9WebM)
 	}
-	if ext := filepath.Ext(def.CropVideoPath); ext != ".mp4" {
-		t.Errorf("default preview name %s ends %s, want .mp4", def.CropVideoPath, ext)
+	if ext := filepath.Ext(def.CropVideoPath); ext != ".webm" {
+		t.Errorf("crop preview name %s ends %s, want .webm", def.CropVideoPath, ext)
 	}
-	if format, codec, audio := probeMediaShape(t, def.CropVideoPath); !strings.Contains(format, "mp4") ||
-		codec != "mjpeg" || audio != "" {
-		t.Errorf("default preview %s: format %q codec %q audio %q, want an mjpeg-only MP4",
+	if format, codec, audio := probeMediaShape(t, def.CropVideoPath); !strings.Contains(format, "webm") ||
+		codec != "vp9" || audio != "opus" {
+		t.Errorf("crop preview %s: format %q codec %q audio %q, want vp9 + the source's Opus in WebM",
 			def.CropVideoPath, format, codec, audio)
 	}
 
-	// vp9-webm: a clip every browser plays, carrying the source's sound, as a
-	// NEW versioned file next to the default one.
+	// The OVERLAY video honours the requested mux: the default is mjpeg in an
+	// MP4 with no audio - unchanged for every existing caller.
+	ovTask, err := a.RenderPreview(context.Background(), p, PreviewRequest{
+		FFmpegPath: ffmpeg,
+		Options:    PreviewOptions{Kind: PreviewOverlay},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ov, err := ovTask.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ov.MuxVideo != PreviewMuxMJPEG {
+		t.Errorf("default overlay mux = %q, want %q", ov.MuxVideo, PreviewMuxMJPEG)
+	}
+	if ext := filepath.Ext(ov.OverlayVideoPath); ext != ".mp4" {
+		t.Errorf("overlay name %s ends %s, want .mp4", ov.OverlayVideoPath, ext)
+	}
+	if format, codec, audio := probeMediaShape(t, ov.OverlayVideoPath); !strings.Contains(format, "mp4") ||
+		codec != "mjpeg" || audio != "" {
+		t.Errorf("overlay %s: format %q codec %q audio %q, want an mjpeg-only MP4",
+			ov.OverlayVideoPath, format, codec, audio)
+	}
+
+	// ...and vp9-webm when asked: a clip every browser plays, carrying the
+	// source's sound, as a NEW versioned file next to the default one.
 	vp9Task, err := a.RenderPreview(context.Background(), p, PreviewRequest{
 		FFmpegPath: ffmpeg,
-		Options:    PreviewOptions{Kind: PreviewCrop, MuxVideo: PreviewMuxVP9WebM},
+		Options:    PreviewOptions{Kind: PreviewOverlay, MuxVideo: PreviewMuxVP9WebM},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -963,37 +993,37 @@ func TestRenderPreviewMuxChoice(t *testing.T) {
 		t.Fatal(err)
 	}
 	if vp9.MuxVideo != PreviewMuxVP9WebM {
-		t.Errorf("vp9 preview mux = %q, want %q", vp9.MuxVideo, PreviewMuxVP9WebM)
+		t.Errorf("vp9 overlay mux = %q, want %q", vp9.MuxVideo, PreviewMuxVP9WebM)
 	}
-	if ext := filepath.Ext(vp9.CropVideoPath); ext != ".webm" {
-		t.Errorf("vp9 preview name %s ends %s, want .webm", vp9.CropVideoPath, ext)
+	if ext := filepath.Ext(vp9.OverlayVideoPath); ext != ".webm" {
+		t.Errorf("vp9 overlay name %s ends %s, want .webm", vp9.OverlayVideoPath, ext)
 	}
-	if vp9.Version <= def.Version {
-		t.Errorf("vp9 preview landed as version %d after version %d: the mux choice must not overwrite a retained file",
-			vp9.Version, def.Version)
+	if vp9.Version <= ov.Version {
+		t.Errorf("vp9 overlay landed as version %d after version %d: the mux choice must not overwrite a retained file",
+			vp9.Version, ov.Version)
 	}
-	format, codec, audio := probeMediaShape(t, vp9.CropVideoPath)
+	format, codec, audio := probeMediaShape(t, vp9.OverlayVideoPath)
 	if !strings.Contains(format, "webm") {
-		t.Errorf("vp9 preview %s: container %q, want WebM", vp9.CropVideoPath, format)
+		t.Errorf("vp9 overlay %s: container %q, want WebM", vp9.OverlayVideoPath, format)
 	}
 	if codec != "vp9" {
-		t.Errorf("vp9 preview %s: video codec %q, want vp9", vp9.CropVideoPath, codec)
+		t.Errorf("vp9 overlay %s: video codec %q, want vp9", vp9.OverlayVideoPath, codec)
 	}
 	if audio != "opus" {
-		t.Errorf("vp9 preview %s: audio codec %q, want the source's track as Opus", vp9.CropVideoPath, audio)
+		t.Errorf("vp9 overlay %s: audio codec %q, want the source's track as Opus", vp9.OverlayVideoPath, audio)
 	}
 
 	// The retained list carries the choice per file.
 	refs := a.Previews()
-	if len(refs) != 2 {
-		t.Fatalf("Previews() returned %d refs, want both muxes retained: %+v", len(refs), refs)
+	if len(refs) != 3 {
+		t.Fatalf("Previews() returned %d refs, want all three files retained: %+v", len(refs), refs)
 	}
 	seen := map[PreviewMux]int{}
 	for _, ref := range refs {
 		seen[ref.MuxVideo]++
 	}
-	if seen[PreviewMuxMJPEG] != 1 || seen[PreviewMuxVP9WebM] != 1 {
-		t.Errorf("Previews() mux labels = %+v, want one mjpeg and one vp9-webm", seen)
+	if seen[PreviewMuxMJPEG] != 1 || seen[PreviewMuxVP9WebM] != 2 {
+		t.Errorf("Previews() mux labels = %+v, want one mjpeg (overlay) and two vp9-webm (crop + overlay)", seen)
 	}
 }
 
@@ -1041,12 +1071,12 @@ func TestRenderPreviewVP9GOPChains(t *testing.T) {
 	}
 }
 
-// TestRenderPreviewLimitedRange pins the playability law: the mux must convert
-// its JPEG stills to limited range and stamp that on the stream. A preview
-// that keeps the stills' native full range decodes happily in every software
-// decoder and is refused by Chromium's hardware VP9 path (MEDIA_ERR_DECODE a
-// second into playback) - which is the whole framing preview being unreadable
-// in the app's own browser.
+// TestRenderPreviewLimitedRange pins the playability law: the VP9 encode must
+// carry LIMITED range, stamped both in the chain's final scale (bt709 matrix,
+// out_range=tv) and on the stream. A preview that keeps native full range
+// decodes happily in every software decoder and is refused by Chromium's
+// hardware VP9 path (MEDIA_ERR_DECODE a second into playback) - which is the
+// whole framing preview being unreadable in the app's own browser.
 func TestRenderPreviewLimitedRange(t *testing.T) {
 	ffmpeg := requireFFmpeg(t)
 	a, p := setupRenderFixture(t, ffmpeg, 240, 240)

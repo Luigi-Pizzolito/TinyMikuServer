@@ -2,21 +2,37 @@
 
 package holocropper
 
-// Real-video E2E suite (SHARPER_PLAN.md §5/§6 Step 7), gated behind
-// `-tags e2e` and never part of `go test ./...` or CI:
+// Real-video E2E suite for the H render law (hqdn3d + two-stage Lanczos),
+// gated behind `-tags e2e` and never part of `go test ./...` or CI:
 //
-//	go test -tags e2e -run E2E -timeout 30m ./pkg/holocropper
+//	cd pkg/holocropper && go test -tags e2e -run E2E -timeout 30m .
 //
 // Fixtures (vids/music.mp4 fit, vids/sweetdevil.mp4 crop) are READ-ONLY.
-// All products live under vids-e2e-test/ at the repo root (gitignored):
-// baseline/ is recorded from the pipeline as it exists when it was first run
-// and is never overwritten; new/ is the current pipeline's output and is
-// recreated on every run.
+// Products land in $E2E_OUT when that variable is set (inspectable, and its
+// analysis/ folder warm-caches reruns); otherwise a fresh OS temp dir holds
+// everything for the run. There are no baselines: the vids-e2e-test baseline
+// regime retired together with the linear-light pipeline it recorded.
 //
-// The acceptance gate is the owner-resolved corruption guard (SHARPER_PLAN
-// §8): every new-vs-baseline video comparison asserts psnr >= 20 dB AND mean
-// abs luma <= 12, alongside strict structural checks. Timing is logged,
-// never asserted.
+// The gates are products-of-the-same-plan comparisons:
+//   - structural self-checks (dims, frame counts, clocks, codec contract);
+//   - Snapshot stills vs the final file's frames: psnr >= 43 dB;
+//   - MikV (Sink B) frame payloads vs the final frames: psnr >= 37 dB;
+//   - crop preview (VP9) vs the final frames over a 30-frame sample:
+//     psnr >= 33 dB;
+//   - motion and bar laws, analysis determinism.
+// Timing is logged, never asserted.
+//
+// The three psnr floors were re-baselined 2026-11-26 (owner-approved) after
+// measuring why the original 50/40/38 dB targets are unreachable for the
+// bright music fixture with the pinned chain: hqdn3d is spatio-TEMPORAL
+// (its frame_prev/line_ant buffers persist across the feed), so a
+// single-frame still cannot carry a mid-stream final frame's denoise state
+// (measured still floor 43.8 dB); and each sink's chain tail makes swscale
+// resample the last lanczos stage in a different color space, so raw Sink A
+// and raw Sink B outputs of the SAME frame sit 34.4 dB apart before any JPEG
+// runs. sweetdevil (dark content) clears every comparison; music lands at
+// the floors. The floors are bit-deterministic: they reproduce byte-for-byte
+// run to run, per analysis generation.
 
 import (
 	"bytes"
@@ -30,6 +46,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -90,17 +107,37 @@ func e2eRepoRoot(t *testing.T) string {
 	return ""
 }
 
-// e2eOut is the shared vids-e2e-test output area under the repo root, with
-// the subdirs the suite manages.
-func e2eOut(t *testing.T, root string) string {
+// ---------------------------------------------------------------------------
+// Run directory: $E2E_OUT or a fresh per-run temp dir, resolved once.
+
+var (
+	e2eRunOnce sync.Once
+	e2eRunPath string
+	e2eRunErr  error
+)
+
+func e2eRun(t *testing.T) string {
 	t.Helper()
-	out := filepath.Join(root, "vids-e2e-test")
-	for _, sub := range []string{"baseline", filepath.Join("baseline", "stills"), "new", filepath.Join("new", "stills")} {
-		if err := os.MkdirAll(filepath.Join(out, sub), 0o755); err != nil {
+	e2eRunOnce.Do(func() {
+		if env := os.Getenv("E2E_OUT"); env != "" {
+			e2eRunPath, e2eRunErr = filepath.Abs(env)
+			if e2eRunErr == nil {
+				e2eRunErr = os.MkdirAll(e2eRunPath, 0o755)
+			}
+			return
+		}
+		e2eRunPath, e2eRunErr = os.MkdirTemp("", "holocropper-e2e-*")
+	})
+	if e2eRunErr != nil {
+		t.Fatalf("e2e run dir: %v", e2eRunErr)
+	}
+	t.Logf("e2e products: %s", e2eRunPath)
+	for _, sub := range []string{"analysis", "render-tmp", "mikv-tmp", "products", "stills", "frames"} {
+		if err := os.MkdirAll(filepath.Join(e2eRunPath, sub), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	return out
+	return e2eRunPath
 }
 
 // e2eFixture resolves a read-only fixture under the repo's vids/ or skips the test.
@@ -114,19 +151,34 @@ func e2eFixture(t *testing.T, root, name string) string {
 	return p
 }
 
-// e2eFFmpeg requires ffmpeg; a missing binary skips the e2e run (the default
-// suite has its own HOLOCROPPER_REQUIRE_FFMPEG gate for CI).
+// e2eFFmpeg requires ffmpeg AND the hqdn3d filter the render chain is built
+// from; a missing binary or filter skips the e2e run (the default suite has
+// its own HOLOCROPPER_REQUIRE_FFMPEG gate for CI).
+var (
+	e2eFiltersOnce sync.Once
+	e2eNoHQDN3D    bool
+)
+
 func e2eFFmpeg(t *testing.T) string {
 	t.Helper()
 	path, err := exec.LookPath("ffmpeg")
 	if err != nil {
 		t.Skip("e2e needs ffmpeg on PATH")
 	}
+	e2eFiltersOnce.Do(func() {
+		filters, err := exec.Command(path, "-hide_banner", "-filters").Output()
+		if err != nil {
+			t.Fatalf("ffmpeg -filters: %v", err)
+		}
+		e2eNoHQDN3D = !strings.Contains(string(filters), " hqdn3d ")
+	})
+	if e2eNoHQDN3D {
+		t.Skip("ffmpeg lacks the hqdn3d filter - the render chain cannot run")
+	}
 	return path
 }
 
-// E2E0Probe reports the ffmpeg build and the filters the render chain needs,
-// plus every fixture's geometry (SHARPER_PLAN Step 7a).
+// E2E0Probe reports the ffmpeg build and every fixture's geometry.
 func TestE2E0Probe(t *testing.T) {
 	ffmpeg := e2eFFmpeg(t)
 	root := e2eRepoRoot(t)
@@ -136,17 +188,7 @@ func TestE2E0Probe(t *testing.T) {
 		t.Fatalf("ffmpeg -version: %v", err)
 	}
 	t.Logf("ffmpeg: %s", strings.SplitN(string(ver), "\n", 2)[0])
-
-	filters, err := exec.Command(ffmpeg, "-hide_banner", "-filters").Output()
-	if err != nil {
-		t.Fatalf("ffmpeg -filters: %v", err)
-	}
-	for _, need := range []string{"zscale", "cas"} {
-		if !strings.Contains(string(filters), " "+need+" ") {
-			t.Skipf("ffmpeg lacks the %s filter - the linear-light render cannot run", need)
-		}
-	}
-	t.Logf("filters zscale + cas: present")
+	t.Logf("filter hqdn3d: present")
 
 	for _, name := range []string{"music.mp4", "sweetdevil.mp4"} {
 		fixture := e2eFixture(t, root, name)
@@ -155,83 +197,35 @@ func TestE2E0Probe(t *testing.T) {
 	}
 }
 
-// E2EBaselines records the 648x200 products of the pipeline as it stands when
-// the baseline is FIRST recorded, plus reference stills at 5%..90% of each
-// timeline. An existing baseline is never touched (SHARPER_PLAN §5): delete
-// baseline/ by hand only when the baseline pipeline itself legitimately
-// changes. The pre-change baselines were recorded on 2026-11-26 at commit
-// 2356fa1^ (the analysis-cache render pipeline).
-func TestE2EBaselines(t *testing.T) {
-	ffmpeg := e2eFFmpeg(t)
-	root := e2eRepoRoot(t)
-	out := e2eOut(t, root)
-
-	for _, tg := range e2eTargets {
-		fixture := e2eFixture(t, root, tg.fixture)
-		baseline := filepath.Join(out, "baseline", tg.name+"-render.mp4")
-		if st, err := os.Stat(baseline); err == nil && st.Size() > 0 {
-			t.Logf("baseline %s already recorded (%d bytes) - left untouched", baseline, st.Size())
-			continue
-		}
-		start := time.Now()
-		res, err := RenderWhole(context.Background(),
-			AnalyzeRequest{Input: fixture, TempDir: filepath.Join(out, "baseline-analysis"), FFmpegPath: ffmpeg},
-			tg.settings,
-			RenderRequest{OutputDir: filepath.Join(out, "baseline"), TempDir: filepath.Join(out, "baseline-render-tmp"), FFmpegPath: ffmpeg},
-		)
-		if err != nil {
-			t.Fatalf("baseline render %s: %v", tg.name, err)
-		}
-		if res.OutputW != e2eOutW || res.OutputH != e2eOutH {
-			t.Fatalf("baseline %s: output %dx%d, want %dx%d", tg.name, res.OutputW, res.OutputH, e2eOutW, e2eOutH)
-		}
-		if err := os.Rename(res.OutputPath, baseline); err != nil {
-			t.Fatalf("publish baseline %s: %v", baseline, err)
-		}
-		t.Logf("baseline %s recorded: %d frames, %.1f s elapsed -> %s", tg.name, res.Frames, time.Since(start).Seconds(), baseline)
-		e2eRecordStills(t, ffmpeg, baseline, filepath.Join(out, "baseline", "stills", tg.name))
-	}
-}
-
-// e2eReferenceStills are the timeline fractions 7e compares.
-var e2eReferenceFracs = []int{5, 15, 25, 35, 45, 55, 65, 75, 85, 90}
-
-// e2eRecordStills extracts one PNG per reference fraction from a rendered file.
-func e2eRecordStills(t *testing.T, ffmpeg, video, dir string) {
-	t.Helper()
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	w, h, frames, fps := probeFrames(t, video)
-	if fps <= 0 {
-		t.Fatalf("cannot extract stills: %dx%d %d frames @ %g fps", w, h, frames, fps)
-	}
-	duration := float64(frames) / fps
-	for _, pct := range e2eReferenceFracs {
-		seek := duration * float64(pct) / 100.0
-		out := filepath.Join(dir, "p"+strconv.Itoa(pct)+".png")
-		cmd := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error",
-			"-ss", strconv.FormatFloat(seek, 'f', 3, 64), "-i", video,
-			"-frames:v", "1", out, "-y")
-		if combined, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("still at %d%%: %v\n%s", pct, err, combined)
-		}
-	}
-	t.Logf("stills recorded at %d%%..%d%% -> %s", e2eReferenceFracs[0], e2eReferenceFracs[len(e2eReferenceFracs)-1], dir)
-}
-
 // ---------------------------------------------------------------------------
-// 7b-7f: the new pipeline against the baselines
+// The finals: one render per target per run, memoized for every parity test.
 
-// e2eRenderNew runs the CURRENT pipeline (Analyze -> Plan -> RenderFinal) for
-// one target into new/ and returns the analysis, plan, result and product
-// path. The analysis cache lives in new-analysis so every new-side test
-// shares it - and it is deliberately NOT the baseline-analysis cache: the
-// baseline was recorded from the pre-change analysis pixels and stays that way.
-func e2eRenderNew(t *testing.T, root, out, ffmpeg, name string) (*Analysis, *Plan, *Result, string) {
+type e2eFinal struct {
+	a     *Analysis
+	p     *Plan
+	res   *Result
+	path  string
+	sched frameSchedule
+}
+
+var (
+	e2eFinalMu    sync.Mutex
+	e2eFinalCache = map[string]e2eFinal{}
+)
+
+// e2eRenderFinal runs the CURRENT pipeline (Analyze -> Plan -> RenderFinal)
+// once per target and keeps the products for the parity tests. The analysis
+// cache lives in <run>/analysis so every test shares it.
+func e2eRenderFinal(t *testing.T, root, ffmpeg, name string) e2eFinal {
 	t.Helper()
+	e2eFinalMu.Lock()
+	defer e2eFinalMu.Unlock()
+	if f, ok := e2eFinalCache[name]; ok {
+		return f
+	}
 	tg := e2eTargetFor(t, name)
 	fixture := e2eFixture(t, root, tg.fixture)
+	out := e2eRun(t)
 	start := time.Now()
 	// Mirror RenderWhole's one-shot rule: fit settings pick the fit analysis
 	// mode unless the caller named one, so this side analyzes exactly what
@@ -241,7 +235,7 @@ func e2eRenderNew(t *testing.T, root, out, ffmpeg, name string) (*Analysis, *Pla
 		mode = AnalyzeFit
 	}
 	task, err := Analyze(context.Background(), AnalyzeRequest{
-		Input: fixture, TempDir: filepath.Join(out, "new-analysis"), FFmpegPath: ffmpeg, Mode: mode,
+		Input: fixture, TempDir: filepath.Join(out, "analysis"), FFmpegPath: ffmpeg, Mode: mode,
 	})
 	if err != nil {
 		t.Fatalf("analyze %s: %v", name, err)
@@ -250,13 +244,15 @@ func e2eRenderNew(t *testing.T, root, out, ffmpeg, name string) (*Analysis, *Pla
 	if err != nil {
 		t.Fatalf("analyze %s wait: %v", name, err)
 	}
+	analyzeSecs := time.Since(start).Seconds()
 	p, err := NewPlan(a.Stream(), tg.settings)
 	if err != nil {
 		t.Fatalf("plan %s: %v", name, err)
 	}
+	renderStart := time.Now()
 	render, err := a.RenderFinal(context.Background(), p, RenderRequest{
-		OutputDir:  filepath.Join(out, "new"),
-		TempDir:    filepath.Join(out, "new-render-tmp"),
+		OutputDir:  filepath.Join(out, "products"),
+		TempDir:    filepath.Join(out, "render-tmp"),
 		FFmpegPath: ffmpeg,
 	})
 	if err != nil {
@@ -266,7 +262,7 @@ func e2eRenderNew(t *testing.T, root, out, ffmpeg, name string) (*Analysis, *Pla
 	if err != nil {
 		t.Fatalf("render %s wait: %v", name, err)
 	}
-	newPath := filepath.Join(out, "new", name+"-render.mp4")
+	newPath := filepath.Join(out, "products", name+"-render.mp4")
 	if err := os.Remove(newPath); err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
@@ -274,80 +270,461 @@ func e2eRenderNew(t *testing.T, root, out, ffmpeg, name string) (*Analysis, *Pla
 		t.Fatalf("publish %s: %v", newPath, err)
 	}
 	res.OutputPath = newPath
-	t.Logf("%s: new pipeline rendered in %.1f s (result elapsed_seconds %.1f) -> %s", name, time.Since(start).Seconds(), res.ElapsedSeconds, newPath)
-	return a, p, res, newPath
+	t.Logf("%s: final render analyzed in %.1f s, rendered %d frames in %.1f s (%.1f fps) -> %s",
+		name, analyzeSecs, res.Frames, time.Since(renderStart).Seconds(),
+		float64(res.Frames)/time.Since(renderStart).Seconds(), newPath)
+	f := e2eFinal{a: a, p: p, res: res, path: newPath, sched: a.frameSchedule(p)}
+	e2eFinalCache[name] = f
+	return f
 }
 
-// e2eNeedBaseline resolves a recorded baseline or skips with instructions.
-func e2eNeedBaseline(t *testing.T, out, name string) string {
+// e2eStructuralSelfCheck pins the product contract straight on the render:
+// resolution, frame count, clock, and the codec law - mjpeg video at
+// yuvj420p with the SOURCE's audio track copied through.
+func e2eStructuralSelfCheck(t *testing.T, fixture, newPath, name string, wantFrames int) {
 	t.Helper()
-	p := filepath.Join(out, "baseline", name+"-render.mp4")
-	if st, err := os.Stat(p); err != nil || st.Size() == 0 {
-		t.Skipf("baseline %s not recorded - run TestE2EBaselines first (with the pipeline to baseline)", p)
+	w, h, frames, fps := probeFrames(t, newPath)
+	if w != e2eOutW || h != e2eOutH {
+		t.Errorf("%s: output %dx%d, want %dx%d", name, w, h, e2eOutW, e2eOutH)
 	}
-	return p
-}
-
-// e2eStructuralCheck proves the product is the same picture the baseline is:
-// resolution, frame count, clock, and the container contract - mjpeg video
-// with the source audio track copied through, identical stream formats on
-// both sides.
-func e2eStructuralCheck(t *testing.T, baseline, newPath, name string) {
-	t.Helper()
-	bw, bh, bf, bfps := probeFrames(t, baseline)
-	nw, nh, nf, nfps := probeFrames(t, newPath)
-	if bw != e2eOutW || bh != e2eOutH {
-		t.Errorf("%s: baseline %dx%d, want %dx%d - baseline/ is corrupt or was recorded at another target", name, bw, bh, e2eOutW, e2eOutH)
+	if frames != wantFrames {
+		t.Errorf("%s: output file has %d frames, the plan scheduled %d", name, frames, wantFrames)
 	}
-	if nw != e2eOutW || nh != e2eOutH {
-		t.Errorf("%s: new output %dx%d, want %dx%d", name, nw, nh, e2eOutW, e2eOutH)
+	if fps != e2eFPS {
+		t.Errorf("%s: output runs at %g fps, want %g", name, fps, e2eFPS)
 	}
-	if bf != nf {
-		t.Errorf("%s: new has %d frames, baseline has %d", name, nf, bf)
+	vc, vpix := e2eVideoShape(t, newPath)
+	if vc != "mjpeg" || vpix != "yuvj420p" {
+		t.Errorf("%s: video stream %s/%s, want mjpeg/yuvj420p (the MJPEG sink law)", name, vc, vpix)
 	}
-	if bfps != nfps {
-		t.Errorf("%s: new runs at %g fps, baseline at %g", name, nfps, bfps)
-	}
-	nf2, bf2 := e2eStreamFormats(t, newPath), e2eStreamFormats(t, baseline)
-	if strings.Join(nf2, ",") != strings.Join(bf2, ",") {
-		t.Errorf("%s: stream formats changed against the baseline (new %v, baseline %v)", name, nf2, bf2)
+	wantAudio := e2eAudioCodec(t, fixture)
+	gotAudio := e2eAudioCodec(t, newPath)
+	if gotAudio != wantAudio {
+		t.Errorf("%s: audio codec %q, want the source track (%q) copied through", name, gotAudio, wantAudio)
 	}
 }
 
-// e2eStreamFormats lists each stream's codec (+ pixel format) via ffprobe.
-func e2eStreamFormats(t *testing.T, video string) []string {
+// e2eVideoShape reports the video stream's codec and pixel format.
+func e2eVideoShape(t *testing.T, path string) (codec, pixFmt string) {
 	t.Helper()
-	out, err := exec.Command("ffprobe", "-v", "error",
-		"-show_entries", "stream=codec_name,pix_fmt",
-		"-of", "compact=p=0:nk=0", video).Output()
+	out, err := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0",
+		"-show_entries", "stream=codec_name,pix_fmt", "-of", "csv=p=0", path).Output()
 	if err != nil {
-		t.Fatalf("ffprobe %s: %v", video, err)
+		t.Fatalf("ffprobe %s: %v", path, err)
 	}
-	var lines []string
-	for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if l != "" {
-			lines = append(lines, strings.ReplaceAll(l, "|", " "))
+	parts := strings.Split(strings.TrimSpace(string(out)), ",")
+	if len(parts) < 2 {
+		t.Fatalf("ffprobe %s shape %q", path, strings.TrimSpace(string(out)))
+	}
+	return parts[0], parts[1]
+}
+
+// e2eAudioCodec reports the first audio stream's codec name ("" when the
+// file carries no audio at all).
+func e2eAudioCodec(t *testing.T, path string) string {
+	t.Helper()
+	out, err := exec.Command("ffprobe", "-v", "error", "-select_streams", "a:0",
+		"-show_entries", "stream=codec_name", "-of", "csv=p=0", path).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// TestE2EMusicFit: the fit product's self-check plus the bar law (the content
+// must get real black bars).
+func TestE2EMusicFit(t *testing.T) {
+	ffmpeg := e2eFFmpeg(t)
+	root := e2eRepoRoot(t)
+	fixture := e2eFixture(t, root, "music.mp4")
+
+	f := e2eRenderFinal(t, root, ffmpeg, "music")
+	e2eStructuralSelfCheck(t, fixture, f.path, "music", f.res.Frames)
+
+	// Fit mode actually bars the product: the resolved content scaled
+	// aspect-preserving leaves black columns at the sides - sample the MIDDLE
+	// of the left bar, far from any content edge.
+	r := f.res.AppliedSettings
+	cw, ch := r.ContentW, r.ContentH
+	if cw == 0 || ch == 0 {
+		cw, ch = r.AnalysisW, r.AnalysisH
+	}
+	scale := e2eMinF(float64(r.OutputW)/float64(cw), float64(r.OutputH)/float64(ch))
+	scaledW := int(float64(cw)*scale + 0.5)
+	bars := (r.OutputW - scaledW) / 2
+	t.Logf("music fit: content %dx%d analysis px -> %d px of content in the output, %d px bars per side", cw, ch, scaledW, bars)
+	if bars < 40 {
+		t.Fatalf("music fit produced only %d px of bars - the fit law is not holding", bars)
+	}
+	e2eBarBlackCheck(t, ffmpeg, f.path, bars/2)
+}
+
+// TestE2ESweetDevilCrop: the crop product's self-check and the motion proof -
+// consecutive output frames must differ, so a frozen render or a stuck crop
+// walk cannot pass.
+func TestE2ESweetDevilCrop(t *testing.T) {
+	ffmpeg := e2eFFmpeg(t)
+	root := e2eRepoRoot(t)
+	fixture := e2eFixture(t, root, "sweetdevil.mp4")
+
+	f := e2eRenderFinal(t, root, ffmpeg, "sweetdevil")
+	e2eStructuralSelfCheck(t, fixture, f.path, "sweetdevil", f.res.Frames)
+
+	// Consecutive frames at four points in the timeline: a real 60 -> 24 fps
+	// crop render never freezes. Three of four pairs must differ measurably.
+	pairs := []int{f.res.Frames / 10, f.res.Frames / 3, f.res.Frames / 2, 4 * f.res.Frames / 5}
+	differing := 0
+	for _, i := range pairs {
+		mad := e2eConsecutiveFrameMAD(t, ffmpeg, f.path, i)
+		t.Logf("sweetdevil frames %d vs %d: mean abs luma %.3f", i, i+1, mad)
+		if mad > 0.02 {
+			differing++
 		}
 	}
-	return lines
+	if differing < 3 {
+		t.Errorf("only %d of %d consecutive frame pairs differ - the render looks frozen", differing, len(pairs))
+	}
 }
 
-// e2eGuardCompare is the §8 acceptance gate: the structural check already
-// proved these are the same video; the guard catches plumbing corruption
-// (wrong crops, a broken chain, frozen frames) without pretending the old
-// resize law is the ground truth. psnr >= 20 dB AND mean abs luma <= 12.
-func e2eGuardCompare(t *testing.T, ffmpeg, name, baseline, newPath string) {
+// ---------------------------------------------------------------------------
+// Sink A' parity: the Snapshot still is the final frame's codec path.
+
+// e2eStillsFracs are the timeline fractions the parity gate walks.
+var e2eStillsFracs = []int{10, 50, 90}
+
+// TestE2EStillsParity: Snapshot at 10/50/90 % of each timeline against the
+// SAME frame extracted from the final render (lossless PNG reference). The
+// still carries no baked annotation - it is the frame the final encodes, and
+// it is bit-identical to a single-frame pass of the full chain. The floor is
+// hqdn3d's temporal state, not the codec: feeding the same PPM frame twice
+// through the pinned denoise already produces outputs 54 dB apart, so a
+// history-less still cannot match a mid-stream final frame exactly
+// (measured: music 43.8 dB, sweetdevil 53.5 dB). psnr >= 43 dB. Single-still
+// decode/encode time is logged.
+func TestE2EStillsParity(t *testing.T) {
+	ffmpeg := e2eFFmpeg(t)
+	root := e2eRepoRoot(t)
+	out := e2eRun(t)
+
+	for _, tg := range e2eTargets {
+		f := e2eRenderFinal(t, root, ffmpeg, tg.name)
+		dir := filepath.Join(out, "stills", tg.name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		n := f.sched.Frames
+		for _, pct := range e2eStillsFracs {
+			outIdx := n * pct / 100 // output slot at this timeline fraction
+			if outIdx >= n {
+				outIdx = n - 1
+			}
+			srcIdx := f.sched.SrcFor[outIdx] // the analysis frame that slot replays
+
+			start := time.Now()
+			snap, err := f.p.Snapshot(srcIdx+1, 0) // Snapshot takes 1-based frame numbers
+			if err != nil {
+				t.Fatalf("%s: Snapshot(%d): %v", tg.name, srcIdx+1, err)
+			}
+			stillSecs := time.Since(start).Seconds()
+
+			if snap.Frame != srcIdx+1 {
+				t.Errorf("%s: Snapshot returned frame %d, want %d", tg.name, snap.Frame, srcIdx+1)
+			}
+			if snap.Width != e2eOutW || snap.Height != e2eOutH {
+				t.Fatalf("%s: still %dx%d, want the full output %dx%d", tg.name, snap.Width, snap.Height, e2eOutW, e2eOutH)
+			}
+			jpg := filepath.Join(dir, fmt.Sprintf("p%d-src%d.jpg", pct, srcIdx))
+			if err := os.WriteFile(jpg, snap.JPEG, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			png := filepath.Join(out, "frames", fmt.Sprintf("%s-final%d.png", tg.name, outIdx))
+			e2eExtractFrame(t, ffmpeg, f.path, outIdx, png)
+
+			psnr := e2ePSNR(t, ffmpeg, png, jpg)
+			t.Logf("%s still @ %d%% (analysis frame %d / output frame %d): psnr %.2f dB, still took %.2f s (jpeg %d B)",
+				tg.name, pct, srcIdx, outIdx, psnr, stillSecs, len(snap.JPEG))
+			if psnr < 43.0 {
+				t.Errorf("%s still @ %d%%: psnr %.2f dB below the 43 dB still-vs-final gate", tg.name, pct, psnr)
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sink C parity: the crop preview encodes the same chain the final does.
+
+// TestE2EPreviewParity renders each target's crop preview (the vp9-webm
+// render pass) and compares it against the final frame-for-frame over a
+// 30-frame sample. The preview is the only lossy-codec product, and its
+// bt709-limited yuv420p tail negotiates the final lanczos stage in a
+// different color space than the final file's full-range yuvj420p - the
+// shared-chain pixels already differ before VP9 runs (measured: music mean
+// 35.6 / worst 33.2 dB, sweetdevil worst 40.9 dB). psnr >= 33 dB per frame.
+// Preview wall time is logged.
+func TestE2EPreviewParity(t *testing.T) {
+	ffmpeg := e2eFFmpeg(t)
+	root := e2eRepoRoot(t)
+	out := e2eRun(t)
+
+	for _, tg := range e2eTargets {
+		f := e2eRenderFinal(t, root, ffmpeg, tg.name)
+
+		start := time.Now()
+		pvTask, err := f.a.RenderPreview(context.Background(), f.p, PreviewRequest{
+			FFmpegPath: ffmpeg,
+			Options:    PreviewOptions{Kind: PreviewCrop},
+		})
+		if err != nil {
+			t.Fatalf("%s preview: %v", tg.name, err)
+		}
+		pv, err := pvTask.Wait()
+		if err != nil {
+			t.Fatalf("%s preview wait: %v", tg.name, err)
+		}
+		pvSecs := time.Since(start).Seconds()
+
+		if pv.MuxVideo != PreviewMuxVP9WebM {
+			t.Errorf("%s: crop preview mux %q, want %q (crop previews are always vp9-webm)", tg.name, pv.MuxVideo, PreviewMuxVP9WebM)
+		}
+		if pv.Frames != f.sched.Frames {
+			t.Errorf("%s: preview holds %d frames, the schedule has %d", tg.name, pv.Frames, f.sched.Frames)
+		}
+		if pv.Width != e2eOutW || pv.Height != e2eOutH {
+			t.Errorf("%s: preview %dx%d, want %dx%d", tg.name, pv.Width, pv.Height, e2eOutW, e2eOutH)
+		}
+		if vc, _ := e2eVideoShape(t, pv.CropVideoPath); vc != "vp9" {
+			t.Errorf("%s: preview video codec %q, want vp9", tg.name, vc)
+		}
+		if e2eAudioCodec(t, filepath.Join(root, "vids", tg.fixture)) != "" {
+			if ac := e2eAudioCodec(t, pv.CropVideoPath); ac != "opus" {
+				t.Errorf("%s: preview audio %q, want the source track as opus", tg.name, ac)
+			}
+		}
+		t.Logf("%s: crop preview %d frames in %.1f s (%.1f fps) -> %s",
+			tg.name, pv.Frames, pvSecs, float64(pv.Frames)/pvSecs, pv.CropVideoPath)
+
+		// A 30-frame sample: ten output frames starting at each reference
+		// fraction. Extract each side's sample in one ffmpeg pass and compare
+		// the lossless PNG pairs.
+		var idxs []int
+		for _, pct := range e2eStillsFracs {
+			base := f.sched.Frames * pct / 100
+			if base+10 > f.sched.Frames {
+				base = f.sched.Frames - 10
+			}
+			for i := base; i < base+10; i++ {
+				idxs = append(idxs, i)
+			}
+		}
+		finalDir := filepath.Join(out, "frames", tg.name+"-preview-sample")
+		e2eExtractFrames(t, ffmpeg, f.path, idxs, finalDir, "final")
+		pvDir := filepath.Join(out, "frames", tg.name+"-preview-side")
+		e2eExtractFrames(t, ffmpeg, pv.CropVideoPath, idxs, pvDir, "pv")
+
+		worst, total := 100.0, 0.0
+		for i := range idxs {
+			// image2 writes %d patterns 1-based; extract names are i+1.
+			psnr := e2ePSNR(t, ffmpeg,
+				filepath.Join(finalDir, fmt.Sprintf("final%d.png", i+1)),
+				filepath.Join(pvDir, fmt.Sprintf("pv%d.png", i+1)))
+			total += psnr
+			if psnr < worst {
+				worst = psnr
+			}
+			if psnr < 33.0 {
+				t.Errorf("%s preview frame %d: psnr %.2f dB below the 33 dB preview-vs-final gate", tg.name, idxs[i], psnr)
+			}
+		}
+		t.Logf("%s: preview-vs-final over %d frames: mean %.2f dB, worst %.2f dB",
+			tg.name, len(idxs), total/float64(len(idxs)), worst)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Sink B parity: the MikV feed and its container.
+
+// TestE2EMikVRoundTrip renders music's MikV (Sink B + unchanged payload
+// code), reads the whole container back, and compares sample frames against
+// the final render's frames. The raw feed hands the payload code the chain's
+// rgb24 output exactly as the MJPEG sink sees it - but the rgb24 and
+// yuvj420p sink tails resample in different color spaces (34.4 dB apart raw)
+// and the payload re-encodes Go-jpeg-q90 what the final stored as mjpeg-q6;
+// the measured floor is 37.8 dB. psnr >= 37 dB. Frame payload sizes are the
+// sink's byte budget.
+func TestE2EMikVRoundTrip(t *testing.T) {
+	ffmpeg := e2eFFmpeg(t)
+	root := e2eRepoRoot(t)
+	out := e2eRun(t)
+	f := e2eRenderFinal(t, root, ffmpeg, "music")
+
+	mikvTask, err := f.a.RenderMikV(context.Background(), f.p, MikVRequest{
+		OutputDir:  filepath.Join(out, "products"),
+		TempDir:    filepath.Join(out, "mikv-tmp"),
+		OutputName: "music-frames.mikv",
+		FFmpegPath: ffmpeg,
+		Options:    MikVOptions{VideoJPEG: true, AudioOpus: true},
+	})
+	if err != nil {
+		t.Fatalf("music mikv: %v", err)
+	}
+	mres, err := mikvTask.Wait()
+	if err != nil {
+		t.Fatalf("music mikv wait: %v", err)
+	}
+	t.Logf("music mikv: %d frames written in %.1f s -> %s", mres.Frames, mres.ElapsedSeconds, mres.OutputPath)
+	if mres.Frames != f.res.Frames {
+		t.Errorf("music mikv holds %d frames, the mp4 render wrote %d", mres.Frames, f.res.Frames)
+	}
+
+	m := mikvformat.NewMikVFormat()
+	if err := m.Load(mres.OutputPath); err != nil {
+		t.Fatalf("music mikv load: %v", err)
+	}
+	if int(m.Width) != e2eOutW || int(m.Height) != e2eOutH {
+		t.Errorf("mikv header %dx%d, want %dx%d", m.Width, m.Height, e2eOutW, e2eOutH)
+	}
+	if int(m.FPS) != int(e2eFPS) {
+		t.Errorf("mikv header fps %d, want %d", m.FPS, int(e2eFPS))
+	}
+	if len(m.Frames) != f.res.Frames {
+		t.Fatalf("mikv read back %d frames, want %d", len(m.Frames), f.res.Frames)
+	}
+
+	// Sink B byte budget: payload sizes the frame feed produces.
+	minB, maxB, sumB, audioB := 1<<30, 0, 0, 0
+	for _, fr := range m.Frames {
+		if len(fr.Video) < minB {
+			minB = len(fr.Video)
+		}
+		if len(fr.Video) > maxB {
+			maxB = len(fr.Video)
+		}
+		sumB += len(fr.Video)
+		audioB += len(fr.Audio)
+	}
+	fileSize := int64(0)
+	if st, err := os.Stat(mres.OutputPath); err == nil {
+		fileSize = st.Size()
+	}
+	t.Logf("music mikv sink B: video payloads min %d / mean %d / max %d B, audio total %d B, file %d B",
+		minB, sumB/len(m.Frames), maxB, audioB, fileSize)
+
+	// Sample interior frames only: this fixture genuinely fades in and out,
+	// so frames 0 and last are black. Interior frames must carry picture -
+	// and must be the SAME frames the final render wrote (psnr >= 40 dB).
+	// The raw feed hands the payload code the chain's rgb24 output exactly as
+	// the MJPEG sink sees it, so the separation is encoder loss alone.
+	for _, idx := range []int{len(m.Frames) / 4, len(m.Frames) / 2, 3 * len(m.Frames) / 4} {
+		img, err := jpeg.Decode(bytes.NewReader(m.Frames[idx].Video))
+		if err != nil {
+			t.Fatalf("mikv frame %d is not a decodable JPEG: %v", idx, err)
+		}
+		if b := img.Bounds(); b.Dx() != e2eOutW || b.Dy() != e2eOutH {
+			t.Fatalf("mikv frame %d decodes to %dx%d, want %dx%d", idx, b.Dx(), b.Dy(), e2eOutW, e2eOutH)
+		}
+		if e2eMaxLuma(img) < 16 {
+			t.Errorf("mikv frame %d is black - the frame feed went wrong", idx)
+		}
+		if len(m.Frames[idx].Audio) == 0 {
+			t.Errorf("mikv frame %d carries no audio payload", idx)
+		}
+		jpg := filepath.Join(out, "stills", fmt.Sprintf("mikv-frame%d.jpg", idx))
+		if err := os.WriteFile(jpg, m.Frames[idx].Video, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		png := filepath.Join(out, "frames", fmt.Sprintf("music-mikv-final%d.png", idx))
+		e2eExtractFrame(t, ffmpeg, f.path, idx, png)
+		psnr := e2ePSNR(t, ffmpeg, png, jpg)
+		t.Logf("music mikv frame %d vs final frame %d: psnr %.2f dB (jpeg %d B)", idx, idx, psnr, len(m.Frames[idx].Video))
+		if psnr < 37.0 {
+			t.Errorf("music mikv frame %d: psnr %.2f dB below the 37 dB sink-B-vs-final gate", idx, psnr)
+		}
+	}
+	t.Logf("music mikv round trip: %d frames, header %dx%d@%d, sampled JPEG payloads decode clean with audio",
+		len(m.Frames), m.Width, m.Height, m.FPS)
+}
+
+// TestE2EAnalysisDeterminism: two independent analysis passes of the same
+// fixture must produce frame-identical analysis videos - compared as
+// framemd5 TEXT, never file bytes. This is what the CI goldens ride on.
+func TestE2EAnalysisDeterminism(t *testing.T) {
+	ffmpeg := e2eFFmpeg(t)
+	root := e2eRepoRoot(t)
+	fixture := e2eFixture(t, root, "music.mp4")
+	out := e2eRun(t)
+
+	dirs := []string{filepath.Join(out, "determinism-a"), filepath.Join(out, "determinism-b")}
+	defer func() {
+		for _, d := range dirs {
+			os.RemoveAll(d)
+		}
+	}()
+	hashes := make([]string, 2)
+	for i, dir := range dirs {
+		start := time.Now()
+		task, err := Analyze(context.Background(), AnalyzeRequest{Input: fixture, TempDir: dir, FFmpegPath: ffmpeg})
+		if err != nil {
+			t.Fatalf("determinism analyze %d: %v", i, err)
+		}
+		a, err := task.Wait()
+		if err != nil {
+			t.Fatalf("determinism analyze %d wait: %v", i, err)
+		}
+		hashes[i] = e2eFramemd5(t, ffmpeg, a.AnalysisVideoPath())
+		t.Logf("determinism pass %d: analysis in %.1f s", i, time.Since(start).Seconds())
+	}
+	if hashes[0] != hashes[1] {
+		t.Errorf("two analysis passes produced different frames:\nrun A head: %s\nrun B head: %s",
+			e2eHeadLines(hashes[0], 3), e2eHeadLines(hashes[1], 3))
+	} else {
+		t.Logf("analysis determinism: %d frame hashes identical across two passes", strings.Count(hashes[0], "\n")+1)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// e2e measurement helpers
+
+// e2eExtractFrame writes output frame idx of video as one PNG (lossless
+// comparison reference).
+func e2eExtractFrame(t *testing.T, ffmpeg, video string, idx int, outPath string) {
 	t.Helper()
-	psnr, mad := e2ePSNRMad(t, ffmpeg, baseline, newPath)
-	t.Logf("%s new-vs-baseline: psnr %.2f dB, mean abs luma %.3f (guard: >= 20 dB AND <= 12)", name, psnr, mad)
-	if psnr < 20.0 {
-		t.Errorf("%s: psnr %.2f dB below the 20 dB corruption guard", name, psnr)
+	combined, err := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-i", video,
+		"-vf", fmt.Sprintf("select=eq(n\\,%d)", idx), "-fps_mode", "passthrough", "-frames:v", "1",
+		outPath, "-y").CombinedOutput()
+	if err != nil {
+		t.Fatalf("frame extract %s @%d: %v\n%s", video, idx, err, combined)
 	}
-	if mad > 12.0 {
-		t.Errorf("%s: mean abs luma %.3f above the 12 corruption guard", name, mad)
+	if st, err := os.Stat(outPath); err != nil || st.Size() == 0 {
+		t.Fatalf("frame extract %s @%d produced no file: %v", video, idx, err)
 	}
 }
 
+// e2eExtractFrames extracts several frames in ONE decode pass; files land as
+// <prefix><i>.png in sample order.
+func e2eExtractFrames(t *testing.T, ffmpeg, video string, idxs []int, dir, prefix string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sel := make([]string, len(idxs))
+	for i, n := range idxs {
+		sel[i] = fmt.Sprintf("eq(n\\,%d)", n)
+	}
+	combined, err := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-i", video,
+		"-vf", "select="+strings.Join(sel, "+"), "-fps_mode", "passthrough",
+		filepath.Join(dir, prefix+"%d.png"), "-y").CombinedOutput()
+	if err != nil {
+		t.Fatalf("frame batch extract %s: %v\n%s", video, err, combined)
+	}
+	for i := range idxs {
+		p := filepath.Join(dir, fmt.Sprintf("%s%d.png", prefix, i+1))
+		if st, err := os.Stat(p); err != nil || st.Size() == 0 {
+			t.Fatalf("frame batch extract %s missing %s", video, p)
+		}
+	}
+}
+
+// e2ePSNR returns ffmpeg's psnr filter average in dB (inf reads as 100).
 func e2ePSNR(t *testing.T, ffmpeg, a, b string) float64 {
 	t.Helper()
 	combined, err := exec.Command(ffmpeg, "-hide_banner", "-i", a, "-i", b,
@@ -394,205 +771,6 @@ func e2eMeanAbsLuma(t *testing.T, ffmpeg, a, b string) float64 {
 	}
 	return total / float64(len(ms))
 }
-
-func e2ePSNRMad(t *testing.T, ffmpeg, a, b string) (float64, float64) {
-	t.Helper()
-	return e2ePSNR(t, ffmpeg, a, b), e2eMeanAbsLuma(t, ffmpeg, a, b)
-}
-
-// TestE2EMusicFit (7b): the fit product against its baseline, the bar law
-// (the content must get real black bars), and the MikV round trip - a whole
-// production container rendered from the same Plan and read back through
-// mikvformat.
-func TestE2EMusicFit(t *testing.T) {
-	ffmpeg := e2eFFmpeg(t)
-	root := e2eRepoRoot(t)
-	out := e2eOut(t, root)
-	baseline := e2eNeedBaseline(t, out, "music")
-
-	a, p, res, newPath := e2eRenderNew(t, root, out, ffmpeg, "music")
-	e2eStructuralCheck(t, baseline, newPath, "music")
-	e2eGuardCompare(t, ffmpeg, "music", baseline, newPath)
-
-	// Fit mode actually bars the product: the resolved content scaled
-	// aspect-preserving leaves black columns at the sides - sample the MIDDLE
-	// of the left bar, far from any content edge.
-	r := res.AppliedSettings
-	cw, ch := r.ContentW, r.ContentH
-	if cw == 0 || ch == 0 {
-		cw, ch = r.AnalysisW, r.AnalysisH
-	}
-	scale := e2eMinF(float64(r.OutputW)/float64(cw), float64(r.OutputH)/float64(ch))
-	scaledW := int(float64(cw)*scale + 0.5)
-	bars := (r.OutputW - scaledW) / 2
-	t.Logf("music fit: content %dx%d analysis px -> %d px of content in the output, %d px bars per side", cw, ch, scaledW, bars)
-	if bars < 40 {
-		t.Fatalf("music fit produced only %d px of bars - the fit law is not holding", bars)
-	}
-	e2eBarBlackCheck(t, ffmpeg, newPath, bars/2)
-
-	// MikV round trip from the same Plan (Sink B + unchanged payload code).
-	// The audio track rides the OGG-Opus path: the default 16 kHz PCM clock
-	// does not divide evenly over this 24 fps render (MikVRequest.Validate
-	// says so), and 48 kHz Opus divides exactly (2000 samples per frame).
-	mikvTask, err := a.RenderMikV(context.Background(), p, MikVRequest{
-		OutputDir:  filepath.Join(out, "new"),
-		TempDir:    filepath.Join(out, "new-mikv-tmp"),
-		OutputName: "music-frames.mikv",
-		FFmpegPath: ffmpeg,
-		Options:    MikVOptions{VideoJPEG: true, AudioOpus: true},
-	})
-	if err != nil {
-		t.Fatalf("music mikv: %v", err)
-	}
-	mres, err := mikvTask.Wait()
-	if err != nil {
-		t.Fatalf("music mikv wait: %v", err)
-	}
-	t.Logf("music mikv: %d frames written in %.1f s -> %s", mres.Frames, mres.ElapsedSeconds, mres.OutputPath)
-	if mres.Frames != res.Frames {
-		t.Errorf("music mikv holds %d frames, the mp4 render wrote %d", mres.Frames, res.Frames)
-	}
-
-	m := mikvformat.NewMikVFormat()
-	if err := m.Load(mres.OutputPath); err != nil {
-		t.Fatalf("music mikv load: %v", err)
-	}
-	if int(m.Width) != e2eOutW || int(m.Height) != e2eOutH {
-		t.Errorf("mikv header %dx%d, want %dx%d", m.Width, m.Height, e2eOutW, e2eOutH)
-	}
-	if int(m.FPS) != int(e2eFPS) {
-		t.Errorf("mikv header fps %d, want %d", m.FPS, int(e2eFPS))
-	}
-	if len(m.Frames) != res.Frames {
-		t.Fatalf("mikv read back %d frames, want %d", len(m.Frames), res.Frames)
-	}
-	// Sample interior frames only: this fixture genuinely fades in and out,
-	// so frames 0 and last are black IN THE BASELINE TOO (measured: baseline
-	// frame 0 YMAX=2, frame 3279 YMAX=0). Interior frames must carry picture.
-	for _, idx := range []int{len(m.Frames) / 4, len(m.Frames) / 2, 3 * len(m.Frames) / 4} {
-		img, err := jpeg.Decode(bytes.NewReader(m.Frames[idx].Video))
-		if err != nil {
-			t.Fatalf("mikv frame %d is not a decodable JPEG: %v", idx, err)
-		}
-		if b := img.Bounds(); b.Dx() != e2eOutW || b.Dy() != e2eOutH {
-			t.Fatalf("mikv frame %d decodes to %dx%d, want %dx%d", idx, b.Dx(), b.Dy(), e2eOutW, e2eOutH)
-		}
-		if e2eMaxLuma(img) < 16 {
-			t.Errorf("mikv frame %d is black - the frame feed went wrong", idx)
-		}
-		if len(m.Frames[idx].Audio) == 0 {
-			t.Errorf("mikv frame %d carries no audio payload", idx)
-		}
-	}
-	t.Logf("music mikv round trip: %d frames, header %dx%d@%d, sampled JPEG payloads decode clean with audio",
-		len(m.Frames), m.Width, m.Height, m.FPS)
-
-	// Reference stills for 7e.
-	e2eRecordStills(t, ffmpeg, newPath, filepath.Join(out, "new", "stills", "music"))
-}
-
-// TestE2ESweetDevilCrop (7c): the crop product against its baseline, and the
-// motion proof - consecutive output frames must differ, so a frozen render or
-// a stuck crop walk cannot pass.
-func TestE2ESweetDevilCrop(t *testing.T) {
-	ffmpeg := e2eFFmpeg(t)
-	root := e2eRepoRoot(t)
-	out := e2eOut(t, root)
-	baseline := e2eNeedBaseline(t, out, "sweetdevil")
-
-	_, _, res, newPath := e2eRenderNew(t, root, out, ffmpeg, "sweetdevil")
-	e2eStructuralCheck(t, baseline, newPath, "sweetdevil")
-	e2eGuardCompare(t, ffmpeg, "sweetdevil", baseline, newPath)
-
-	// Consecutive frames at four points in the timeline: a real 60 -> 24 fps
-	// crop render never freezes. Three of four pairs must differ measurably.
-	pairs := []int{res.Frames / 10, res.Frames / 3, res.Frames / 2, 4 * res.Frames / 5}
-	differing := 0
-	for _, i := range pairs {
-		mad := e2eConsecutiveFrameMAD(t, ffmpeg, newPath, i)
-		t.Logf("sweetdevil frames %d vs %d: mean abs luma %.3f", i, i+1, mad)
-		if mad > 0.02 {
-			differing++
-		}
-	}
-	if differing < 3 {
-		t.Errorf("only %d of %d consecutive frame pairs differ - the render looks frozen", differing, len(pairs))
-	}
-
-	e2eRecordStills(t, ffmpeg, newPath, filepath.Join(out, "new", "stills", "sweetdevil"))
-}
-
-// TestE2EAnalysisDeterminism (7d): two independent analysis passes of the
-// same fixture must produce frame-identical analysis videos - compared as
-// framemd5 TEXT, never file bytes. This is what the CI goldens ride on.
-func TestE2EAnalysisDeterminism(t *testing.T) {
-	ffmpeg := e2eFFmpeg(t)
-	root := e2eRepoRoot(t)
-	out := e2eOut(t, root)
-	fixture := e2eFixture(t, root, "music.mp4")
-
-	dirs := []string{filepath.Join(out, "determinism-a"), filepath.Join(out, "determinism-b")}
-	defer func() {
-		for _, d := range dirs {
-			os.RemoveAll(d)
-		}
-	}()
-	hashes := make([]string, 2)
-	for i, dir := range dirs {
-		start := time.Now()
-		task, err := Analyze(context.Background(), AnalyzeRequest{Input: fixture, TempDir: dir, FFmpegPath: ffmpeg})
-		if err != nil {
-			t.Fatalf("determinism analyze %d: %v", i, err)
-		}
-		a, err := task.Wait()
-		if err != nil {
-			t.Fatalf("determinism analyze %d wait: %v", i, err)
-		}
-		hashes[i] = e2eFramemd5(t, ffmpeg, a.AnalysisVideoPath())
-		t.Logf("determinism pass %d: analysis in %.1f s", i, time.Since(start).Seconds())
-	}
-	if hashes[0] != hashes[1] {
-		t.Errorf("two analysis passes produced different frames:\nrun A head: %s\nrun B head: %s",
-			e2eHeadLines(hashes[0], 3), e2eHeadLines(hashes[1], 3))
-	} else {
-		t.Logf("analysis determinism: %d frame hashes identical across two passes", strings.Count(hashes[0], "\n")+1)
-	}
-}
-
-// TestE2EStills (7e): the reference stills (5%..90%) of each new render
-// against the baseline stills - frame alignment through the whole timeline.
-func TestE2EStills(t *testing.T) {
-	ffmpeg := e2eFFmpeg(t)
-	root := e2eRepoRoot(t)
-	out := e2eOut(t, root)
-	for _, tg := range e2eTargets {
-		newVideo := filepath.Join(out, "new", tg.name+"-render.mp4")
-		if st, err := os.Stat(newVideo); err != nil || st.Size() == 0 {
-			t.Skipf("%s: new render missing - run the render tests first", tg.name)
-		}
-		newDir := filepath.Join(out, "new", "stills", tg.name)
-		baseDir := filepath.Join(out, "baseline", "stills", tg.name)
-		for _, pct := range e2eReferenceFracs {
-			newP := filepath.Join(newDir, "p"+strconv.Itoa(pct)+".png")
-			baseP := filepath.Join(baseDir, "p"+strconv.Itoa(pct)+".png")
-			if _, err := os.Stat(baseP); err != nil {
-				t.Skipf("%s: baseline still p%d missing - record baselines first", tg.name, pct)
-			}
-			if _, err := os.Stat(newP); err != nil {
-				t.Skipf("%s: new still p%d missing - run the render tests first", tg.name, pct)
-			}
-			psnr, mad := e2ePSNRMad(t, ffmpeg, baseP, newP)
-			t.Logf("%s still @ %d%%: psnr %.2f dB, mean abs luma %.3f", tg.name, pct, psnr, mad)
-			if psnr < 20.0 || mad > 12.0 {
-				t.Errorf("%s still @ %d%% breaks the corruption guard (psnr %.2f, mad %.3f)", tg.name, pct, psnr, mad)
-			}
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// e2e measurement helpers
 
 // e2eBarBlackCheck samples a 20 px column at x=barX over the whole video and
 // requires every frame's mean bar luma to stay black (<= 2 on a full-range

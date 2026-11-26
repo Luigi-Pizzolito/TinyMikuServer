@@ -494,12 +494,13 @@ type PreviewOptions struct {
 	DrawReadouts     bool `json:"draw_readouts"`
 	DrawSubjectBoxes bool `json:"draw_subject_boxes"`
 	DrawIslands      bool `json:"draw_islands"`
-	// MuxVideo picks the codec the preview sequences are muxed with. "" or
-	// mjpeg is the engine default: the JPEG sequence is put into an MP4 the
-	// way the CLI mux does it, video only. vp9-webm encodes VP9 video and
-	// brings the analyzed input's audio track along as Opus, in a WebM
-	// container - the pairing every browser decodes, at the cost of a real
-	// video encode, so it is opt-in. The file extension follows the mux.
+	// MuxVideo picks the OVERLAY preview video's mux. "" or mjpeg is the
+	// engine default: the Go-drawn JPEG sequence is put into an MP4 the way
+	// the CLI mux does it, video only. vp9-webm encodes VP9 video and brings
+	// the analyzed input's audio track along as Opus, in a WebM container -
+	// the pairing every browser decodes. The CROP video ignores this field:
+	// a crop preview is a render pass of the shared pipeline and is always
+	// encoded vp9-webm. The file extension follows the mux.
 	MuxVideo PreviewMux `json:"mux_video"`
 	Observer *Observer  `json:"-"`
 }
@@ -608,7 +609,7 @@ type PreviewResult struct {
 	SettingsHash     string     `json:"settings_hash"`
 	CropVideoPath    string     `json:"crop_video_path"`    // "" when kind=overlay
 	OverlayVideoPath string     `json:"overlay_video_path"` // "" when kind=crop
-	MuxVideo         PreviewMux `json:"mux_video"`          // the codec both preview files hold
+	MuxVideo         PreviewMux `json:"mux_video"`          // a published crop pass is always vp9-webm; with an overlay file published, that file's mux
 	Width            int        `json:"width"`              // OUTPUT target resolution
 	Height           int        `json:"height"`
 	Frames           int        `json:"frames"`

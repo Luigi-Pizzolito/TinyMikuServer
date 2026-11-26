@@ -2,6 +2,8 @@ package holocropper
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
@@ -10,19 +12,22 @@ import (
 	"image/jpeg"
 	"io"
 	"math"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
 
 /* Stills and contact sheets (HOLOCROPPER-API-PLAN.md story B3).
 
-No Task, no scratch files: both composite in memory straight from the
-cached analysis video plus the Plan's records - the same crop rect and
-fill-resize the render passes execute (cropToBBoxCalc + fillResizeTo),
-with the same output-space overlay boxes the preview videos draw. A
-Snapshot is the annotated single frame a scrubber popover opens; a
-ContactSheet is the evenly-sampled tile strip under the timeline.
+A Snapshot is the SHARED render pipeline run for ONE frame: seeked decode,
+writePPMCrop, finalFilterChain, MJPEG sink at mjpegQ - the same codec path a
+final frame takes (see renderStillJPEG). A ContactSheet is the evenly-sampled
+tile strip under the timeline, still composited in memory from the cached
+analysis video plus the Plan's records - the same crop rect and fill-resize
+the Go frame loop executes (cropToBBoxCalc + fillResizeTo), with the same
+output-space overlay boxes the preview videos draw.
 
 One ffmpeg pipe pass (select filter, rawvideo) fetches every wanted frame,
 so a contact sheet costs one decode pass over the analysis video, not one
@@ -64,9 +69,13 @@ type Snapshot struct {
 
 // Snapshot composites output-space frame `frame` (1-based). maxWidth > 0
 // caps the returned width (height follows the output aspect); 0 returns
-// the full output resolution. The annotation is always drawn at full
-// output resolution first, then scaled, so a capped snapshot's boxes are
-// exactly the full-res framing shrunk, never re-derived.
+// the full output resolution. Since the pipeline unification the frame IS
+// the render pass for one frame: the frame-N crop from the plan
+// (scaleRectToSource), a seeked source decode, writePPMCrop, and the final
+// filter chain's MJPEG sink at mjpegQ - byte-for-byte the final's codec
+// path, so a snapshot shows exactly what the product writes at that frame.
+// No overlay boxes (the UI draws its own); a maxWidth cap re-scales and
+// re-encodes in Go only when the cap actually bites.
 func (p *Plan) Snapshot(frame, maxWidth int) (*Snapshot, error) {
 	if frame < 1 || frame > len(p.records) {
 		return nil, fmt.Errorf("holocropper: snapshot frame %d out of range 1..%d", frame, len(p.records))
@@ -74,24 +83,137 @@ func (p *Plan) Snapshot(frame, maxWidth int) (*Snapshot, error) {
 	if p.videoPath == "" {
 		return nil, errStillsNoVideo
 	}
+	idx := frame - 1
+	w, h := p.resolved.OutputW, p.resolved.OutputH
 
-	frameRGBA, err := p.decodeAnalysisFrame(frame - 1)
+	jpegBytes, err := p.renderStillJPEG(idx)
 	if err != nil {
 		return nil, err
 	}
-
-	full := p.composeFrame(frame-1, frameRGBA, p.resolved.OutputW, p.resolved.OutputH)
-	w, h := full.Bounds().Dx(), full.Bounds().Dy()
 	if tw, th := stillsCapSize(w, h, maxWidth); tw != w || th != h {
-		full = fillResizeTo(full, tw, th)
+		img, err := jpeg.Decode(bytes.NewReader(jpegBytes))
+		if err != nil {
+			return nil, fmt.Errorf("holocropper: snapshot re-size: %w", err)
+		}
+		rgba, err := toRGBA(img)
+		if err != nil {
+			return nil, fmt.Errorf("holocropper: snapshot re-size: %w", err)
+		}
+		capped := fillResizeTo(rgba, tw, th)
+		var buf bytes.Buffer
+		if err := jpeg.Encode(&buf, capped, &jpeg.Options{Quality: snapshotJPEGQuality}); err != nil {
+			return nil, err
+		}
+		jpegBytes = buf.Bytes()
 		w, h = tw, th
 	}
+	return &Snapshot{Frame: frame, Width: w, Height: h, JPEG: jpegBytes}, nil
+}
 
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, full, &jpeg.Options{Quality: snapshotJPEGQuality}); err != nil {
+// renderStillJPEG runs the single-frame render pass: the frame's crop rect
+// (analysis space -> source pixels, exactly as the final maps it), a seeked
+// rgb24 decode of the SOURCE video at source pixels (the same decoder args
+// the final uses, plus the input seek), the Go crop copy (writePPMCrop), and
+// the shared encoder with the MJPEG sink at mjpegQ written as a bare JPEG
+// file. The analysis video is only a 480p proxy - decoding it would resize
+// from fewer pixels than the final and the still would not match - so the
+// still decodes the analyzed input itself. The seek sits half a frame EARLY -
+// the package's frame-seeking law (see seekAnalysisFrame): ffmpeg hands out
+// the first frame with pts >= ss, so the target frame is the first survivor.
+func (p *Plan) renderStillJPEG(idx int) ([]byte, error) {
+	w, h := p.resolved.OutputW, p.resolved.OutputH
+	aw, ah := p.resolved.AnalysisW, p.resolved.AnalysisH
+	sw, sh := p.resolved.SourceW, p.resolved.SourceH
+	if aw <= 0 || ah <= 0 || sw <= 0 || sh <= 0 {
+		return nil, fmt.Errorf("holocropper: plan has no analysis/source geometry for stills")
+	}
+	sourceFile, err := p.sourceInputPath()
+	if err != nil {
 		return nil, err
 	}
-	return &Snapshot{Frame: frame, Width: w, Height: h, JPEG: buf.Bytes()}, nil
+	fps := p.analysisFPS
+	if fps <= 0 {
+		fps = defaultFPS
+	}
+	rectFor := func(srcIdx int) image.Rectangle {
+		return scaleRectToSource(p.cropRectAt(srcIdx), aw, ah, sw, sh)
+	}
+	mode := finalModeCrop
+	fitW, fitH, padX, padY := w, h, 0, 0
+	if p.settings.FitWithBars {
+		// The fit content rect resolves once per stream (plan §6.10): the
+		// still bakes the same box the final's chain carries.
+		mode = finalModeFit
+		fitW, fitH, padX, padY = fitBoxToOutput(rectFor(0).Dx(), rectFor(0).Dy(), w, h)
+	}
+
+	dir, err := os.MkdirTemp("", "holocropper-still-*")
+	if err != nil {
+		return nil, fmt.Errorf("holocropper: still scratch: %w", err)
+	}
+	defer os.RemoveAll(dir)
+	out := filepath.Join(dir, "still.jpg")
+
+	tb := newTaskBase(context.Background(), TaskRenderFinal, nil)
+	tb.begin()
+	if err := runSourceRender(context.Background(), sourceRenderOpts{
+		tb: tb, sourceFile: sourceFile,
+		srcW: sw, srcH: sh, srcFrames: len(p.records),
+		sched:   frameSchedule{Frames: 1, SrcFor: []int{idx}, AnalysisFPS: fps, RenderFPS: fps},
+		rectFor: rectFor, mode: mode, sink: sinkMJPEG,
+		fitW: fitW, fitH: fitH, padX: padX, padY: padY,
+		outW: w, outH: h, fps: fps,
+		startFrame: 0, frameCount: 1, frameLimit: 1,
+		seekSeconds: stillSeekSeconds(idx, fps),
+		phase:       PhaseRenderFrames, totalOut: 1,
+		tmpOutJPEG:  out,
+	}); err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		return nil, fmt.Errorf("holocropper: still frame: %w", err)
+	}
+	return data, nil
+}
+
+// sourceInputPath resolves the original video file the cached analysis was
+// built from: the meta.json sidecar beside every analysis.mp4 records the
+// analyzed input path. The stills pipeline decodes that file, frame-for-frame
+// what the final render decodes.
+func (p *Plan) sourceInputPath() (string, error) {
+	if p.videoPath == "" {
+		return "", errStillsNoVideo
+	}
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(p.videoPath), analysisMetaName))
+	if err != nil {
+		return "", fmt.Errorf("holocropper: stills need the analyzed input path (meta.json beside the analysis video): %w", err)
+	}
+	var meta analysisMeta
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return "", fmt.Errorf("holocropper: stills parse the analysis meta.json: %w", err)
+	}
+	if meta.Input == "" {
+		return "", fmt.Errorf("holocropper: analysis meta.json carries no input path")
+	}
+	return meta.Input, nil
+}
+
+// stillSeekSeconds is the half-early input-seek timestamp for analysis frame
+// idx (the seekAnalysisFrame law, shared with every one-frame verb).
+func stillSeekSeconds(idx int, fps float64) float64 {
+	ss := (float64(idx) - 0.5) / fps
+	if fps <= 0 || ss < 0 {
+		ss = 0
+	}
+	return ss
+}
+
+// toRGBA copies any image into an *image.RGBA (the fillResizeTo input law).
+func toRGBA(img image.Image) (*image.RGBA, error) {
+	out := image.NewRGBA(img.Bounds())
+	draw.Draw(out, out.Bounds(), img, img.Bounds().Min, draw.Src)
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -227,45 +349,6 @@ func scaleRecordToFrame(rec FrameRecord, w, h, tw, th int) FrameRecord {
 
 func scaleRect(r Rect, fx, fy float64) Rect {
 	return Rect{X: r.X * fx, Y: r.Y * fy, W: r.W * fx, H: r.H * fy}
-}
-
-// decodeAnalysisFrame fetches exactly one analysis frame with the same
-// one-pass select machinery the sheet uses.
-// decodeAnalysisFrame fetches one analysis frame. A Plan whose stream locked
-// an fps gets the time-seeked decode (decodeAnalysisFrameSeek); a Plan from
-// a stream that never locked one keeps the select-filter fetch.
-func (p *Plan) decodeAnalysisFrame(idx int) (*image.RGBA, error) {
-	if idx < 0 || idx >= len(p.records) {
-		return nil, fmt.Errorf("holocropper: analysis video has %d frames, still asks for index %d", len(p.records), idx)
-	}
-	if p.analysisFPS > 0 {
-		return p.decodeAnalysisFrameSeek(idx)
-	}
-	frames, err := p.decodeAnalysisFrames([]int{idx})
-	if err != nil {
-		return nil, err
-	}
-	return frames[0], nil
-}
-
-// decodeAnalysisFrameSeek fetches frame idx with an ffmpeg INPUT seek instead
-// of a select filter. Accurate input seek decodes from the keyframe before
-// the target and discards frames whose pts lands before the seek point, so
-// the pipe work is bounded to roughly one GOP ahead of the target instead of
-// a full linear pass over the whole analysis video - the cost a live
-// frame-strip poll pays several times a second must not scale with video
-// length.
-//
-// The seek sits half a frame EARLY: ffmpeg hands out the first frame with
-// pts >= ss, so half a frame below the target's own timestamp makes the
-// target frame the first survivor under float rounding (the analysis encode
-// is frame-passthrough, so frame idx sits at idx/analysisFPS — the engine's
-// frame-grid law, the same CFR assumption the framing decider steps on).
-func (p *Plan) decodeAnalysisFrameSeek(idx int) (*image.RGBA, error) {
-	if p.resolved.AnalysisW <= 0 || p.resolved.AnalysisH <= 0 {
-		return nil, fmt.Errorf("holocropper: plan has no analysis geometry for stills")
-	}
-	return seekAnalysisFrame(p.videoPath, idx, p.resolved.AnalysisW, p.resolved.AnalysisH, p.analysisFPS)
 }
 
 // seekAnalysisFrame fetches analysis frame idx (0-based) out of `path` with an

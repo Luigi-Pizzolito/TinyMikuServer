@@ -23,14 +23,15 @@ import (
 previews and the final production render - both executed from a cached
 Analysis plus a Plan, no detection and no re-analysis.
 
-The preview pass runs the frame loop - cropToBBoxCalc + fillResizeTo for the
-content-aware modes, fitResizeTo (whole frame scaled onto black bars) for fit
-mode (§6.10) - against the cached analysis video, writing a JPEG sequence and
-ffmpeg-muxing it with progress. The final production render instead runs the
-linear-light pipeline in linearrender.go: full-res source decode, the crop
-composed at source pixels, and one ffmpeg encode that resizes in linear light
-(lanczos, cas=0.4 last) and muxes mjpeg + the source audio through, exactly
-as the CLI does.
+The CROP preview video runs the SAME pipeline as the final production render
+(linearrender.go): full-res source decode, the crop composed at source
+pixels, and the one shared encoder chain (finalFilterChain) - the pixels are
+what the final writes, so the judged preview matches the judged product.
+The only sink is VP9+WebM (the browser-safe pairing; the encode args are the
+preview mux's own, kept verbatim, now with the limited-range conversion
+inside the shared chain). The OVERLAY preview keeps the analysis-cache frame
+loop (plannedFrames/runOverlayLoop): its frames carry Go-drawn boxes and cannot
+come out of a filter chain.
 
 Preview files are versioned and never overwritten (requirement 11):
 <basename>-<WxH>-v<N>.mp4 and <basename>-<WxH>-overlay-v<N>.mp4 inside the
@@ -72,10 +73,9 @@ const (
 // GOP - full-range builds die on the first hardware decode, limited-range
 // builds play end to end (docs/current/VIDEO_SECTION_V2.md §6).
 const (
-	// previewRangeFilter converts the JPEG stills to limited range as they
-	// enter the encoder, so the preview's levels match the source video's.
-	previewRangeFilter = "scale=in_range=jpeg:out_range=tv"
-	// previewColorRange is the range the muxer stamps on the stream.
+	// previewColorRange is the range the muxer stamps on the stream. The
+	// conversion to that range is now the shared chain's job (the crop
+	// pass's final scale carries out_color_matrix=bt709:out_range=tv).
 	previewColorRange = "tv"
 )
 
@@ -346,30 +346,35 @@ func previewWork(ctx context.Context, a *Analysis, task *PreviewTask, p *Plan, o
 		return nil, fmt.Errorf("holocropper: unknown preview kind %q", opts.Kind)
 	}
 
-	cropDir, overlayDir := "", ""
-	if wantCrop {
-		cropDir = filepath.Join(task.scratch, "crop")
-		if err := os.MkdirAll(cropDir, 0o755); err != nil {
-			return nil, err
-		}
+	// The crop video is a shared-pipeline encode: always the VP9 sink (the
+	// pairing the browser preview pane plays). Options.MuxVideo steers the
+	// OVERLAY mux only.
+	mux := opts.MuxVideo
+	if mux == "" {
+		mux = PreviewMuxMJPEG
 	}
+	overlayDir := ""
 	if wantOverlay {
 		overlayDir = filepath.Join(task.scratch, "overlay")
 		if err := os.MkdirAll(overlayDir, 0o755); err != nil {
 			return nil, err
 		}
 	}
+	if wantCrop {
+		// The crop pass encodes straight into scratch (the shared render
+		// pipeline lands its sink file there before the versioned move-in).
+		if err := os.MkdirAll(task.scratch, 0o755); err != nil {
+			return nil, err
+		}
+	}
 
 	start := time.Now()
 
-	// The mux decides what the preview files hold, and for vp9-webm whether
-	// the analyzed input's audio comes along as Opus.
-	mux := opts.MuxVideo
-	if mux == "" {
-		mux = PreviewMuxMJPEG
-	}
+	// Whether the analyzed input's audio comes along: always for the VP9 crop
+	// encode, and for an OVERLAY vp9-webm mux (the mjpeg overlay mux never
+	// carries audio today).
 	audioSource := ""
-	if mux == PreviewMuxVP9WebM {
+	if wantCrop || mux == PreviewMuxVP9WebM {
 		hasAudio, err := sourceHasAudio(ctx, ffmpegPath, a.meta.Input)
 		if err != nil {
 			return nil, err
@@ -381,9 +386,18 @@ func previewWork(ctx context.Context, a *Analysis, task *PreviewTask, p *Plan, o
 		}
 	}
 
-	frames, err := runCropLoop(ctx, tb, a, p, cropDir, overlayDir, opts, PhasePreviewFrames)
-	if err != nil {
-		return nil, err
+	frames := 0 // the frames the published previews hold
+	if wantCrop {
+		frames = a.frameSchedule(p).Frames
+	}
+	if wantOverlay {
+		n, err := runOverlayLoop(ctx, tb, a, p, overlayDir, opts, PhasePreviewFrames)
+		if err != nil {
+			return nil, err
+		}
+		if !wantCrop {
+			frames = n
+		}
 	}
 	// A cancel that landed on the last decoded frame still wins: never publish
 	// a preview for a pass that no longer owns the render slot.
@@ -405,19 +419,46 @@ func previewWork(ctx context.Context, a *Analysis, task *PreviewTask, p *Plan, o
 	// is moved in only once complete, so a cancelled mux never publishes a
 	// half file.
 	if wantCrop {
-		v := nextPreviewVersion(a.PreviewsDir(), basename, r.OutputW, r.OutputH, PreviewCrop)
-		final := filepath.Join(a.PreviewsDir(), previewFileName(basename, r.OutputW, r.OutputH, PreviewCrop, v, mux))
-		tmp := filepath.Join(task.scratch, "crop"+previewFileExt(mux))
-		if err := muxFrameSequence(ctx, ffmpegPath, cropDir, audioSource, out.FPS, tmp, mux, PhasePreviewMux, tb, frames); err != nil {
+		// The crop video: the SAME render pass the final runs (source decode,
+		// scaleRectToSource, writePPMCrop, finalFilterChain, previewGOPFrames
+		// and the source audio as Opus), VP9 sink.
+		sched := a.frameSchedule(p)
+		rectFor := func(srcIdx int) image.Rectangle {
+			return scaleRectToSource(p.cropRectAt(srcIdx), r.AnalysisW, r.AnalysisH, r.SourceW, r.SourceH)
+		}
+		mode := finalModeCrop
+		fitW, fitH, padX, padY := r.OutputW, r.OutputH, 0, 0
+		if p.settings.FitWithBars {
+			mode = finalModeFit
+			fitW, fitH, padX, padY = fitBoxToOutput(rectFor(0).Dx(), rectFor(0).Dy(), r.OutputW, r.OutputH)
+		}
+		tmp := filepath.Join(task.scratch, "crop"+previewFileExt(PreviewMuxVP9WebM))
+		if err := runSourceRender(ctx, sourceRenderOpts{
+			tb: tb, ffmpegPath: ffmpegPath, sourceFile: a.meta.Input,
+			srcW: r.SourceW, srcH: r.SourceH, srcFrames: len(p.records),
+			sched: sched, rectFor: rectFor, mode: mode, sink: sinkVP9,
+			fitW: fitW, fitH: fitH, padX: padX, padY: padY,
+			outW: r.OutputW, outH: r.OutputH, fps: planFPS(p),
+			phase: PhasePreviewMux, totalOut: sched.Frames,
+			tmpOutWebM: tmp, audioSource: audioSource,
+		}); err != nil {
 			return nil, err
 		}
+		v := nextPreviewVersion(a.PreviewsDir(), basename, r.OutputW, r.OutputH, PreviewCrop)
+		final := filepath.Join(a.PreviewsDir(), previewFileName(basename, r.OutputW, r.OutputH, PreviewCrop, v, PreviewMuxVP9WebM))
 		if err := moveFile(tmp, final); err != nil {
 			return nil, err
+		}
+		// A pure crop pass is vp9-webm whatever MuxVideo asked for (the crop
+		// video is always the browser-safe encode); MuxVideo labels the
+		// overlay file when one is published.
+		if !wantOverlay {
+			out.MuxVideo = PreviewMuxVP9WebM
 		}
 		out.Version = v
 		out.CropVideoPath = final
 		if err := writePreviewSidecar(PreviewRef{
-			Version: v, Kind: PreviewCrop, Path: final, MuxVideo: mux, SettingsHash: out.SettingsHash,
+			Version: v, Kind: PreviewCrop, Path: final, MuxVideo: PreviewMuxVP9WebM, SettingsHash: out.SettingsHash,
 			CreatedAt: time.Now().UTC(), Width: r.OutputW, Height: r.OutputH, FPS: out.FPS, Frames: frames, Law: PreviewLaw,
 		}); err != nil {
 			return nil, err
@@ -458,12 +499,13 @@ func previewWork(ctx context.Context, a *Analysis, task *PreviewTask, p *Plan, o
 // ---------------------------------------------------------------------------
 // The crop loop (shared by previews and the final render)
 
-// runCropLoop decodes the cached analysis video and writes the planned crops.
-// cropDir receives the plain crop sequence; overlayDir receives the same
-// frames with the framing boxes drawn. The sequences are the SCHEDULED frames:
-// file names are 1-based output frame numbers, so the image2 demuxer plays
-// them at the render clock.
-func runCropLoop(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, cropDir, overlayDir string, opts PreviewOptions, phase Phase) (int, error) {
+// runOverlayLoop decodes the cached analysis video and writes the overlay
+// sequence: the planned frames with the framing boxes drawn (the crop
+// preview went to the shared render pipeline, so this loop's plain-crop half
+// was retired with it). The sequence is the SCHEDULED frames: file names are
+// 1-based output frame numbers, so the image2 demuxer plays them at the
+// render clock.
+func runOverlayLoop(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, overlayDir string, opts PreviewOptions, phase Phase) (int, error) {
 	r := p.resolved
 	style := defaultOverlayStyle()
 	// G4 detail layers need the mask, not just the record. The stream's
@@ -474,11 +516,6 @@ func runCropLoop(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, cropDi
 	stream := a.Stream()
 	memoIdx, memoOK, memo := -1, false, subjectDetail{}
 	return plannedFrames(ctx, tb, a, p, a.frameSchedule(p), phase, func(outIdx, srcIdx int, analysis, out *image.RGBA) error {
-		if cropDir != "" {
-			if err := writeJPEG(cropDir, outIdx+1, out); err != nil {
-				return err
-			}
-		}
 		if overlayDir != "" {
 			overlay := image.NewRGBA(image.Rect(0, 0, r.OutputW, r.OutputH))
 			copyRGBA(overlay, out)
@@ -507,7 +544,7 @@ func runCropLoop(ctx context.Context, tb *taskBase, a *Analysis, p *Plan, cropDi
 // an error, never a silent truncation. The Plan's frames are played out on the
 // schedule, so an output pass writes renderFPS seconds-worth of frames even
 // when the analysis clock is different. fn owns what the frame becomes -
-// a JPEG file (runCropLoop) or a MikV frame payload (RenderMikV) - and is told
+// a JPEG file (runOverlayLoop) or a MikV frame payload (RenderMikV) - and is told
 // both the output frame it is writing and which analysis frame it replays,
 // plus the DECODED analysis frame itself (G4: the overlay pass measures its
 // subject detail from the exact pixels this pass decoded; callers that only
@@ -641,13 +678,15 @@ func muxFrameSequence(ctx context.Context, ffmpegPath, framesDir, audioSource st
 		//
 		// Two args are law, not taste:
 		//
-		// -vf + -color_range carry the preview out of the refusal zone.
-		// The frames are full-range JPEG stills, and a full-range vp9
-		// stream with the range left undeclared is what Chromium's HARDWARE
-		// VP9 decoder refuses: the VA-API decoder answers "error decoding
-		// stream" (MEDIA_ERR_DECODE) while libvpx, ffvp9 and Chromium's own
-		// software path read the same bytes happily. Converting the stills
-		// to limited range and stamping that on the stream fixes it.
+		// -color_range stamps the limited range the stream carries. Full-range
+		// VP9 with the range left undeclared is what Chromium's HARDWARE VP9
+		// decoder refuses: the VA-API decoder answers "error decoding stream"
+		// (MEDIA_ERR_DECODE) while libvpx, ffvp9 and Chromium's own software
+		// path read the same bytes happily. The conversion itself now lives
+		// in the shared chain's final scale stage (out_color_matrix=bt709:
+		// out_range=tv) - the old previewRangeFilter -vf step existed only
+		// because the old crop input was full-range JPEG stills, and the
+		// crop pass no longer runs this mux at all.
 		//
 		// -g keeps a keyframe within one second of any seek. Note the
 		// correction of an earlier reading here: the refusal was first
@@ -655,14 +694,14 @@ func muxFrameSequence(ctx context.Context, ffmpegPath, framesDir, audioSource st
 		// happened to fail near a GOP boundary, but the measured matrix
 		// shows full-range builds die at GOP 128, 48, 24, 12 and all-intra
 		// alike, while limited-range builds play at every one of them.
-		args = append(args, "-vf", previewRangeFilter,
+		args = append(args,
 			"-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p",
 			"-crf", strconv.Itoa(previewVP9CRF), "-b:v", "0",
 			"-deadline", "good", "-cpu-used", strconv.Itoa(previewVP9CPUUsed),
 			"-g", strconv.Itoa(previewGOPFrames(fps)),
 			"-color_range", previewColorRange)
 	} else {
-		args = append(args, "-c:v", "mjpeg", "-q:v", "6")
+		args = append(args, "-c:v", "mjpeg", "-q:v", strconv.Itoa(mjpegQ))
 	}
 	if audioSource != "" {
 		args = append(args, "-map", "1:a:0")
@@ -927,26 +966,28 @@ func renderFinalWork(ctx context.Context, a *Analysis, task *RenderTask, p *Plan
 		return nil, err
 	}
 
-	// The linear-light production pass (SHARPER_PLAN §4): full-res decode,
-	// the Plan's crop composed at source pixels, one ffmpeg encode running
-	// lanczos in linear light with cas=0.4 last, muxed as the same mjpeg +
+	// The production pass (the judged "H" law): full-res decode, the Plan's
+	// crop composed at source pixels, one ffmpeg encode running hqdn3d +
+	// two-stage Lanczos in gamma space, muxed as the same mjpeg +
 	// source-audio-copy MP4 the CLI produces.
 	sched := a.frameSchedule(p)
 	rectFor := func(srcIdx int) image.Rectangle {
 		return scaleRectToSource(p.cropRectAt(srcIdx), r.AnalysisW, r.AnalysisH, r.SourceW, r.SourceH)
 	}
-	chain := linearFillChain(r.OutputW, r.OutputH)
+	mode := finalModeCrop
+	fitW, fitH, padX, padY := r.OutputW, r.OutputH, 0, 0
 	if p.settings.FitWithBars {
 		// The fit content rect resolves once per stream (plan §6.10), so the
 		// fit box is constant and the pad law can be baked into the chain.
-		c := rectFor(0)
-		chain = linearFitChain(c.Dx(), c.Dy(), r.OutputW, r.OutputH)
+		mode = finalModeFit
+		fitW, fitH, padX, padY = fitBoxToOutput(rectFor(0).Dx(), rectFor(0).Dy(), r.OutputW, r.OutputH)
 	}
 	tmp := filepath.Join(task.scratch, "final.mp4")
 	err := runSourceRender(ctx, sourceRenderOpts{
 		tb: tb, ffmpegPath: req.FFmpegPath, sourceFile: a.meta.Input,
 		srcW: r.SourceW, srcH: r.SourceH, srcFrames: len(p.records),
-		sched: sched, rectFor: rectFor, chain: chain,
+		sched: sched, rectFor: rectFor, mode: mode, sink: sinkMJPEG,
+		fitW: fitW, fitH: fitH, padX: padX, padY: padY,
 		outW: r.OutputW, outH: r.OutputH, fps: planFPS(p),
 		phase: PhaseRenderFrames, totalOut: sched.Frames,
 		tmpOut: tmp, copyAudio: true,

@@ -3,9 +3,12 @@ package holocropper
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/jpeg"
+	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -13,6 +16,38 @@ import (
 // Stills and contact sheets (story B3). Layout, sampling, colours and the
 // caption font are pure and pinned here; compositing runs against the real
 // fixture analysis video when ffmpeg is available.
+
+// rawFrameSeeked decodes one rgb24 frame out of src with the STILL decode's
+// input seek (-ss before -i, -frames:v 1), exactly the byte stream
+// runSourceRender reads on the seek path.
+func rawFrameSeeked(ffmpeg, src string, ss float64, w, h int) ([]byte, error) {
+	cmd := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error",
+		"-ss", strconv.FormatFloat(ss, 'f', 6, 64),
+		"-i", src, "-map", "0:v:0", "-fps_mode", "passthrough",
+		"-f", "rawvideo", "-pix_fmt", "rgb24", "-frames:v", "1", "pipe:1")
+	return readRawFrame(cmd, w, h)
+}
+
+// rawFrameSelected decodes frame idx of src with a decode-from-start and the
+// select filter - the frame-exact reference the contact-sheet machinery uses.
+func rawFrameSelected(ffmpeg, src string, idx, w, h int) ([]byte, error) {
+	cmd := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error",
+		"-i", src, "-map", "0:v:0", "-fps_mode", "passthrough",
+		"-vf", fmt.Sprintf("select='eq(n\\,%d)'", idx),
+		"-f", "rawvideo", "-pix_fmt", "rgb24", "-frames:v", "1", "pipe:1")
+	return readRawFrame(cmd, w, h)
+}
+
+func readRawFrame(cmd *exec.Cmd, w, h int) ([]byte, error) {
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	if len(out) != w*h*3 {
+		return nil, fmt.Errorf("rawvideo frame is %d bytes, want %d", len(out), w*h*3)
+	}
+	return out, nil
+}
 
 // ---------------------------------------------------------------------------
 // Layout and sampling (pure)
@@ -247,6 +282,10 @@ func decodeSheet(t *testing.T, jpegBytes []byte) image.Image {
 // ---------------------------------------------------------------------------
 // Snapshot against the real fixture (ffmpeg-gated)
 
+// The snapshot IS the shared render pipeline for one frame (MJPEG sink at
+// mjpegQ, full output resolution). It carries no baked annotation boxes -
+// the UI draws its own overlays - so the fixture test pins the delivery
+// shape and the subject content, not box strokes.
 func TestSnapshotFixture(t *testing.T) {
 	ffmpeg := requireFFmpeg(t)
 	_, p := setupRenderFixture(t, ffmpeg, 240, 240)
@@ -268,28 +307,18 @@ func TestSnapshotFixture(t *testing.T) {
 		t.Fatalf("encoded JPEG is %v, want 240x240", b)
 	}
 
-	all := img.Bounds()
-	aw := countClassified(img, all, func(c color.Color) bool { w, _, _, _ := classify(c); return w })
-	am := countClassified(img, all, func(c color.Color) bool { _, a, _, _ := classify(c); return a })
-	cy := countClassified(img, all, func(c color.Color) bool { _, _, e, _ := classify(c); return e })
-	mg := countClassified(img, all, func(c color.Color) bool { _, _, _, m := classify(c); return m })
-	if aw < 1000 {
-		t.Errorf("white subject pixels = %d, want > 1000 (the crop must contain the white box scaled to output size)", aw)
-	}
-	if am < 20 {
-		t.Errorf("amber subject-box stroke pixels = %d, want > 20", am)
-	}
-	if cy < 10 {
-		t.Errorf("cyan EMA-box pixels = %d, want > 10", cy)
-	}
-	if mg < 100 {
-		t.Errorf("magenta crop-frame border pixels = %d, want > 100", mg)
+	white := countClassified(img, img.Bounds(), func(c color.Color) bool { w, _, _, _ := classify(c); return w })
+	if white < 1000 {
+		t.Errorf("white subject pixels = %d, want > 1000 (the crop must contain the white box scaled to output size)", white)
 	}
 }
 
 // The live frame strip (Horidashimi item 743) polls Snapshot while a pass is
-// running, so the time-seeked fetch must return the exact frame the
-// select-filter pass returns - boundaries included.
+// running. Snapshot seeks the SOURCE; the package's frame-seeking law
+// (seekAnalysisFrame, the half-early -ss) must land on the exact frame the
+// select-filter pass over the ANALYSIS video returns - boundaries included.
+// Shared law, so the analysis-video parity stands in for the source decode
+// here; TestStillsSourceSeekFrameExact pins the source side directly.
 func TestSnapshotSeekDecodeMatchesSelect(t *testing.T) {
 	ffmpeg := requireFFmpeg(t)
 	_, p := setupRenderFixture(t, ffmpeg, 240, 240)
@@ -298,7 +327,7 @@ func TestSnapshotSeekDecodeMatchesSelect(t *testing.T) {
 	}
 	n := len(p.records)
 	for _, idx := range []int{0, 1, 2, n / 3, n / 2, n - 2, n - 1} {
-		seek, err := p.decodeAnalysisFrameSeek(idx)
+		seek, err := seekAnalysisFrame(p.videoPath, idx, p.resolved.AnalysisW, p.resolved.AnalysisH, p.analysisFPS)
 		if err != nil {
 			t.Fatalf("seek decode index %d: %v", idx, err)
 		}
@@ -308,6 +337,37 @@ func TestSnapshotSeekDecodeMatchesSelect(t *testing.T) {
 		}
 		if !bytes.Equal(seek.Pix, sel[0].Pix) {
 			t.Errorf("index %d: seek decode is not the same frame as the select decode", idx)
+		}
+	}
+}
+
+// The -ss the still decode relies on must be frame-exact on the SOURCE file
+// itself: the raw rgb24 bytes of the seeked decode must equal frame idx of a
+// decode-from-start (the select-filter reference the contact sheet uses).
+func TestStillsSourceSeekFrameExact(t *testing.T) {
+	ffmpeg := requireFFmpeg(t)
+	_, p := setupRenderFixture(t, ffmpeg, 240, 240)
+	src, err := p.sourceInputPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sw, sh := p.resolved.SourceW, p.resolved.SourceH
+	fps := p.analysisFPS
+	if fps <= 0 {
+		t.Fatalf("fixture plan carries no analysis fps")
+	}
+	n := len(p.records)
+	for _, idx := range []int{0, 1, n / 2, n - 2, n - 1} {
+		seek, err := rawFrameSeeked(ffmpeg, src, stillSeekSeconds(idx, fps), sw, sh)
+		if err != nil {
+			t.Fatalf("seeked source decode index %d: %v", idx, err)
+		}
+		ref, err := rawFrameSelected(ffmpeg, src, idx, sw, sh)
+		if err != nil {
+			t.Fatalf("select source decode index %d: %v", idx, err)
+		}
+		if !bytes.Equal(seek, ref) {
+			t.Errorf("index %d: the -ss decode is not the same source frame as the decode-from-start", idx)
 		}
 	}
 }

@@ -1,34 +1,36 @@
 package holocropper
 
-/* Linear-light render passes (SHARPER_PLAN.md §4): the production renders
-(RenderFinal, RenderMikV) no longer resize Go images cut from the 480p
-analysis cache. The pass instead
+/* The shared render pipeline: production renders (RenderFinal, RenderMikV),
+output-resolution PREVIEWS and single-frame STILLS all run through the ONE
+encoder-process starter (runSourceRender) and the ONE filter-chain builder
+(finalFilterChain) in this file. The pass
 
-  1. decodes the FULL-RES source through ffmpeg to rgb24 frames,
+  1. decodes the source through ffmpeg to rgb24 frames,
   2. composes the Plan's crop rectangle at SOURCE pixels in Go (no resize -
      out-of-frame regions compose black, the cropToBBoxCalc law §12.8), and
   3. hands each crop as one self-describing PPM frame to a single ffmpeg
-     encoder running the linear-light resize law:
+     encoder running the chosen resize law ("H", judged by eye against the
+     linear-light variants):
 
-       setparams (stamp the PPM feed)
-       -> zscale to BT.709 linear light (tin/pin bt709, npl 100, gbrpf32le)
-       -> zscale lanczos to the framed output size (+ pad to output for fit)
-       -> zscale gamma back to BT.709
-       -> cas 0.4 LAST at final size.
+       hqdn3d=2:1.5:0:0            denoise FIRST, on the full-res crop
+       scale=iw*2/3:ih*2/3:lanczos  first downscale stage
+       scale=<target>:lanczos       second stage to the framed size
+       (+ pad to output for fit mode)
+       format=<sink format>         yuvj420p (MJPEG) / rgb24 (raw) /
+                                    yuv420p bt709 limited (VP9 preview)
 
-The setparams stamp and the gamma-back's m=bt709 are the verified feed form
-(SHARPER_PLAN §3): zimg refuses an UNTAGGED continuous RGB feed (code 3074,
-no path between colorspaces) and has no trichromatic linear->BT.1886 path;
-neither changes the resize law itself. Verified end-to-end on ffmpeg 9.0.2
-and on the CI-pinned 6.1.1 build.
+Everything happens in gamma-encoded 8-bit RGB. No linear light, no CAS, no
+unsharp, no extra sharpening of any kind; no colour-management parameter
+filters, no special scalers, no sws-flag or colour-tag overrides anywhere
+on the encoder feed.
 
 Variable-size crops are what makes the PPM image pipe necessary: rawvideo
 requires one constant frame size for the whole stream, while the Plan's crop
 rect walks frame to frame. The encoder resamples every input frame to the
 exact framed size regardless.
 
-Previews, overlay videos and stills keep the analysis-cache pipeline
-(plannedFrames/runCropLoop); only the production passes use this file. */
+Overlay previews keep the analysis-cache pipeline (plannedFrames/runOverlayLoop)
+unchanged: their frames are box-drawn Go images, not a chain pass. */
 
 import (
 	"bufio"
@@ -43,41 +45,72 @@ import (
 	"strings"
 )
 
-// The linear-light law, as two ends around the resize. Stage 0 stamps the
-// untagged PPM feed with its BT.709 identity (setparams changes tags only,
-// never pixels), converts to linear light, and materializes gbrpf32le; the
-// back end returns the resized linear frames to BT.709 transfer/matrix and
-// sharpens with CAS at the final size. cas is LAST, after the pad, so bars
-// are never sharpened.
+// The resize law ("H"), stated exactly. finalDenoise is the spatial-only
+// hqdn3d (temporal strengths 0) applied FIRST on the full-res cropped frame:
+// the source videos carry hatching/compression texture that full-res Lanczos
+// turns into visible static, and denoising before the resize removes it. The
+// 2/3 first stage and the strengths below are final - do not tune them.
 const (
-	linearStage0 = "setparams=color_primaries=bt709:color_trc=bt709:range=pc," +
-		"zscale=tin=bt709:pin=bt709:t=linear:npl=100,format=gbrpf32le"
-	linearBack = "zscale=tin=linear:pin=bt709:t=bt709:m=bt709,cas=0.4"
+	finalDenoise = "hqdn3d=2:1.5:0:0"
+	mjpegQ       = 6 // -q:v for every MJPEG sink (unchanged value)
 )
 
-// linearFillChain is the content-aware law: the crop arrives aspect-locked by
-// aspectLockedTargetCalc, so lanczos maps it straight onto the output
-// (exactly what fillResizeTo does today, in linear light from full-res detail).
-func linearFillChain(outW, outH int) string {
-	return linearStage0 + fmt.Sprintf(",zscale=w=%d:h=%d:f=lanczos,", outW, outH) + linearBack
+// The mode/sink vocabulary of finalFilterChain.
+const (
+	finalModeCrop = "crop"
+	finalModeFit  = "fit"
+
+	sinkMJPEG = "mjpeg" // -c:v mjpeg -q:v mjpegQ -pix_fmt yuvj420p (full range)
+	sinkRGB   = "rgb"   // rawvideo rgb24 pipe (MikV frame feed)
+	sinkVP9   = "vp9"   // -c:v libvpx-vp9 -pix_fmt yuv420p, BT.709 LIMITED range
+)
+
+// finalFilterChain is the ONE filter-chain builder for every ffmpeg render
+// pass (final, MikV, preview, still). mode is crop or fit; sink picks the
+// final format stage. Fit mode scales the content crop aspect-preserving to
+// the fit box (the 825 amendment's own rounding) and pads to the output on
+// black AFTER the scale and BEFORE the format stage; the pad is omitted when
+// the fit box already is the output.
+func finalFilterChain(mode, sink string, outW, outH, fitW, fitH, padX, padY int) string {
+	secondScale := fmt.Sprintf("scale=%d:%d:flags=lanczos", outW, outH)
+	pad := ""
+	if mode == finalModeFit {
+		secondScale = fmt.Sprintf("scale=%d:%d:flags=lanczos", fitW, fitH)
+		if fitW != outW || fitH != outH {
+			pad = fmt.Sprintf(",pad=%d:%d:%d:%d:black", outW, outH, padX, padY)
+		}
+	}
+	format := "format=yuvj420p"
+	switch sink {
+	case sinkRGB:
+		format = "format=rgb24"
+	case sinkVP9:
+		// The browser-safe preview sink: the RGB->YUV conversion happens
+		// here, on the FINAL size, with the BT.709 matrix and LIMITED range
+		// (full-range VP9 is what hardware decoders refuse - PreviewLaw 2).
+		// The MJPEG final converts full range instead, which is what JFIF
+		// decoders assume for yuvj420p.
+		secondScale += ":out_color_matrix=bt709:out_range=tv"
+		format = "format=yuv420p"
+	}
+	return finalDenoise + ",scale=iw*2/3:ih*2/3:flags=lanczos," + secondScale + pad + "," + format
 }
 
-// linearFitChain is the fit-with-bars law (§6.10 + the 825 amendment): the
-// content crop is scaled aspect-preserving to the fit box computed with
-// fitResizeTo's own rounding, padded to the output on black in linear light,
-// then gamma-returned and sharpened.
-func linearFitChain(contentW, contentH, outW, outH int) string {
+// fitBoxToOutput is the fit-with-bars box: the content crop scaled
+// aspect-preserving into the output with the same rounding the Go fit law
+// uses (math.Round, clamped to at least 1). Callers bake it into
+// finalFilterChain's fitW/fitH/padX/padY.
+func fitBoxToOutput(contentW, contentH, outW, outH int) (fitW, fitH, padX, padY int) {
 	scale := math.Min(float64(outW)/float64(contentW), float64(outH)/float64(contentH))
-	sw := int(math.Round(float64(contentW) * scale))
-	sh := int(math.Round(float64(contentH) * scale))
-	if sw < 1 {
-		sw = 1
+	fitW = int(math.Round(float64(contentW) * scale))
+	fitH = int(math.Round(float64(contentH) * scale))
+	if fitW < 1 {
+		fitW = 1
 	}
-	if sh < 1 {
-		sh = 1
+	if fitH < 1 {
+		fitH = 1
 	}
-	return linearStage0 + fmt.Sprintf(",zscale=w=%d:h=%d:f=lanczos,pad=w=%d:h=%d:x=%d:y=%d:color=black,",
-		sw, sh, outW, outH, (outW-sw)/2, (outH-sh)/2) + linearBack
+	return fitW, fitH, (outW - fitW) / 2, (outH - fitH) / 2
 }
 
 // scaleRectToSource maps a Plan crop rect (analysis pixels; may spill past the
@@ -163,19 +196,34 @@ func rgbaFromRGB24(rgb []byte, w, h int) *image.RGBA {
 	return out
 }
 
-// sourceRenderOpts drives one decode -> crop -> linear-light encode pass.
-// Exactly one sink is active:
+// sourceRenderOpts drives one decode -> crop -> encode pass. Exactly one sink
+// is active:
 //
 //   - tmpOut != "": Sink A, the mjpeg production file (RenderFinal). The
 //     source file is re-opened as ffmpeg input 1 so its audio rides along
 //     with -c:a copy, exactly as the old muxFrameSequence mux did.
+//   - tmpOutWebM != "": Sink C, the vp9-webm preview file. The audio source
+//     (audioSource, usually the analyzed input) rides along as Opus, exactly
+//     as the old VP9 preview mux did.
+//   - tmpOutJPEG != "": Sink A', a single-frame JPEG file (Snapshot). Same
+//     mjpeg encoder at mjpegQ as Sink A - the MJPEG sink's compressed
+//     bitstream without the MP4 wrapper, so a still is the final frame's
+//     codec path byte-for-byte. Expects a one-frame pass.
 //   - onRawFrame != nil: Sink B, the MikV frame feed. The encoder writes
 //     rawvideo rgb24 frames at exactly outW x outH to stdout; the callback
 //     receives them in output order and turns them into payloads.
 //
-// rectFor(srcIdx) is the SOURCE-pixel crop for one source frame; srcFrames
-// is the plan's record count, which the passthrough analysis guarantees
-// equals the source frame count.
+// mode and sink steer the ONE chain builder (finalFilterChain). rectFor(srcIdx)
+// is the SOURCE-pixel crop for one source frame; srcFrames is the plan's record
+// count, which the passthrough analysis guarantees equals the source frame
+// count. startFrame/frameCount optionally narrow the pass to a window of
+// OUTPUT slots (0/0 = the whole schedule): frames before the window are still
+// decoded - the decode count is what proves the cache matches the plan - but
+// only the window's crops are fed, and the decoder is stopped early when the
+// window has been fed. seekSeconds > 0 replaces the decode-from-start pump
+// with an ffmpeg INPUT seek (-ss before -i): the first decoded frame is the
+// one the schedule plays at startFrame - the half-early seek law makes the
+// landing frame-exact - and rectFor/slot matching is indexed from it.
 type sourceRenderOpts struct {
 	tb         *taskBase
 	ffmpegPath string
@@ -185,17 +233,30 @@ type sourceRenderOpts struct {
 
 	sched   frameSchedule
 	rectFor func(srcIdx int) image.Rectangle
-	chain   string
+	mode    string
+	sink    string
+	fitW    int
+	fitH    int
+	padX    int
+	padY    int
 	outW    int
 	outH    int
 	fps     float64
 
+	startFrame  int
+	frameCount  int // 0 = the whole schedule
+	frameLimit  int // >0: encoder-side -frames:v cap (single-frame stills)
+	seekSeconds float64 // >0: input-seek the decode (-ss before -i)
+
 	phase    Phase
 	totalOut int // scheduled output frames the pass must produce
 
-	tmpOut     string
-	copyAudio  bool
-	onRawFrame func(outIdx int, rgb []byte) error
+	tmpOut      string
+	tmpOutWebM  string
+	tmpOutJPEG  string
+	audioSource string
+	copyAudio   bool
+	onRawFrame  func(outIdx int, rgb []byte) error
 }
 
 // runSourceRender executes one full pipeline pass. Cancel/supersede semantics
@@ -205,10 +266,11 @@ type sourceRenderOpts struct {
 // and kills both subprocesses. Progress comes from the encoder's own `frame=`
 // stats, so one phase covers feed, resize and mux.
 func runSourceRender(ctx context.Context, o sourceRenderOpts) error {
-	if o.tmpOut == "" && o.onRawFrame == nil {
+	if o.tmpOut == "" && o.tmpOutWebM == "" && o.tmpOutJPEG == "" && o.onRawFrame == nil {
 		return errors.New("holocropper: runSourceRender needs a sink")
 	}
 	ffmpegPath := resolveFFmpegPath(o.ffmpegPath)
+	chain := finalFilterChain(o.mode, o.sink, o.outW, o.outH, o.fitW, o.fitH, o.padX, o.padY)
 
 	// decCtx outlives nothing useful once the pump has fed its last scheduled
 	// frame: a render clock slower than the source's clock needs only the
@@ -219,11 +281,18 @@ func runSourceRender(ctx context.Context, o sourceRenderOpts) error {
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel() // internal aborts + a safety net on every return path
 
-	dec := exec.CommandContext(decCtx, ffmpegPath,
-		"-hide_banner", "-loglevel", "error",
+	decArgs := []string{"-hide_banner", "-loglevel", "error"}
+	if o.seekSeconds > 0 {
+		// Input seek (stills): -ss before -i seeks by keyframe and decodes
+		// forward, landing on the target under the frame-clock law the stills
+		// seek half-early rule guarantees.
+		decArgs = append(decArgs, "-ss", strconv.FormatFloat(o.seekSeconds, 'f', 6, 64))
+	}
+	decArgs = append(decArgs,
 		"-i", o.sourceFile, "-map", "0:v:0",
 		"-fps_mode", "passthrough",
 		"-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1")
+	dec := exec.CommandContext(decCtx, ffmpegPath, decArgs...)
 	decOut, err := dec.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("holocropper: decoder stdout pipe: %w", err)
@@ -241,19 +310,52 @@ func runSourceRender(ctx context.Context, o sourceRenderOpts) error {
 	if o.tmpOut != "" {
 		// Sink A re-reads the source file as input 1 for the audio copy.
 		encArgs = append(encArgs, "-i", o.sourceFile)
+	} else if o.audioSource != "" {
+		// Sink C brings its audio source in as input 1, like the old mux.
+		encArgs = append(encArgs, "-i", o.audioSource)
 	}
-	encArgs = append(encArgs, "-vf", o.chain)
-	if o.tmpOut != "" {
+	encArgs = append(encArgs, "-vf", chain)
+	switch {
+	case o.tmpOut != "":
 		encArgs = append(encArgs, "-map", "0:v:0")
 		if o.copyAudio {
 			encArgs = append(encArgs, "-map", "1:a:0", "-c:a", "copy")
 		}
+		if o.frameLimit > 0 {
+			encArgs = append(encArgs, "-frames:v", strconv.Itoa(o.frameLimit))
+		}
 		// yuvj420p pins today's product pixel format: the chain hands the
-		// encoder bt709-tagged full-range frames and swscale converts with
-		// the right matrix - same container/codec/format pairing the UMP PC
-		// player already accepts.
-		encArgs = append(encArgs, "-c:v", "mjpeg", "-q:v", "6", "-pix_fmt", "yuvj420p", o.tmpOut, "-y")
-	} else {
+		// encoder full-range frames and swscale converts with the right
+		// matrix - same container/codec/format pairing the UMP PC player
+		// already accepts.
+		encArgs = append(encArgs, "-c:v", "mjpeg", "-q:v", strconv.Itoa(mjpegQ), "-pix_fmt", "yuvj420p", o.tmpOut, "-y")
+	case o.tmpOutJPEG != "":
+		// Sink A': the same mjpeg encode as Sink A, written as a bare JPEG
+		// file (the image2 muxer picks .jpg from the extension). This is the
+		// Snapshot delivery: the compressed frame is the bitstream a final
+		// frame carries, minus the MP4 wrapper.
+		encArgs = append(encArgs, "-map", "0:v:0")
+		if o.frameLimit > 0 {
+			encArgs = append(encArgs, "-frames:v", strconv.Itoa(o.frameLimit))
+		}
+		encArgs = append(encArgs, "-c:v", "mjpeg", "-q:v", strconv.Itoa(mjpegQ), "-pix_fmt", "yuvj420p", o.tmpOutJPEG, "-y")
+	case o.tmpOutWebM != "":
+		// Sink C: the exact vp9-webm encode law the preview mux used, plus
+		// the explicit BT.709 tags (the old mux inherited them implicitly;
+		// stating them makes the browser-side decode law unambiguous). The
+		// limited-range conversion now lives in the shared chain.
+		encArgs = append(encArgs, "-map", "0:v:0",
+			"-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p",
+			"-crf", strconv.Itoa(previewVP9CRF), "-b:v", "0",
+			"-deadline", "good", "-cpu-used", strconv.Itoa(previewVP9CPUUsed),
+			"-g", strconv.Itoa(previewGOPFrames(o.fps)),
+			"-color_range", previewColorRange,
+			"-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709")
+		if o.audioSource != "" {
+			encArgs = append(encArgs, "-map", "1:a:0", "-c:a", "libopus", "-b:a", "128k")
+		}
+		encArgs = append(encArgs, o.tmpOutWebM, "-y")
+	default:
 		encArgs = append(encArgs, "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1")
 	}
 	enc := exec.CommandContext(runCtx, ffmpegPath, encArgs...)
@@ -371,14 +473,33 @@ func runSourceRender(ctx context.Context, o sourceRenderOpts) error {
 	// The pump: decode one source frame at a time, feed the crops every
 	// output slot replays that frame. Frames the schedule never plays are
 	// still decoded - the count is what proves the cache matches the source.
-	// usedFrames is the last source index the schedule plays + 1: a slower
-	// render clock stops the decoder early instead of draining the rest.
+	// usedFrames is the last source index the pass plays + 1: a slower render
+	// clock (or a narrowed window) stops the decoder early instead of
+	// draining the rest. Frames before the window start are decoded and
+	// DISCARDED: correct and simple, no input seek on the range path.
+	window := o.sched.Frames
+	if o.frameCount > 0 && o.frameCount < window {
+		window = o.frameCount
+	}
+	// base is the source index of the first DECODED frame: 0 when the decode
+	// starts at the file's first frame; on the seek path it is the frame the
+	// half-early seek law lands on, and every decoded frame is indexed from
+	// it. usedFrames is how many frames the pump reads.
+	base, last := 0, o.startFrame+window-1
 	usedFrames := o.srcFrames
-	if o.sched.Frames > 0 {
-		usedFrames = o.sched.SrcFor[o.sched.Frames-1] + 1
+	if o.sched.Frames > 0 && last >= 0 && last < o.sched.Frames {
+		if o.seekSeconds > 0 {
+			base = o.sched.SrcFor[o.startFrame]
+			usedFrames = o.sched.SrcFor[last] - base + 1
+		} else if u := o.sched.SrcFor[last] + 1; u < usedFrames {
+			usedFrames = u
+		}
 	}
 	frame := make([]byte, o.srcW*o.srcH*3)
-	decoded, out := 0, 0
+	decoded, out, fed := 0, 0, 0
+	if o.seekSeconds > 0 {
+		out = o.startFrame // the seek path never decodes frames before the window
+	}
 	var pumpErr error
 	for decoded < usedFrames && pumpErr == nil {
 		if _, err := io.ReadFull(decOut, frame); err != nil {
@@ -394,23 +515,27 @@ func runSourceRender(ctx context.Context, o sourceRenderOpts) error {
 			pumpErr = err
 			break
 		}
-		crop := o.rectFor(decoded - 1)
-		for out < o.sched.Frames && o.sched.SrcFor[out] == decoded-1 {
-			if err := writePPMCrop(encIn, frame, o.srcW, o.srcH, crop); err != nil {
-				pumpErr = err // a broken pipe here means the encoder already died
-				break
+		crop := o.rectFor(base + decoded - 1)
+		for out < o.sched.Frames && o.sched.SrcFor[out] == base+decoded-1 {
+			if out >= o.startFrame && fed < window {
+				if err := writePPMCrop(encIn, frame, o.srcW, o.srcH, crop); err != nil {
+					pumpErr = err // a broken pipe here means the encoder already died
+					break
+				}
+				fed++
 			}
 			out++
 		}
 	}
 
 	// EOF on stdin lets a healthy encoder finish. The decoder: a slower
-	// render clock stops it deliberately once its last played frame is fed
-	// (ffmpeg is then killed mid-decode - an intentional kill whose exit
-	// code must not surface as a pass failure); otherwise it is drained to
-	// its natural EOF so a clean exit 0 is reported.
+	// render clock (or a narrowed window) stops it deliberately once its
+	// last played frame is fed (ffmpeg is then killed mid-decode - an
+	// intentional kill whose exit code must not surface as a pass failure);
+	// otherwise it is drained to its natural EOF so a clean exit 0 is
+	// reported.
 	encIn.Close()
-	earlyDecKill := pumpErr == nil && rawErr == nil && usedFrames < o.srcFrames
+	earlyDecKill := pumpErr == nil && rawErr == nil && decoded < o.srcFrames
 	if earlyDecKill {
 		decCancel()
 	}
@@ -460,13 +585,13 @@ func runSourceRender(ctx context.Context, o sourceRenderOpts) error {
 		}
 		return &FFmpegError{Phase: o.phase, Command: dec.String(), ExitCode: code, StderrTail: strings.Join(decTail, " ")}
 	}
-	if out != o.sched.Frames {
+	if out != window {
 		return fmt.Errorf("holocropper: the frame schedule wanted %d output frames, the pass wrote %d",
-			o.sched.Frames, out)
+			window, out)
 	}
-	if o.onRawFrame != nil && rawFrames != o.sched.Frames {
+	if o.onRawFrame != nil && rawFrames != window {
 		return fmt.Errorf("holocropper: the frame pipe delivered %d output frames, the schedule wanted %d",
-			rawFrames, o.sched.Frames)
+			rawFrames, window)
 	}
 	return nil
 }
