@@ -367,23 +367,43 @@ func renderMikVWork(ctx context.Context, a *Analysis, task *MikVTask, p *Plan, r
 		return nil, err
 	}
 
-	// 2. The planned frames, straight into the container.
+	// 2. The planned frames, straight into the container. The linear-light
+	// production law (SHARPER_PLAN §4) runs on the full-res source through
+	// the same pipeline as RenderFinal, Sink B: the encoder emits rawvideo
+	// rgb24 frames at exactly the output size and each one goes into the
+	// payload code unchanged (rgb565LE / jpeg.Encode at the setting quality).
 	jpegQuality := req.Options.JPEGQuality
 	if jpegQuality == 0 {
 		jpegQuality = mikvformat.DefaultJPEGQuality
 	}
-	frames, err := plannedFrames(ctx, tb, a, p, sched, PhaseMikVFrames, func(outIdx, srcIdx int, _, out *image.RGBA) error {
-		var payload []byte
-		if req.Options.VideoJPEG {
-			var buf jpegBuffer
-			if err := jpeg.Encode(&buf, out, &jpeg.Options{Quality: jpegQuality}); err != nil {
-				return fmt.Errorf("holocropper: mikv jpeg frame %d: %w", outIdx+1, err)
+	rectFor := func(srcIdx int) image.Rectangle {
+		return scaleRectToSource(p.cropRectAt(srcIdx), r.AnalysisW, r.AnalysisH, r.SourceW, r.SourceH)
+	}
+	chain := linearFillChain(r.OutputW, r.OutputH)
+	if p.settings.FitWithBars {
+		c := rectFor(0) // the fit content rect resolves once per stream
+		chain = linearFitChain(c.Dx(), c.Dy(), r.OutputW, r.OutputH)
+	}
+	err = runSourceRender(ctx, sourceRenderOpts{
+		tb: tb, ffmpegPath: req.FFmpegPath, sourceFile: a.meta.Input,
+		srcW: r.SourceW, srcH: r.SourceH, srcFrames: len(p.records),
+		sched: sched, rectFor: rectFor, chain: chain,
+		outW: r.OutputW, outH: r.OutputH, fps: planFPS(p),
+		phase: PhaseMikVFrames, totalOut: sched.Frames,
+		onRawFrame: func(outIdx int, rgb []byte) error {
+			out := rgbaFromRGB24(rgb, r.OutputW, r.OutputH)
+			var payload []byte
+			if req.Options.VideoJPEG {
+				var buf jpegBuffer
+				if err := jpeg.Encode(&buf, out, &jpeg.Options{Quality: jpegQuality}); err != nil {
+					return fmt.Errorf("holocropper: mikv jpeg frame %d: %w", outIdx+1, err)
+				}
+				payload = buf.data
+			} else {
+				payload = rgb565LE(out)
 			}
-			payload = buf.data
-		} else {
-			payload = rgb565LE(out)
-		}
-		return mikv.AddFrame(payload, chunks[outIdx])
+			return mikv.AddFrame(payload, chunks[outIdx])
+		},
 	})
 	if err != nil {
 		return nil, err
@@ -391,6 +411,7 @@ func renderMikVWork(ctx context.Context, a *Analysis, task *MikVTask, p *Plan, r
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	frames := sched.Frames
 
 	// 3. Write the container to scratch and publish it in one move.
 	tb.setPhase(PhaseMikVWrite, 1)

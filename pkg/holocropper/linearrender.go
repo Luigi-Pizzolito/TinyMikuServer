@@ -148,6 +148,21 @@ func maxInt(a, b int) int {
 	return b
 }
 
+// rgbaFromRGB24 wraps one Sink B output frame (exactly w*3*h bytes of rgb24
+// from the frame pipe) as the *image.RGBA the MikV payload code has always
+// been fed. The payload conversion itself (rgb565LE / jpeg.Encode) is
+// unchanged.
+func rgbaFromRGB24(rgb []byte, w, h int) *image.RGBA {
+	out := image.NewRGBA(image.Rect(0, 0, w, h))
+	for i := 0; i < w*h; i++ {
+		out.Pix[i*4+0] = rgb[i*3+0]
+		out.Pix[i*4+1] = rgb[i*3+1]
+		out.Pix[i*4+2] = rgb[i*3+2]
+		out.Pix[i*4+3] = 255
+	}
+	return out
+}
+
 // sourceRenderOpts drives one decode -> crop -> linear-light encode pass.
 // Exactly one sink is active:
 //

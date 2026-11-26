@@ -282,8 +282,12 @@ only in the analysis scale filter.
       sweetdevil crop 5555 frames psnr 27.2 dB / mad 2.08 (144.7 s incl.
       analysis) - inside the §8 guard with room; audio copied untouched
       (aac, opus); container stays mjpeg/yuvj420p. Suite green.
-- [ ] Step 4 — `RenderMikV` frames pass onto Sink B; payload + audio code
-      untouched. Suite green (mikv_test phase expectations hold).
+- [x] Step 4 — `RenderMikV` frames pass runs the same pipeline, Sink B: raw
+      rgb24 frames at exactly the output size → `rgbaFromRGB24` → the
+      unchanged payload code (`rgb565LE` / `jpeg.Encode` / `mikv.AddFrame` /
+      `mikv.Save`) and unchanged audio track. PhaseMikVFrames progress now
+      comes from the encoder stats. MikV tests green incl. cancel-mid-frames
+      and supersede; full suite green.
 - [ ] Step 5 — remove the final render's now-dead helpers usage (keep
       previews/stills intact); grep check: `bitexact` only in analysis scale;
       no VP9/WebM added anywhere.
