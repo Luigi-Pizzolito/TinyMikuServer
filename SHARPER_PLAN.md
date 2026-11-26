@@ -36,8 +36,10 @@ the task was authored against this state — `00905c3` was a stale base).
 > - The analysis pass must stay bit-exact (it drives the CI golden tests);
 >   final-output tests use TOLERANCES (psnr >= 40 dB or mean abs diff <= 1.0),
 >   never exact hashes. "bitexact" must remain ONLY in the analysis scale filter.
-> - E2E gated behind `//go:build e2e` (`go test -tags e2e -run E2E -timeout 30m
->   ./pkg/holocropper`), NOT in default `go test ./...`, NOT in the GitHub Actions
+> - E2E gated behind `//go:build e2e` (`cd pkg/holocropper && go test -tags e2e
+>   -run E2E -timeout 30m .` - the package is its own nested module, so it is
+>   NOT reachable as `./pkg/holocropper` from the repo root), NOT in default
+>   `go test ./...`, NOT in the GitHub Actions
 >   workflow. `t.Skip` with a clear message if a fixture is missing or ffmpeg
 >   lacks zscale/cas.
 > - Do not touch the Horidashimi repo. Do not alter existing MikV payload code
@@ -216,7 +218,10 @@ only in the analysis scale filter.
   trip); 7c sweetdevil crop (moving rects — consecutive frames must differ;
   side-by-side vs baseline); 7d analysis framemd5 determinism (self-validating);
   7e stills at 5%..90% of the timeline vs baseline stills; 7f timing logs only.
-  Run manually: `go test -tags e2e -run E2E -timeout 30m ./pkg/holocropper`.
+  Run manually from the package directory: `cd pkg/holocropper && go test -tags
+  e2e -run E2E -timeout 30m .` (`pkg/holocropper/go.mod` makes it a nested
+  module: `go test ./pkg/holocropper` from the repo root errors "main module
+  does not contain package").
   NOT part of `go test ./...`; NOT added to `.github/workflows/ci.yml`.
 
 ## 6. Milestones & checklist
@@ -351,6 +356,13 @@ only in the analysis scale filter.
       golden parity replay) deliberately keep their own full passes. Host
       default suite: 50.4 s → 33.6 s wall; container `-race` benchmark of the
       exact CI invocation: 352.8 s → 221.9 s (exit 0, well inside 600 s).
+- [x] Step 7.5c — consumer update (owner request): Horidashimi bumped from
+      `pkg/holocropper v0.2.2` to `v0.2.3` (go get + go mod tidy; the plan's
+      "do not touch Horidashimi" line scoped the refactor itself, not the
+      consumer's dependency update). No Horidashimi code changes were needed
+      - the API surface it uses (Analyze modes, NewPlan/NewFitPlan, render
+      tasks) is untouched. Build + vet clean; `internal/library/video` (89.4
+      s) and `internal/api` (1.2 s) green against the new module.
 
 ## 7. Risks & notes
 
