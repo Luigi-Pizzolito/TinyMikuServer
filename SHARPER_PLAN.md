@@ -259,9 +259,12 @@ only in the analysis scale filter.
         (`code 3074`) — the real pipeline never does that. Decoder-side color
         conversion (source -> rgb24) follows the source's own tags, exactly as
         vidio does for today's pipeline — no behavior change in what Go sees.
-- [ ] Step 1.5 — record 648x200 baselines into `vids-e2e-test/baseline/` with
-      the CURRENT code; add `vids-e2e-test/` to `.gitignore`. `go build ./... &&
-      go test ./...` green.
+- [x] Step 1.5 — 648x200 baselines recorded from the pre-change pipeline into
+      `vids-e2e-test/baseline/` (music 3280 frames 20.9 s, sweetdevil 5555
+      frames 124.7 s, both `yuvj420p`), plus 10 reference stills (5%..90%) per
+      fixture under `baseline/stills/`; analysis caches kept separate under
+      `baseline-analysis/`. `vids-e2e-test/` added to `.gitignore`; baseline
+      recorder verified idempotent. Suite green.
 - [ ] Step 2 — swap analysis prepare args to the exact task form (drop
       `-sws_flags`, drop `-x264-params cpu-independent=1`, add `-pix_fmt
       yuv420p -c:v libx264 -preset ultrafast -qp 0`). Re-record ffmpeg9 goldens
@@ -324,3 +327,7 @@ Options for the Step 7 gate:
 
 Default (absent other instructions): option 1, documented as a deviation from
 the task's tolerance line, measured numbers recorded in the test output.
+
+**RESOLVED 2026-11-26 (owner):** acceptance gate = corruption guard — every
+new-vs-baseline comparison asserts `psnr >= 20 dB AND mean abs luma <= 12`,
+alongside all structural checks. Full step sequence (1.5 -> 7) authorized.

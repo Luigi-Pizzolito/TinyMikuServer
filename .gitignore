@@ -32,6 +32,7 @@ assets/*
 
 # Test video folders
 vids/
+vids-e2e-test/
 vids-cropped/
 vids-cropped2/
 vids-cropped-new/
