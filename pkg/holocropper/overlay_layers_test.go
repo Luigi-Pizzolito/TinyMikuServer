@@ -324,16 +324,8 @@ func TestOverlayDrawingIsDeterministic(t *testing.T) {
 
 func TestMeasureDecodedFrameIsExactOnRealFrames(t *testing.T) {
 	ffmpeg := requireFFmpeg(t)
-	inputDir, tempDir := t.TempDir(), t.TempDir()
-	fixture := buildFixture(t, ffmpeg, inputDir)
-	task, err := Analyze(context.Background(), AnalyzeRequest{Input: fixture, TempDir: tempDir, FFmpegPath: ffmpeg})
-	if err != nil {
-		t.Fatal(err)
-	}
-	a, err := task.Wait()
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := sharedBoxFixture(t, ffmpeg)
+	a, _ := attachWarmAnalysis(t, ffmpeg, fixture, AnalyzeCrop)
 	stream := a.Stream()
 
 	measured := 0
@@ -378,16 +370,8 @@ func TestMeasureDecodedFrameIsExactOnRealFrames(t *testing.T) {
 
 func TestPreviewCarriesTheG4OverlayLayers(t *testing.T) {
 	ffmpeg := requireFFmpeg(t)
-	inputDir, tempDir := t.TempDir(), t.TempDir()
-	fixture := buildFixture(t, ffmpeg, inputDir)
-	task, err := Analyze(context.Background(), AnalyzeRequest{Input: fixture, TempDir: tempDir, FFmpegPath: ffmpeg})
-	if err != nil {
-		t.Fatal(err)
-	}
-	a, err := task.Wait()
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := sharedBoxFixture(t, ffmpeg)
+	a, _ := attachWarmAnalysis(t, ffmpeg, fixture, AnalyzeCrop)
 	plan, err := NewPlan(a.Stream(), Settings{Width: 240, Height: 240, FPS: fixtureFPS})
 	if err != nil {
 		t.Fatal(err)

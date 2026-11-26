@@ -327,6 +327,28 @@ only in the analysis scale filter.
       600 s budget that the old vidio-heavy suite repeatedly exceeded (the
       pre-existing CI flake: parent-branch timeouts with vidio cleanup
       goroutine pile-ups, NOT golden drift).
+- [x] Step 7.5a — CI policy (owner, Actions budget): the workflow now triggers
+      ONLY on release tags (`pkg/**/v*`, `v*`) plus `workflow_dispatch`
+      (ordinary pushes and PRs no longer start CI; the `regenerate_golden`
+      dispatch input is kept). Branch verification runs through a manual
+      dispatch; the authoritative run is the one the delivery tag starts.
+      No copyrighted video is involved: CI synthesizes every fixture from
+      lavfi, `vids/` and `vids-e2e-test/` are gitignored, and the e2e suite
+      stays out of CI.
+- [x] Step 7.5b — suite workload reduction (owner: "reduce the workload so it
+      runs faster", chosen over raising the timeout): `fixturecache_test.go`
+      builds each lavfi fixture variant ONCE per run (canonical box clip,
+      gray clip, 12 fps clip) and runs one warm `Analyze` per fixture+mode
+      (crop = full prepare+detect; fit = prepare-only), then hands each of
+      the ~20 consumer tests a PRIVATE copy of the finished cache dir that
+      the cache-aware `Analyze` attaches from immediately ("a valid cache hit
+      completes the Task immediately"). Identity is per-path and the copy is
+      a new path, so preview bookkeeping, render slots, scratch and
+      cancellation assertions stay per-test. Tests that OBSERVE the analysis
+      machinery live (cache round trip, supersede, cancel mid-detect, resume,
+      golden parity replay) deliberately keep their own full passes. Host
+      default suite: 50.4 s → 33.6 s wall; container `-race` benchmark of the
+      exact CI invocation: 352.8 s → 221.9 s (exit 0, well inside 600 s).
 
 ## 7. Risks & notes
 

@@ -27,20 +27,14 @@ render slot, cancel mid-render leaving nothing published, scratch isolation
 under TempDir, and the final render's output naming, audio track and frame
 determinism. */
 
-// setupRenderFixture runs the analysis pass once and returns the cached
-// Analysis plus a Plan at the requested output size.
+// setupRenderFixture hands the test the cached Analysis plus a Plan at the
+// requested output size. The warm harness analyzes the canonical clip once
+// per run and gives each test a private copy of the finished cache, so the
+// attach is immediate while previews/scratch/slot isolation is preserved.
 func setupRenderFixture(t *testing.T, ffmpegPath string, outW, outH int) (*Analysis, *Plan) {
 	t.Helper()
-	inputDir, tempDir := t.TempDir(), t.TempDir()
-	fixture := buildFixture(t, ffmpegPath, inputDir)
-	task, err := Analyze(context.Background(), AnalyzeRequest{Input: fixture, TempDir: tempDir, FFmpegPath: ffmpegPath})
-	if err != nil {
-		t.Fatal(err)
-	}
-	a, err := task.Wait()
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := sharedBoxFixture(t, ffmpegPath)
+	a, _ := attachWarmAnalysis(t, ffmpegPath, fixture, AnalyzeCrop)
 	p, err := NewPlan(a.Stream(), Settings{Width: outW, Height: outH, FPS: fixtureFPS})
 	if err != nil {
 		t.Fatal(err)
@@ -670,8 +664,8 @@ func TestRenderRejectsMismatchedPlan(t *testing.T) {
 // included (a second call reuses the analysis).
 func TestRenderWholeOneShot(t *testing.T) {
 	ffmpeg := requireFFmpeg(t)
-	inputDir, tempDir, outDir := t.TempDir(), t.TempDir(), t.TempDir()
-	fixture := buildFixture(t, ffmpeg, inputDir)
+	tempDir, outDir := t.TempDir(), t.TempDir()
+	fixture := sharedBoxFixture(t, ffmpeg)
 
 	analyze := AnalyzeRequest{Input: fixture, TempDir: tempDir, FFmpegPath: ffmpeg}
 	render := RenderRequest{OutputDir: outDir, TempDir: tempDir, FFmpegPath: ffmpeg}

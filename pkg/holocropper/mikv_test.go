@@ -27,19 +27,14 @@ reassemble into a plain Ogg stream), naming and OutputName override,
 cancel mid-render, the shared render slot, and the option validation that
 guards the container's integer fps / divisible PCM budget. */
 
-// setupMikVAnalysis analyzes the standard fixture once for the MikV tests.
+// setupMikVAnalysis hands the MikV tests the cached Analysis, a Plan at the
+// tiny 40x40 container size and the private TempDir holding the copy. The
+// warm harness analyzes the canonical clip once per run; the attach is
+// immediate and scratch assertions stay per-test.
 func setupMikVAnalysis(t *testing.T, ffmpegPath string, fps float64) (*Analysis, *Plan, string) {
 	t.Helper()
-	inputDir, tempDir := t.TempDir(), t.TempDir()
-	fixture := buildFixture(t, ffmpegPath, inputDir)
-	task, err := Analyze(context.Background(), AnalyzeRequest{Input: fixture, TempDir: tempDir, FFmpegPath: ffmpegPath})
-	if err != nil {
-		t.Fatal(err)
-	}
-	a, err := task.Wait()
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := sharedBoxFixture(t, ffmpegPath)
+	a, tempDir := attachWarmAnalysis(t, ffmpegPath, fixture, AnalyzeCrop)
 	p, err := NewPlan(a.Stream(), Settings{Width: 40, Height: 40, FPS: fps})
 	if err != nil {
 		t.Fatal(err)

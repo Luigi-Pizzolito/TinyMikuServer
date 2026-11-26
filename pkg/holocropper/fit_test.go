@@ -3,12 +3,10 @@ package holocropper
 import (
 	"context"
 	"errors"
-	"fmt"
 	"image"
 	"image/color"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -221,37 +219,17 @@ func TestFitResizeTo(t *testing.T) {
 // a black-bar output, frame count intact.
 func TestRenderFinalFitBars(t *testing.T) {
 	ffmpeg := requireFFmpeg(t)
-	inputDir, tempDir, outDir := t.TempDir(), t.TempDir(), t.TempDir()
+	outDir := t.TempDir()
 
-	fixture := filepath.Join(inputDir, "gray.mp4")
-	cmd := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-		"-f", "lavfi", "-i", fmt.Sprintf("color=c=gray:s=%dx%d:d=%d:r=%d", fixtureW, fixtureH, fixtureSeconds, fixtureFPS),
-		"-f", "lavfi", "-i", fmt.Sprintf("sine=frequency=440:duration=%d", fixtureSeconds),
-		"-map", "0:v", "-map", "1:a",
-		"-x264-params", "cpu-independent=1",
-		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
-		fixture)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("gray fixture build failed: %v: %s", err, out)
-	}
-
-	task, err := Analyze(context.Background(), AnalyzeRequest{
-		Input: fixture, TempDir: tempDir, FFmpegPath: ffmpeg,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	a, err := task.Wait()
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := sharedGrayFixture(t, ffmpeg)
+	a, _ := attachWarmAnalysis(t, ffmpeg, fixture, AnalyzeCrop)
 
 	p, err := NewFitPlan(a.Stream(), Settings{Width: 240, Height: 240, FPS: fixtureFPS})
 	if err != nil {
 		t.Fatal(err)
 	}
 	rt, err := a.RenderFinal(context.Background(), p, RenderRequest{
-		OutputDir: outDir, TempDir: tempDir, FFmpegPath: ffmpeg,
+		OutputDir: outDir, TempDir: outDir, FFmpegPath: ffmpeg,
 	})
 	if err != nil {
 		t.Fatal(err)

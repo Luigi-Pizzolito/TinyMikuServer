@@ -3,7 +3,6 @@ package holocropper
 import (
 	"bytes"
 	"compress/gzip"
-	"context"
 	"encoding/binary"
 	"errors"
 	"image"
@@ -243,17 +242,8 @@ func TestSubjectDetailNeedsACachedVideoAndARecordedThreshold(t *testing.T) {
 
 func TestSubjectDetailReproducesTheRecordedStream(t *testing.T) {
 	ffmpeg := requireFFmpeg(t)
-	inputDir, tempDir := t.TempDir(), t.TempDir()
-	fixture := buildFixture(t, ffmpeg, inputDir)
-
-	task, err := Analyze(context.Background(), AnalyzeRequest{Input: fixture, TempDir: tempDir, FFmpegPath: ffmpeg})
-	if err != nil {
-		t.Fatal(err)
-	}
-	a, err := task.Wait()
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := sharedBoxFixture(t, ffmpeg)
+	a, _ := attachWarmAnalysis(t, ffmpeg, fixture, AnalyzeCrop)
 	stream := a.Stream()
 
 	measured := 0

@@ -154,16 +154,8 @@ func TestRenderPassesFollowThePlansFrameClock(t *testing.T) {
 	const srcFPS = 12
 	const wantFrames = fixtureSeconds * fixtureFPS // 4 s at the plan's 24 fps
 
-	inputDir, tempDir := t.TempDir(), t.TempDir()
-	fixture := buildFixtureAt(t, ffmpeg, inputDir, srcFPS)
-	task, err := Analyze(context.Background(), AnalyzeRequest{Input: fixture, TempDir: tempDir, FFmpegPath: ffmpeg})
-	if err != nil {
-		t.Fatal(err)
-	}
-	a, err := task.Wait()
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture := sharedClock12Fixture(t, ffmpeg)
+	a, scratchDir := attachWarmAnalysis(t, ffmpeg, fixture, AnalyzeCrop)
 	if a.meta.FPS != srcFPS {
 		t.Fatalf("the analysis recorded %g fps, want the source's %d", a.meta.FPS, srcFPS)
 	}
@@ -213,7 +205,7 @@ func TestRenderPassesFollowThePlansFrameClock(t *testing.T) {
 	// sound under them. Before the schedule it held 48 frames - 2 s of picture
 	// against a track that ran the full 4 s.
 	outDir := t.TempDir()
-	mk := runMikVRender(t, a, p, ffmpeg, tempDir, MikVRequest{
+	mk := runMikVRender(t, a, p, ffmpeg, scratchDir, MikVRequest{
 		OutputDir: outDir,
 		Options:   MikVOptions{VideoJPEG: true, AudioOpus: true, OpusBitrateKbps: 32},
 	})

@@ -200,10 +200,8 @@ func TestFitPlanParityWithDetectedPlan(t *testing.T) {
 	ffmpeg := requireFFmpeg(t)
 	settings := Settings{Width: 320, Height: 480, FPS: fixtureFPS, AutoOrient: true}
 
-	detInput, detTemp := t.TempDir(), t.TempDir()
-	det := analyzeWithMode(t, ffmpeg, buildFixture(t, ffmpeg, detInput), detTemp, AnalyzeCrop)
-	fitInput, fitTemp := t.TempDir(), t.TempDir()
-	fit := analyzeWithMode(t, ffmpeg, buildFixture(t, ffmpeg, fitInput), fitTemp, AnalyzeFit)
+	det, _ := attachWarmAnalysis(t, ffmpeg, sharedBoxFixture(t, ffmpeg), AnalyzeCrop)
+	fit, _ := attachWarmAnalysis(t, ffmpeg, sharedBoxFixture(t, ffmpeg), AnalyzeFit)
 
 	dp, err := NewFitPlan(det.Stream(), settings)
 	if err != nil {
@@ -259,10 +257,8 @@ func TestFitPlanParityWithDetectedPlan(t *testing.T) {
 // internally (records == stream == decoded) hold for the synthetic stream.
 func TestFitRenderChainAllProducts(t *testing.T) {
 	ffmpeg := requireFFmpeg(t)
-	inputDir, tempDir := t.TempDir(), t.TempDir()
-	fixture := buildFixture(t, ffmpeg, inputDir)
-
-	a := analyzeWithMode(t, ffmpeg, fixture, tempDir, AnalyzeFit)
+	fixture := sharedBoxFixture(t, ffmpeg)
+	a, tempDir := attachWarmAnalysis(t, ffmpeg, fixture, AnalyzeFit)
 	p, err := NewFitPlan(a.Stream(), Settings{Width: 160, Height: 120, FPS: fixtureFPS})
 	if err != nil {
 		t.Fatal(err)
