@@ -316,9 +316,17 @@ only in the analysis scale filter.
       `vids-e2e-test/new/`; timing logged, never asserted; baselines left
       untouched; e2e is not in `go test ./...` and not in CI. Default suite
       green.
-- [ ] Step 7.5 — push; CI green (analysis goldens re-recorded for ffmpeg6 via
-      `regenerate_golden` dispatch if the pinned runner's decisions drift);
-      workflow diff must show NO e2e addition.
+- [ ] Step 7.5 — push; CI green (analysis goldens re-recorded for ffmpeg6;
+      workflow diff shows NO e2e addition). ffmpeg6 golden re-recorded inside
+      the pinned `parity-lab` container (ubuntu:24.04, ffmpeg 6.1.1-3ubuntu5 =
+      the CI apt build): the committed drift was 1 px bbox/EMA columns only,
+      and the new ffmpeg6 golden is BYTE-IDENTICAL to the ffmpeg9 host golden
+      - qp 0 lossless + bitexact scale makes the decision stream machine- and
+      build-independent. The exact CI invocation (`go test -count=1 -race
+      -timeout 600s ./...`) passes in the container in 353 s, well inside the
+      600 s budget that the old vidio-heavy suite repeatedly exceeded (the
+      pre-existing CI flake: parent-branch timeouts with vidio cleanup
+      goroutine pile-ups, NOT golden drift).
 
 ## 7. Risks & notes
 
