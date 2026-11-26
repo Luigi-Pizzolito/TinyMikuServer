@@ -302,8 +302,20 @@ only in the analysis scale filter.
       same framing both sides, so this measures the resize law change alone.
       Throwaway files deleted (`step6_parity_test.go`, `linearlight_smoke_test.go`);
       the permanent e2e (Step 7) covers the same comparisons on real fixtures.
-- [ ] Step 7 — `e2e_test.go` (7a-7f) run on the host, 30m timeout; outputs to
-      `vids-e2e-test/new/`; timing logged, never asserted.
+- [x] Step 7 — `e2e_test.go` (7a-7e) green on the host (ffmpeg n9.0.2,
+      `go test -tags e2e -run E2E -timeout 30m`, 273 s total): 7b music fit
+      **psnr 33.78 dB / mad 2.96**, fit bars black (worst frame bar luma
+      0.000 over all 3280 frames), MikV round trip 3280 frames (header
+      648x200@24, interior JPEG payloads decode with Opus audio; the fixture
+      genuinely fades in/out - baseline frame 0/last are black too, so the
+      payload check samples interior frames); 7c sweetdevil crop **psnr 27.21
+      dB / mad 2.08** + motion proof 4/4 consecutive-frame pairs differing;
+      7d analysis determinism 4100/4100 framemd5 lines identical across two
+      fresh passes; 7e all 20 reference stills inside the guard (music
+      29.0-39.1 dB, sweetdevil 25.3-27.1 dB). Outputs under
+      `vids-e2e-test/new/`; timing logged, never asserted; baselines left
+      untouched; e2e is not in `go test ./...` and not in CI. Default suite
+      green.
 - [ ] Step 7.5 — push; CI green (analysis goldens re-recorded for ffmpeg6 via
       `regenerate_golden` dispatch if the pinned runner's decisions drift);
       workflow diff must show NO e2e addition.
