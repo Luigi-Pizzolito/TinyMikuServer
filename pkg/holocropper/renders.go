@@ -20,15 +20,17 @@ import (
 )
 
 /* Render passes (HOLOCROPPER-API-PLAN.md stories B1/B2): output-resolution
-previews and the final production render, both executed from a cached
-Analysis video plus a Plan - no detection, no re-decode of the source.
+previews and the final production render - both executed from a cached
+Analysis plus a Plan, no detection and no re-analysis.
 
-Both passes share one frame loop - cropToBBoxCalc + fillResizeTo for the
-content-aware modes, fitResizeTo (whole frame scaled onto black bars) for
-fit mode (§6.10) - against the cached analysis video,
-writing a JPEG sequence into Task-ID-isolated scratch under the caller's
-TempDir, then ffmpeg-muxing it with progress. Previews mux video only; the
-final render copies the source audio track through, exactly as the CLI does.
+The preview pass runs the frame loop - cropToBBoxCalc + fillResizeTo for the
+content-aware modes, fitResizeTo (whole frame scaled onto black bars) for fit
+mode (§6.10) - against the cached analysis video, writing a JPEG sequence and
+ffmpeg-muxing it with progress. The final production render instead runs the
+linear-light pipeline in linearrender.go: full-res source decode, the crop
+composed at source pixels, and one ffmpeg encode that resizes in linear light
+(lanczos, cas=0.4 last) and muxes mjpeg + the source audio through, exactly
+as the CLI does.
 
 Preview files are versioned and never overwritten (requirement 11):
 <basename>-<WxH>-v<N>.mp4 and <basename>-<WxH>-overlay-v<N>.mp4 inside the
@@ -921,27 +923,40 @@ func renderFinalWork(ctx context.Context, a *Analysis, task *RenderTask, p *Plan
 	r := p.resolved
 	start := time.Now()
 
-	framesDir := filepath.Join(task.scratch, "frames")
-	if err := os.MkdirAll(framesDir, 0o755); err != nil {
+	if err := os.MkdirAll(task.scratch, 0o755); err != nil {
 		return nil, err
 	}
 
-	frames, err := runCropLoop(ctx, tb, a, p, framesDir, "", PreviewOptions{Kind: PreviewCrop}, PhaseRenderFrames)
-	if err != nil {
-		return nil, err
+	// The linear-light production pass (SHARPER_PLAN §4): full-res decode,
+	// the Plan's crop composed at source pixels, one ffmpeg encode running
+	// lanczos in linear light with cas=0.4 last, muxed as the same mjpeg +
+	// source-audio-copy MP4 the CLI produces.
+	sched := a.frameSchedule(p)
+	rectFor := func(srcIdx int) image.Rectangle {
+		return scaleRectToSource(p.cropRectAt(srcIdx), r.AnalysisW, r.AnalysisH, r.SourceW, r.SourceH)
 	}
-	if err := ctx.Err(); err != nil {
+	chain := linearFillChain(r.OutputW, r.OutputH)
+	if p.settings.FitWithBars {
+		// The fit content rect resolves once per stream (plan §6.10), so the
+		// fit box is constant and the pad law can be baked into the chain.
+		c := rectFor(0)
+		chain = linearFitChain(c.Dx(), c.Dy(), r.OutputW, r.OutputH)
+	}
+	tmp := filepath.Join(task.scratch, "final.mp4")
+	err := runSourceRender(ctx, sourceRenderOpts{
+		tb: tb, ffmpegPath: req.FFmpegPath, sourceFile: a.meta.Input,
+		srcW: r.SourceW, srcH: r.SourceH, srcFrames: len(p.records),
+		sched: sched, rectFor: rectFor, chain: chain,
+		outW: r.OutputW, outH: r.OutputH, fps: planFPS(p),
+		phase: PhaseRenderFrames, totalOut: sched.Frames,
+		tmpOut: tmp, copyAudio: true,
+	})
+	if err != nil {
 		return nil, err
 	}
 
 	basename := getBasenameWithoutExt(a.meta.Input)
 	outPath := filepath.Join(outDir, renderOutputName(basename, r.OutputW, r.OutputH, req.OutputName))
-	tmp := filepath.Join(task.scratch, "final.mp4")
-	// The PC product keeps the CLI's mux: mjpeg video with the source audio
-	// copied through. That pairing IS the format the UMP PC player takes.
-	if err := muxFrameSequence(ctx, req.FFmpegPath, framesDir, a.meta.Input, planFPS(p), tmp, PreviewMuxMJPEG, PhaseRenderMux, tb, frames); err != nil {
-		return nil, err
-	}
 	if err := moveFile(tmp, outPath); err != nil {
 		return nil, err
 	}
@@ -957,7 +972,7 @@ func renderFinalWork(ctx context.Context, a *Analysis, task *RenderTask, p *Plan
 		OutputW:         r.OutputW,
 		OutputH:         r.OutputH,
 		AppliedSettings: r,
-		Frames:          frames,
+		Frames:          sched.Frames,
 		FPS:             planFPS(p),
 		ElapsedSeconds:  time.Since(start).Seconds(),
 	}

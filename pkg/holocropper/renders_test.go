@@ -611,8 +611,11 @@ func TestRenderFinalOutputAndDeterminism(t *testing.T) {
 	if st, err := os.Stat(keepRes.WorkDir); err != nil || !st.IsDir() {
 		t.Errorf("KeepWorkDir: %s should still exist (%v)", keepRes.WorkDir, err)
 	}
-	if frames, err := filepath.Glob(filepath.Join(keepRes.WorkDir, "frames", "*.jpg")); err != nil || len(frames) != total {
-		t.Errorf("KeepWorkDir: frames scratch has %d jpegs, want %d", len(frames), total)
+	// The linear-light render has no JPEG-frame scratch to keep: the whole
+	// product is built inside one encode and moved out on success. Keep the
+	// sweep check that nothing stale was left behind.
+	if left, err := filepath.Glob(filepath.Join(keepRes.WorkDir, "*")); err != nil || len(left) != 0 {
+		t.Errorf("KeepWorkDir: work dir should be left empty by a finished pass, has %d entries", len(left))
 	}
 
 	// A missing output dir is a request error, not a crashed Task.

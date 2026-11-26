@@ -269,11 +269,19 @@ only in the analysis scale filter.
       `-sws_flags`, drop `-x264-params cpu-independent=1`, add `-pix_fmt
       yuv420p -c:v libx264 -preset ultrafast -qp 0`). Re-record ffmpeg9 goldens
       on the host; full suite green.
-- [ ] Step 3 — render core: `scaleRectToSource`, source-px crop composer, PPM
-      writer, pipe runner; `RenderFinal` rewritten onto decode→crop→CHAIN-encode
-      (Sink A) with phase/progress/cancel semantics preserved. Suite green
-      (existing renders_test expectations adjusted only where a phase boundary
-      legitimately moves).
+- [x] Step 3 — render core landed (`linearrender.go`): `scaleRectToSource`,
+      `writePPMCrop` (the cropToBBoxCalc law on RGB24), the chain builders,
+      and `runSourceRender` (decoder ffmpeg -> Go crop pump -> one encoder
+      running the linear-light law; Sink A mjpeg+audio-copy, Sink B rawvideo
+      contract; progress from encoder `frame=` stats; cancel returns the
+      context error verbatim; intentional early decoder kill distinguished
+      from a real decode failure). `renderFinalWork` rewired; JPEG scratch
+      for the final pass is gone (renders_test KeepWorkDir expectation
+      adjusted accordingly). Real-fixture smoke through the full API:
+      music fit 3280 frames psnr 33.8 dB / mad 2.96 (12.4 s incl. analysis);
+      sweetdevil crop 5555 frames psnr 27.2 dB / mad 2.08 (144.7 s incl.
+      analysis) - inside the §8 guard with room; audio copied untouched
+      (aac, opus); container stays mjpeg/yuvj420p. Suite green.
 - [ ] Step 4 — `RenderMikV` frames pass onto Sink B; payload + audio code
       untouched. Suite green (mikv_test phase expectations hold).
 - [ ] Step 5 — remove the final render's now-dead helpers usage (keep
