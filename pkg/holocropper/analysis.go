@@ -802,18 +802,22 @@ func analyzeWork(ctx context.Context, entry *analysisEntry, task *AnalysisTask, 
 		args := []string{
 			"-hide_banner",
 			"-i", ra.input,
-			"-vf", fmt.Sprintf("scale=%d:%d", aw, ah),
-			// lanczos+bitexact: the analysis scaler must be CPU-dispatch
+			// The bitexact analysis scale law. flags= per filter (not a
+			// global -sws_flags): the analysis scaler must be CPU-dispatch
 			// independent. SIMD lanczos paths round differently on different
 			// CPU flag sets (a 1 px edge-ring difference was observed between
 			// a desktop and a GH runner on the SAME ffmpeg build), which
 			// would silently shift detect bboxes and break the golden parity
 			// gate. bitexact forces swscale's deterministic algorithm.
-			"-sws_flags", "lanczos+accurate_rnd+bitexact",
-			// cpu-independent x264: same rationale - subpel search and mode
-			// decisions must not follow the CPU's asm, or the analysis
-			// bitstream (and therefore detect) differs per machine.
-			"-x264-params", "cpu-independent=1",
+			"-vf", fmt.Sprintf("scale=%d:%d:flags=lanczos+accurate_rnd+bitexact", aw, ah),
+			// Lossless, cpu-agnostic cache encode: ultrafast + qp 0 keeps the
+			// analysis pixels exactly what the bitexact scaler produced (a
+			// lossy medium cache quantized them and followed x264's asm),
+			// so no -x264-params cpu-independent override is needed.
+			"-pix_fmt", "yuv420p",
+			"-c:v", "libx264",
+			"-preset", "ultrafast",
+			"-qp", "0",
 			"-fps_mode", "passthrough",
 			"-an",
 			tmpVideo,
