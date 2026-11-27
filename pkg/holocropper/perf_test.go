@@ -511,7 +511,10 @@ func TestPerfDetectSplit(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// detectFrame optimisation PROTOTYPE (proposal only - shipped code untouched)
+// detectFrame optimisation replica (LAW LANDED in the shipped code:
+// video_dsp.go detectState/writeGray + subject_detail.go subjectScan
+// implement the same formulation). The replica stays here as the independent
+// oracle the shipped chain is diffed against, frame for frame.
 // ---------------------------------------------------------------------------
 
 // The shipped detect chain allocates per frame: mono + binary images, a

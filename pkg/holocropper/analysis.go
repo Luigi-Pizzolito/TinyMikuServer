@@ -838,9 +838,9 @@ func analyzeWork(ctx context.Context, entry *analysisEntry, task *AnalysisTask, 
 	var frames int
 	if detected {
 		// Detect: stream the analysis video through the shared single-frame
-		// detector (detectFrame): grayscale -> Otsu hysteresis -> binary ->
-		// subjectsFromBinary, the same measurements the corpus framing
-		// decisions were tuned on.
+		// detector (detectState, video_dsp.go): grayscale -> Otsu hysteresis
+		// -> binary -> the subject measurement summary (subject_detail.go),
+		// the same measurements the corpus framing decisions were tuned on.
 		tb.setPhase(PhaseDetect, srcFrames)
 		batcher := newFrameBatcher(req.Observer)
 		frames, err = runDetectStream(ctx, videoPath, tb, sd, batcher)
@@ -935,6 +935,7 @@ func runDetectStream(ctx context.Context, videoPath string, tb *taskBase, sd *st
 	sd.setGeometry(w, h, sd.srcWLocked(), sd.srcHLocked(), video.FPS())
 
 	lastThr := -1.0
+	detect := &detectState{} // the pass's reused frame scratch: gray/binary buffers + subject scan
 	count := 0
 	for video.Read() {
 		if err := ctx.Err(); err != nil {
@@ -942,7 +943,7 @@ func runDetectStream(ctx context.Context, videoPath string, tb *taskBase, sd *st
 			return count, err
 		}
 		count++
-		bbox, subj, cent := detectFrame(buf, &lastThr)
+		bbox, subj, cent := detect.run(buf, &lastThr)
 		sd.append(withThreshold(newStreamSample(bbox, subj, cent), lastThr))
 		if batcher.observer != nil && batcher.observer.OnFrames != nil {
 			r := rectOf(bbox)

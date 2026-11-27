@@ -10,14 +10,22 @@ Milestone G3, embedding-app item 761).
 
 The detect pass needs two numbers per frame: the master subject bbox and the
 subject count. The embedding app's overlay layer draws the layers underneath
-them too - the DFS islands, which islands the merge filter kept, the pools the
+them too - the flood islands, which islands the merge filter kept, the pools the
 merger produced, and each island's outline. All of it comes out of one walk of
 the mask, and subjectsFromBinary is this measurement's two-number summary, so
 a diagnostic drawn for the user cannot disagree with the stream the framing was
-planned from. */
+planned from: both run the same subjectScan core below.
 
-// subjectComponent is one connected island of the subject mask (one DFS
-// component of connectedComponentLabeling), largest bbox area first.
+The core walks reusable scratch (flat label matrix, flat flood stack,
+per-label stat slices) instead of allocating maps and [][]int matrices per
+frame. The LAW is untouched: same (y,x) seed scan, same 8-neighbour flood
+order, label-on-pop with duplicate pushes, bbox equal to the per-pixel Union
+tight bound, same comparator, same merge claim order. The perf branch proved
+the formulation bit-identical frame-for-frame to the original one over every
+frame of the corpus analyses (PROFILING.md §5). */
+
+// subjectComponent is one connected island of the subject mask (one flood
+// component), largest bbox area first.
 type subjectComponent struct {
 	Label    int             // id in the label matrix
 	Rect     image.Rectangle // tight island bbox, analysis px
@@ -69,130 +77,297 @@ type subjectDetail struct {
 	Bounds     image.Rectangle    // the mask's bounds, for label indexing
 }
 
-// islandStat accumulates one label's pixels during the single mask walk.
-type islandStat struct {
-	count int
-	sumX  int64
-	sumY  int64
-	tight image.Rectangle
-	seen  bool
+// subjectScan is the reusable scratch of the measurement core: the flat label
+// matrix and flood stack, the per-label statistics, the sorted component
+// order and the merge claim flags. One scan serves one measurement, or a
+// streaming series of same-shaped frames (the detect pass reuses one scan for
+// a whole analysis video); it is not safe for concurrent frames.
+type subjectScan struct {
+	labels []int32 // label matrix, row-major over the mask bounds; 0 = background
+	stack  []int32 // flood stack of label indices
+
+	n     int // stat slots ensured for the last flood (labels are 1..n)
+	count []int32
+	sumX  []int64
+	sumY  []int64
+	minX  []int32 // tight island bbox tracked through the flood; maxX/maxY
+	minY  []int32 // hold the EXCLUSIVE edge (image.Rect semantics); all
+	maxX  []int32 // relative to the mask bounds origin
+	maxY  []int32
+
+	order   []int32 // label ids in component (merge) order
+	claimed []bool  // per order position: folded into an earlier pool
 }
 
-// subjectDetailFromBinary runs the shared subject-extraction stage in full:
-// connected component labelling -> sort by bbox area (largest first, ties
-// broken by position so the merge order is deterministic) -> keep the islands
-// whose bbox is at least 20% of the largest bbox, each merging the
+// ensureLabel grows the per-label stat slots through the given label,
+// starting every accumulator fresh.
+func (sc *subjectScan) ensureLabel(label int32) {
+	for sc.n <= int(label) {
+		sc.n++
+		sc.count = append(sc.count, 0)
+		sc.sumX = append(sc.sumX, 0)
+		sc.sumY = append(sc.sumY, 0)
+		sc.minX = append(sc.minX, 1<<30)
+		sc.minY = append(sc.minY, 1<<30)
+		sc.maxX = append(sc.maxX, -1)
+		sc.maxY = append(sc.maxY, -1)
+	}
+}
+
+// measure is the single subject-extraction stage: connected component
+// labelling -> sort by bbox area (largest first, ties broken by position,
+// stable in label order so the merge order is deterministic) -> keep the
+// islands whose bbox is at least 20% of the largest bbox, each merging the
 // not-yet-claimed neighbours within 5% of the frame height -> union master
-// bbox. The merge loop mirrors subjectsFromBinary's iteration order exactly:
-// every accepted island is tested against what the earlier pools have not yet
-// claimed.
-func subjectDetailFromBinary(binaryImg *image.Gray) subjectDetail {
-	boxes, labels := connectedComponentLabeling(binaryImg)
-	bound := binaryImg.Bounds()
-	if len(boxes) == 0 {
-		return subjectDetail{Bounds: bound}
+// bbox. full mode additionally counts each island's mask pixels and centre
+// of mass, marks the accepted islands, and materialises the label matrix the
+// outline tracer (subjectIslands) walks; that is the layer set the lazy
+// detail verbs (SubjectBoxes/FrameIslands) draw. The summary mode the detect
+// pass streams measures exactly the numbers the stream records, and the
+// master-bbox centroid the caller takes from it with maskStats.
+func (sc *subjectScan) measure(binaryImg *image.Gray, full bool) subjectDetail {
+	b := binaryImg.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if len(sc.labels) != w*h {
+		sc.labels = make([]int32, w*h)
+	} else {
+		for i := range sc.labels {
+			sc.labels[i] = 0
+		}
 	}
+	labels := sc.labels
+	sc.n = 0
 
-	// One pass over the label matrix: pixel counts, centres of mass, and the
-	// tight bboxes the outline tracer walks.
-	stats := make(map[int]*islandStat, len(boxes))
-	for y := bound.Min.Y; y < bound.Max.Y; y++ {
-		row := labels[y-bound.Min.Y]
-		for x := bound.Min.X; x < bound.Max.X; x++ {
-			l := row[x-bound.Min.X]
-			if l == 0 {
+	// Connected component labelling: the original walk - (y,x) seed scan, the
+	// flood's 8-neighbour push order (both rows per column offset, then left,
+	// then right), label on pop, duplicate pushes allowed (a pixel pushed
+	// twice is re-popped and re-labelled with its own component's label -
+	// idempotent), and the tight bbox tracked through the flood, which is
+	// exactly the per-pixel Union bound the original stats pass computed.
+	stack := sc.stack[:0]
+	label := int32(1)
+	for y := 0; y < h; y++ {
+		binRow := binaryImg.Pix[y*binaryImg.Stride : y*binaryImg.Stride+w]
+		rowOff := y * w
+		for x := 0; x < w; x++ {
+			if binRow[x] == 0 || labels[rowOff+x] != 0 {
 				continue
 			}
-			st := stats[l]
-			if st == nil {
-				st = &islandStat{}
-				stats[l] = st
+			sc.ensureLabel(label)
+			sc.count[label], sc.sumX[label], sc.sumY[label] = 0, 0, 0
+			minX, minY, maxX, maxY := x, y, x, y
+			stack = append(stack, int32(rowOff+x))
+			for len(stack) > 0 {
+				cur := int(stack[len(stack)-1])
+				stack = stack[:len(stack)-1]
+				cx, cy := cur%w, cur/w
+				labels[cur] = label
+				if cx < minX {
+					minX = cx
+				}
+				if cx > maxX {
+					maxX = cx
+				}
+				if cy < minY {
+					minY = cy
+				}
+				if cy > maxY {
+					maxY = cy
+				}
+				for dx := -1; dx <= 1; dx++ {
+					nx := cx + dx
+					if nx < 0 || nx >= w {
+						continue
+					}
+					if ny := cy - 1; ny >= 0 {
+						if binaryImg.Pix[ny*binaryImg.Stride+nx] > 0 && labels[ny*w+nx] == 0 {
+							stack = append(stack, int32(ny*w+nx))
+						}
+					}
+					if ny := cy + 1; ny < h {
+						if binaryImg.Pix[ny*binaryImg.Stride+nx] > 0 && labels[ny*w+nx] == 0 {
+							stack = append(stack, int32(ny*w+nx))
+						}
+					}
+				}
+				if cx > 0 {
+					if binaryImg.Pix[cy*binaryImg.Stride+cx-1] > 0 && labels[cy*w+cx-1] == 0 {
+						stack = append(stack, int32(cy*w+cx-1))
+					}
+				}
+				if cx+1 < w {
+					if binaryImg.Pix[cy*binaryImg.Stride+cx+1] > 0 && labels[cy*w+cx+1] == 0 {
+						stack = append(stack, int32(cy*w+cx+1))
+					}
+				}
 			}
-			st.count++
-			st.sumX += int64(x)
-			st.sumY += int64(y)
-			p := image.Rect(x, y, x+1, y+1)
-			if !st.seen {
-				st.tight, st.seen = p, true
-			} else {
-				st.tight = st.tight.Union(p)
+			sc.minX[label] = int32(minX)
+			sc.minY[label] = int32(minY)
+			sc.maxX[label] = int32(maxX + 1)
+			sc.maxY[label] = int32(maxY + 1)
+			label++
+		}
+	}
+	sc.stack = stack
+	nComps := int(label) - 1
+	if nComps == 0 {
+		return subjectDetail{Bounds: b}
+	}
+
+	// One pass over the label matrix for the island mask counts and centres
+	// of mass - full mode only; the summary numbers never read them.
+	if full {
+		for y := 0; y < h; y++ {
+			rowOff := y * w
+			for x := 0; x < w; x++ {
+				l := labels[rowOff+x]
+				if l == 0 {
+					continue
+				}
+				sc.count[l]++
+				sc.sumX[l] += int64(b.Min.X + x)
+				sc.sumY[l] += int64(b.Min.Y + y)
 			}
 		}
 	}
 
-	comps := make([]subjectComponent, 0, len(stats))
-	for l, st := range stats {
-		if st.count == 0 {
-			continue
-		}
-		comps = append(comps, subjectComponent{
-			Label:    l,
-			Rect:     st.tight,
-			Area:     st.tight.Dx() * st.tight.Dy(),
-			MaskPx:   st.count,
-			Centroid: image.Point{X: int(st.sumX / int64(st.count)), Y: int(st.sumY / int64(st.count))},
-		})
+	areaOf := func(l int32) int {
+		return int(sc.maxX[l]-sc.minX[l]) * int(sc.maxY[l]-sc.minY[l])
 	}
-	sort.Slice(comps, func(i, j int) bool {
-		if comps[i].Area != comps[j].Area {
-			return comps[i].Area > comps[j].Area
+	rectOf := func(l int32) image.Rectangle {
+		return image.Rect(b.Min.X+int(sc.minX[l]), b.Min.Y+int(sc.minY[l]),
+			b.Min.X+int(sc.maxX[l]), b.Min.Y+int(sc.maxY[l]))
+	}
+
+	if cap(sc.order) < nComps {
+		sc.order = make([]int32, nComps)
+	}
+	order := sc.order[:nComps]
+	for i := range order {
+		order[i] = int32(i + 1)
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		li, lj := order[i], order[j]
+		if ai, aj := areaOf(li), areaOf(lj); ai != aj {
+			return ai > aj
 		}
-		if comps[i].Rect.Min.Y != comps[j].Rect.Min.Y {
-			return comps[i].Rect.Min.Y < comps[j].Rect.Min.Y
+		if sc.minY[li] != sc.minY[lj] {
+			return sc.minY[li] < sc.minY[lj]
 		}
-		return comps[i].Rect.Min.X < comps[j].Rect.Min.X
+		return sc.minX[li] < sc.minX[lj]
 	})
+	if cap(sc.claimed) < nComps {
+		sc.claimed = make([]bool, nComps)
+	}
+	claimed := sc.claimed[:nComps]
+	for i := range claimed {
+		claimed[i] = false
+	}
 
-	largestArea := comps[0].Area
-	tol := bound.Dy() / 20
-	d := subjectDetail{Components: comps, Bounds: bound, Labels: labels}
+	largestArea := areaOf(order[0])
+	tol := h / 20
+	d := subjectDetail{Bounds: b}
 
-	// remaining is what no pool has claimed yet; it starts as every island
-	// (the merge test sees the seed itself, exactly as combineBounds did).
-	remaining := make([]subjectComponent, len(comps))
-	copy(remaining, comps)
-	for i := range comps {
-		c := comps[i]
-		if 100*float64(c.Area)/float64(largestArea) < 20 {
+	// The merge loop keeps the original iteration law exactly: accepted
+	// islands (a prefix, since the order is area-descending and the filter is
+	// monotone in area) each start a pool at their own rect and fold in every
+	// not-yet-claimed island from their own position forward - including the
+	// seed itself, which is why an unclaimed seed's label appears in Seeds
+	// exactly as the original combineBounds-era merge listed it. A pool is
+	// started for every accepted island even one an earlier pool already
+	// swallowed.
+	haveMaster := false
+	for i := 0; i < nComps; i++ {
+		li := order[i]
+		if 100*float64(areaOf(li))/float64(largestArea) < 20 {
 			continue
 		}
-		c.Accepted = true
-		d.Components[i] = c
-
-		combined, seeds, next := c.Rect, []int{c.Label}, make([]subjectComponent, 0, len(remaining))
-		for _, r := range remaining {
-			if expandRectangle(combined, tol).Overlaps(r.Rect) {
-				combined = combined.Union(r.Rect)
-				seeds = append(seeds, r.Label)
+		combined := rectOf(li)
+		var seeds []int
+		if full {
+			seeds = []int{int(li)}
+		}
+		for j := i; j < nComps; j++ {
+			if claimed[j] {
 				continue
 			}
-			next = append(next, r)
+			lj := order[j]
+			rj := rectOf(lj)
+			if expandRectangle(combined, tol).Overlaps(rj) {
+				combined = combined.Union(rj)
+				claimed[j] = true
+				if full {
+					seeds = append(seeds, int(lj))
+				}
+			}
 		}
-		remaining = next
-		pool := subjectPool{Rect: combined, Seeds: seeds}
-		pool.MaskPx, pool.Centroid = maskStats(binaryImg, combined)
-		d.Pools = append(d.Pools, pool)
+		if !haveMaster {
+			d.Master, haveMaster = combined, true
+		} else {
+			d.Master = d.Master.Union(combined)
+		}
+		d.Subjects++
+		if full {
+			pool := subjectPool{Rect: combined, Seeds: seeds}
+			pool.MaskPx, pool.Centroid = maskStats(binaryImg, combined)
+			d.Pools = append(d.Pools, pool)
+		}
 	}
-	if len(d.Pools) == 0 {
+	if !full {
 		return d
 	}
-	rects := make([]image.Rectangle, len(d.Pools))
-	for i, p := range d.Pools {
-		rects[i] = p.Rect
+
+	comps := make([]subjectComponent, nComps)
+	for i, l := range order {
+		comps[i] = subjectComponent{
+			Label:    int(l),
+			Rect:     rectOf(l),
+			Area:     areaOf(l),
+			MaskPx:   int(sc.count[l]),
+			Centroid: image.Point{X: int(sc.sumX[l] / int64(sc.count[l])), Y: int(sc.sumY[l] / int64(sc.count[l]))},
+			Accepted: 100*float64(areaOf(l))/float64(largestArea) >= 20,
+		}
 	}
-	d.Master = totalBoundingBox(rects)
-	d.Subjects = len(d.Pools)
+	d.Components = comps
+
+	rows := make([][]int, h)
+	for y := 0; y < h; y++ {
+		src := sc.labels[y*w : (y+1)*w]
+		row := make([]int, w)
+		for x := range row {
+			row[x] = int(src[x])
+		}
+		rows[y] = row
+	}
+	d.Labels = rows
 	return d
+}
+
+// subjectDetailFromBinary runs the shared subject-extraction stage in full -
+// every island, pool and label the overlay layers draw.
+func subjectDetailFromBinary(binaryImg *image.Gray) subjectDetail {
+	return (&subjectScan{}).measure(binaryImg, true)
+}
+
+// subjectsFromBinary is the two-number summary of the same measurement: the
+// union master bbox and the subject count.
+func subjectsFromBinary(binaryImg *image.Gray) (image.Rectangle, int) {
+	d := (&subjectScan{}).measure(binaryImg, false)
+	return d.Master, d.Subjects
 }
 
 // maskStats counts the white mask pixels inside r and their centre of mass.
 // Zero count pairs with a zero point: "no reading", never a coordinate.
+// Out-of-frame pixels read as background, exactly as the GrayAt walk did.
 func maskStats(img *image.Gray, r image.Rectangle) (int, image.Point) {
+	b := img.Bounds()
+	r = r.Intersect(b)
 	var totalX, totalY, count int64
 	for y := r.Min.Y; y < r.Max.Y; y++ {
-		for x := r.Min.X; x < r.Max.X; x++ {
-			if img.GrayAt(x, y).Y == 255 {
-				totalX += int64(x)
+		rowOff := (y-b.Min.Y)*img.Stride + (r.Min.X - b.Min.X)
+		for x, v := range img.Pix[rowOff : rowOff+r.Dx()] {
+			if v == 255 {
+				totalX += int64(r.Min.X + x)
 				totalY += int64(y)
 				count++
 			}

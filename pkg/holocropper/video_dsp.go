@@ -2,28 +2,55 @@ package holocropper
 
 import (
 	"image"
-	"image/color"
 	"image/draw"
 	"math"
 
 	"github.com/bamiaux/rez"
 )
 
-// convertToMonochrome converts a frame to grayscale.
+// convertToMonochrome converts a frame to grayscale. For opaque frames the
+// conversion is the image/color grayModel law written inline - the exact
+// 16-bit arithmetic draw.Draw's color model applies
+// (y = (19595*r16 + 38470*g16 + 7471*b16 + 1<<15) >> 24 with r16 = r*257
+// for 8-bit input) - proven bit-identical to the draw.Draw path and free of
+// its per-pixel color-interface calls (TestPerfDetectFormulaProbe,
+// PROFILING.md §5). Frames with any transparency keep the generic
+// draw.Draw path.
 func convertToMonochrome(img *image.RGBA) *image.Gray {
 	monoFrame := image.NewGray(img.Bounds())
-	draw.Draw(monoFrame, monoFrame.Bounds(), img, img.Bounds().Min, draw.Src)
+	writeGray(monoFrame, img)
 	return monoFrame
+}
+
+// writeGray applies the grayscale law from img into the caller-owned dst
+// (same bounds as src).
+func writeGray(dst *image.Gray, img *image.RGBA) {
+	if !img.Opaque() {
+		draw.Draw(dst, dst.Bounds(), img, img.Bounds().Min, draw.Src)
+		return
+	}
+	w, h := img.Bounds().Dx(), img.Bounds().Dy()
+	for y := 0; y < h; y++ {
+		// image.RGBA.Stride is BYTES per row (len(Pix) >= h*Stride).
+		src := img.Pix[y*img.Stride : y*img.Stride+w*4]
+		dstRow := dst.Pix[y*dst.Stride : y*dst.Stride+w]
+		for x := 0; x < w; x++ {
+			o := 4 * x
+			v := 19595*uint32(src[o])*257 + 38470*uint32(src[o+1])*257 + 7471*uint32(src[o+2])*257
+			dstRow[x] = byte((v + 1<<15) >> 24)
+		}
+	}
 }
 
 // otsuThreshold applies Otsu's thresholding algorithm.
 func otsuThreshold(img *image.Gray) uint8 {
-	// Calculate histogram
+	// Calculate histogram (row-slice walk over the image's own Pix: same
+	// pixels, same counts as the GrayAt walk it replaces).
 	histogram := make([]int, 256)
-	totalPixels := float64(img.Bounds().Dx() * img.Bounds().Dy())
-	for y := img.Bounds().Min.Y; y < img.Bounds().Max.Y; y++ {
-		for x := img.Bounds().Min.X; x < img.Bounds().Max.X; x++ {
-			intensity := img.GrayAt(x, y).Y
+	w, h := img.Bounds().Dx(), img.Bounds().Dy()
+	totalPixels := float64(w * h)
+	for y := 0; y < h; y++ {
+		for _, intensity := range img.Pix[y*img.Stride : y*img.Stride+w] {
 			histogram[intensity]++
 		}
 	}
@@ -62,124 +89,29 @@ func otsuThreshold(img *image.Gray) uint8 {
 	return optimalThreshold
 }
 
-// applyThreshold applies a binary threshold to an image.
+// applyThreshold applies a binary threshold to an image: pixels below the
+// threshold turn black, pixels at or above it white.
 func applyThreshold(img *image.Gray, threshold uint8) *image.Gray {
 	binaryImg := image.NewGray(img.Bounds())
-	black := color.Gray{Y: 0}
-	white := color.Gray{Y: 255}
-
-	for y := img.Bounds().Min.Y; y < img.Bounds().Max.Y; y++ {
-		for x := img.Bounds().Min.X; x < img.Bounds().Max.X; x++ {
-			if img.GrayAt(x, y).Y < threshold {
-				binaryImg.SetGray(x, y, black)
-			} else {
-				binaryImg.SetGray(x, y, white)
-			}
-		}
-	}
+	thresholdInto(binaryImg, img, threshold)
 	return binaryImg
 }
 
-// connectedComponentLabeling runs the connected component labeling algorithm.
-func connectedComponentLabeling(binaryMap *image.Gray) (map[int]image.Rectangle, [][]int) {
-	labelMatrix := make([][]int, binaryMap.Bounds().Dy())
-	for i := range labelMatrix {
-		labelMatrix[i] = make([]int, binaryMap.Bounds().Dx())
-	}
-
-	boundingBoxes := make(map[int]image.Rectangle)
-
-	label := 1
-	for y := binaryMap.Bounds().Min.Y; y < binaryMap.Bounds().Max.Y; y++ {
-		for x := binaryMap.Bounds().Min.X; x < binaryMap.Bounds().Max.X; x++ {
-			if binaryMap.GrayAt(x, y).Y > 0 && labelMatrix[y][x] == 0 {
-				boundingBox := dfs(binaryMap, labelMatrix, x, y, label)
-				boundingBoxes[label] = boundingBox
-				label++
+// thresholdInto applies the binary threshold law into the caller-owned dst
+// (same bounds as src).
+func thresholdInto(dst, src *image.Gray, threshold uint8) {
+	w, h := src.Bounds().Dx(), src.Bounds().Dy()
+	for y := 0; y < h; y++ {
+		row := src.Pix[y*src.Stride : y*src.Stride+w]
+		dstRow := dst.Pix[y*dst.Stride : y*dst.Stride+w]
+		for x, v := range row {
+			if v < threshold {
+				dstRow[x] = 0
+			} else {
+				dstRow[x] = 255
 			}
 		}
 	}
-
-	return boundingBoxes, labelMatrix
-}
-
-// dfs runs a depth-first search to label connected components.
-func dfs(binaryMap *image.Gray, labelMatrix [][]int, x, y, label int) image.Rectangle {
-	minX, minY, maxX, maxY := x, y, x, y
-
-	stack := []image.Point{{x, y}}
-	for len(stack) > 0 {
-		current := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-
-		cx, cy := current.X, current.Y
-		labelMatrix[cy][cx] = label
-
-		if cx < minX {
-			minX = cx
-		}
-		if cx > maxX {
-			maxX = cx
-		}
-		if cy < minY {
-			minY = cy
-		}
-		if cy > maxY {
-			maxY = cy
-		}
-
-		// Check neighboring pixels
-		for dx := -1; dx <= 1; dx++ {
-			nx, ny := cx+dx, cy-1
-			if nx >= 0 && nx < binaryMap.Bounds().Dx() && ny >= 0 && ny < binaryMap.Bounds().Dy() {
-				if binaryMap.GrayAt(nx, ny).Y > 0 && labelMatrix[ny][nx] == 0 {
-					stack = append(stack, image.Point{nx, ny})
-				}
-			}
-			ny = cy + 1
-			if nx >= 0 && nx < binaryMap.Bounds().Dx() && ny >= 0 && ny < binaryMap.Bounds().Dy() {
-				if binaryMap.GrayAt(nx, ny).Y > 0 && labelMatrix[ny][nx] == 0 {
-					stack = append(stack, image.Point{nx, ny})
-				}
-			}
-		}
-		nx := cx - 1
-		ny := cy
-		if nx >= 0 && nx < binaryMap.Bounds().Dx() && ny >= 0 && ny < binaryMap.Bounds().Dy() {
-			if binaryMap.GrayAt(nx, ny).Y > 0 && labelMatrix[ny][nx] == 0 {
-				stack = append(stack, image.Point{nx, ny})
-			}
-		}
-		nx = cx + 1
-		if nx >= 0 && nx < binaryMap.Bounds().Dx() && ny >= 0 && ny < binaryMap.Bounds().Dy() {
-			if binaryMap.GrayAt(nx, ny).Y > 0 && labelMatrix[ny][nx] == 0 {
-				stack = append(stack, image.Point{nx, ny})
-			}
-		}
-	}
-
-	return image.Rect(minX, minY, maxX+1, maxY+1)
-}
-
-// combineBounds combines the bounds of all rectangles in the slice
-// that overlap with the given rectangle and removes them from the slice.
-func combineBounds(rect image.Rectangle, rects []image.Rectangle, tol int) (combined image.Rectangle, remainingRects []image.Rectangle) {
-	// Initialize the combined rectangle with the rectangle passed as an argument
-	combined = rect
-
-	// Iterate over the rectangles in the slice
-	for _, r := range rects {
-		// Check if the current rectangle overlaps with the given rectangle
-		if expandRectangle(combined, tol).Overlaps(r) {
-			// Combine the bounds of overlapping rectangles
-			combined = combined.Union(r)
-		} else {
-			// Add the non-overlapping rectangle to the remaining rectangles slice
-			remainingRects = append(remainingRects, r)
-		}
-	}
-
-	return combined, remainingRects
 }
 
 // expandRectangle expands the given rectangle by x pixels from its center.
@@ -194,71 +126,70 @@ func expandRectangle(rect image.Rectangle, x int) image.Rectangle {
 	return image.Rect(newMinX, newMinY, newMaxX, newMaxY)
 }
 
-// totalBoundingBox finds the total bounding box given a slice of image.Rectangles.
-func totalBoundingBox(rectangles []image.Rectangle) image.Rectangle {
-	if len(rectangles) == 0 {
-		// Return zero rectangle if there are no input rectangles
-		return image.ZR
-	}
-
-	// Initialize min and max coordinates
-	minX, minY := rectangles[0].Min.X, rectangles[0].Min.Y
-	maxX, maxY := rectangles[0].Max.X, rectangles[0].Max.Y
-
-	// Iterate over rectangles to find min and max coordinates
-	for _, rect := range rectangles {
-		if rect.Min.X < minX {
-			minX = rect.Min.X
-		}
-		if rect.Min.Y < minY {
-			minY = rect.Min.Y
-		}
-		if rect.Max.X > maxX {
-			maxX = rect.Max.X
-		}
-		if rect.Max.Y > maxY {
-			maxY = rect.Max.Y
-		}
-	}
-
-	// Construct and return the total bounding box
-	return image.Rect(minX, minY, maxX, maxY)
+// detectState carries the per-frame scratch of one streaming detect pass:
+// the grayscale and binary buffers and the subject-scan scratch are reused
+// frame to frame instead of re-allocated per frame. A pass owns one
+// detectState (frames are measured sequentially; it is not safe for
+// concurrent use). The measurement stages are the shared laws: grayModel
+// grayscale, Otsu with the +/-10 gray-level hysteresis, and the summary
+// subjectScan measurement (subject_detail.go) - proven frame-for-frame
+// identical to the per-frame-allocation chain they replace (perf branch,
+// PROFILING.md §5).
+type detectState struct {
+	gray    []byte
+	bin     []byte
+	grayImg image.Gray
+	binImg  image.Gray
+	sc      subjectScan
 }
 
-// subjectsFromBinary is the two-number summary of subjectDetailFromBinary:
-// the union master bbox and the subject count. One implementation measures a
-// frame (subject_detail.go), so the detect pass, the plan replay and the lazy
-// detail verbs (SubjectBoxes/FrameIslands) can never disagree about what a
-// frame's subjects were.
-func subjectsFromBinary(binaryImg *image.Gray) (image.Rectangle, int) {
-	d := subjectDetailFromBinary(binaryImg)
-	return d.Master, d.Subjects
+// run measures one frame: grayscale -> Otsu with the hysteresis (lastThr
+// carries the state across frames, start at -1) -> binary -> the subject
+// measurement summary and the master-bbox centroid.
+func (st *detectState) run(img *image.RGBA, lastThr *float64) (image.Rectangle, int, image.Point) {
+	b := img.Bounds()
+	n := b.Dx() * b.Dy()
+	if cap(st.gray) < n {
+		st.gray = make([]byte, n)
+	}
+	if cap(st.bin) < n {
+		st.bin = make([]byte, n)
+	}
+	st.gray = st.gray[:n]
+	st.bin = st.bin[:n]
+	st.grayImg = image.Gray{Pix: st.gray, Stride: b.Dx(), Rect: b}
+	st.binImg = image.Gray{Pix: st.bin, Stride: b.Dx(), Rect: b}
+	writeGray(&st.grayImg, img)
+	thr := float64(otsuThreshold(&st.grayImg))
+	if *lastThr < 0 {
+		*lastThr = thr
+	} else {
+		*lastThr = clampF(thr, *lastThr-10, *lastThr+10)
+	}
+	thresholdInto(&st.binImg, &st.grayImg, uint8(*lastThr))
+	d := st.sc.measure(&st.binImg, false)
+	bbox, subjects := d.Master, d.Subjects
+	if bbox.Empty() {
+		return bbox, subjects, image.Point{}
+	}
+	_, cent := maskStats(&st.binImg, bbox)
+	return bbox, subjects, cent
 }
 
 // detectFrame runs the full single-frame subject detection exactly as the
 // fused pipeline's grayscale+binary stages do: grayscale -> Otsu with the
 // +/-10 gray-level hysteresis (lastThr carries the state across frames,
 // start at -1) -> binary -> subjectsFromBinary. The embeddable detect pass
-// streams frames through it, so the DetectionStream carries the same
-// decisions the pipeline's STEP 3 produces.
+// streams frames through a reusable detectState; detectFrame is the
+// fresh-scratch wrapper one-shot callers (and the law's own tests) use, so
+// the DetectionStream carries the same decisions the pipeline's STEP 3
+// produces.
 //
 // It also reports the centroid: the centre of mass of the subject-mask
 // pixels inside the master bbox — the same point the original 1-1 project
 // drew as its red cross (U3/761 telemetry). Zero when there is no subject.
 func detectFrame(img *image.RGBA, lastThr *float64) (image.Rectangle, int, image.Point) {
-	gray := convertToMonochrome(img)
-	thr := float64(otsuThreshold(gray))
-	if *lastThr < 0 {
-		*lastThr = thr
-	} else {
-		*lastThr = clampF(thr, *lastThr-10, *lastThr+10)
-	}
-	binaryImg := applyThreshold(gray, uint8(*lastThr))
-	bbox, subjects := subjectsFromBinary(binaryImg)
-	if bbox.Empty() {
-		return bbox, subjects, image.Point{}
-	}
-	return bbox, subjects, maskCentroid(binaryImg, bbox)
+	return (&detectState{}).run(img, lastThr)
 }
 
 // maskCentroid is the integer centre of mass of the white mask pixels inside
