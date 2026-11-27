@@ -1,0 +1,28 @@
+#!/bin/bash
+# Profiling wrapper: pure passthrough of argv/stdout/stderr to the real
+# ffmpeg, plus per-invocation wall/user/sys CPU via the bash time keyword.
+# ffmpeg's stderr is moved to fd 3 (the original stderr the package reads);
+# the time keyword's stats land in summary.log so the scanner never sees them.
+dir=/tmp/opencode/ffprof/logs
+mkdir -p "$dir"
+id=$(flock "$dir/next" -c "v=\$(cat '$dir/next' 2>/dev/null || echo 0); v=\$((v+1)); echo \"\$v\" > '$dir/next'; echo \"\$v\"")
+
+kind=other
+for a in "$@"; do
+  case "$a" in
+    rawvideo)   kind=decoder ;;
+    image2pipe) kind=encoder ;;
+    libx264)    kind=analysis-encode ;;
+  esac
+done
+
+{
+  echo "=== run $id kind=$kind start=$(date +%H:%M:%S.%N)"
+  printf '  %q\n' "$@"
+} > "$dir/argv-$id.log"
+
+TIMEFORMAT="run $id $kind wall=%R user=%U sys=%S"$'\n'
+{ time /usr/sbin/ffmpeg "$@" 2>&3 3>&- ; } 3>&2 2>> "$dir/summary.log"
+rc=$?
+echo "exit $rc" >> "$dir/argv-$id.log"
+exit $rc
