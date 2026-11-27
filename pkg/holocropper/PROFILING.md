@@ -7,6 +7,10 @@ carried its usual background load (strata engine ~7 cores, Horidashimi
 server); the CLI baselines from the v0.3.0 gate runs reproduce, so
 comparisons are same-environment.
 
+**Status 2026-11-27: proposals 1-2 are LANDED on this branch** - the
+detect-internals rewrite and the buffered pump writer (§9). Proposals 3-6
+remain owner decisions.
+
 Harness: `perf_test.go` (build tag `perf`, never part of the shipped suite),
 `perf-tools/ffmpeg-wrap` (per-subprocess wall/user/sys via a transparent
 ffmpeg wrapper) and `perf-tools/decode-bench.sh`. `/tmp` is tmpfs with ~4 GB
@@ -102,7 +106,7 @@ mono+binary images, a `[][]int` label matrix (~6 MB), a DFS stack of
 `image.Point`, `image.Rect` Union per labelled pixel, and a `map[int]`
 lookup per labelled pixel - on the order of 10-15 MB/frame of garbage.
 
-### Optimized replica (perf_test.go, proof-gated)
+### Optimized replica (perf_test.go, proof-gated) - LANDED, see §9
 
 `perfOptState.runFrame` is a bit-identical replica: same grayscale law
 (`image/color.grayModel`'s 19595/38470/7471 + 1<<15 >>24 law - verified
@@ -123,10 +127,11 @@ matrix and stack, per-label stat slices).
   but raises the proof burden; the replica keeps identical *execution*,
   not just identical outputs.
 
-Note the shipped `subjectDetailFromBinary` iterates a Go **map** (random
-order) and sorts with an unstable comparator - Master/Subjects are already
-order-insensitive outputs in practice, but that is worth an owner look too:
-the replica iterates labels in numeric order and is deterministic run to run.
+The old shipped `subjectDetailFromBinary` iterated a Go **map** (random
+order) and sorted with an unstable comparator - Master/Subjects are already
+order-insensitive outputs in practice, but the landed core closes that hole
+as well: labels iterate in numeric order and the sort is stable with the
+exact old comparator, so every measurement is deterministic run to run.
 
 ## 6. select-filter decode (measured, low priority)
 
@@ -163,8 +168,10 @@ is quantified here.
    paths) from the replica: zero output change (identity-proven), ~2.3x
    faster detect, ~100 s saved per cold sweetdevil-sized analysis; benefits
    every cold cache and preview. Land behind the golden parity gate.
+   **LANDED 2026-11-27 - §9.**
 2. **Buffer the pump writer** (`bufio` on `encIn` in runSourceRender):
    identical bytes, ~4-6 s per render, trivial diff.
+   **LANDED 2026-11-27 - §9.**
 3. **Parallel detect pipeline** (phase 2): grayscale+Otsu is frame-parallel
    with lookahead; the hysteresis chain is scalar; binarize+components+
    pools per frame are threshold-known in advance and can run N-up with
@@ -177,6 +184,74 @@ is quantified here.
 6. **Reconfig tax**: 6.3x on variable feeds is real but inseparable from
    the current crop law; any mitigation changes pixels. Documented, not
    recommended.
+
+## 9. Landed: proposals 1-2 (2026-11-27, owner greenlight)
+
+Both changes are commits on this branch; main (`6f69792`) is untouched and
+nothing here has been pushed.
+
+**What landed**
+
+- `video_dsp.go`: `detectState` carries one streaming pass's reusable
+  gray/binary buffers and subject scan; `writeGray` writes
+  `image/color.grayModel`'s exact 16-bit law inline for opaque frames
+  (generic `draw.Draw` kept for frames with transparency);
+  `otsuThreshold` / `applyThreshold` / `thresholdInto` walk `Pix` rows
+  directly; `detectFrame` is the fresh-state wrapper one-shot callers (and
+  the law's own tests) use. The old `connectedComponentLabeling` / `dfs` /
+  `combineBounds` / `totalBoundingBox` are gone - no other callers.
+- `subject_detail.go`: `subjectScan.measure(binaryImg, full)` is now the
+  single measurement core behind both `subjectDetailFromBinary` (full mode:
+  every island, pool and label the overlay layers draw) and
+  `subjectsFromBinary` (summary mode: exactly the numbers the stream
+  records). Flat `[]int32` labels + flood stack, per-label stat slices,
+  label-order components, `sort.SliceStable` with the exact shipped
+  comparator, exact pool-claim law - the same formulation the replica proved
+  bit-identical.
+- `analysis.go`: `runDetectStream` runs one reusable `detectState` over the
+  whole analysis video.
+- `linearrender.go`: the pump feeds the encoder through a 4 MB
+  `bufio.Writer` (flushed before stdin close; a flush failure surfaces as
+  `pumpErr`, the same broken pipe the unbuffered pump reported). The byte
+  stream reaching the encoder is unchanged.
+
+**Proof chain**
+
+- replica == old shipped: 13888/13888 frames, 0 mismatches (pre-landing run,
+  §5).
+- landed shipped == replica: 13888/13888 frames, 0 mismatches on (bbox,
+  subjects, centroid, lastThr) - `TestPerfDetectOptimizedIdentity` post-
+  landing, now 96 s for BOTH chains over the full sweetdevil ah648 analysis.
+  Together: the landed chain equals the old shipped chain on every frame.
+- default suite green (52.5 s, zero skips).
+- golden parity gate (`go test -tags e2e -run E2E`, both fixtures) green:
+  stills 43.83-56.57 dB (gate 43), crop preview mean 35.58 / 41.71 dB,
+  worst 33.18 (gate 33), MikV 37.83-43.04 dB (gate 37), analysis
+  determinism framemd5-identical, all structural self-checks pass.
+
+**Measured after landing**
+
+- One-shot `detectFrame` - what `TestPerfDetectSplit` times; it re-allocates
+  its scratch per call, the path one-shot callers use: **18-20 -> 7.7-7.9
+  ms/frame** at 1152x648 under the usual background load. The streaming hot
+  path is faster still: the e2e gate's cold full analysis of 13888
+  sweetdevil frames at 854x480 took **32.0 s** (Prepare + Detect together),
+  so the vidio-decode+detect stream runs well under 1.5 ms/frame. The §5
+  projection (cold 449 -> ~350 s at ah648) looks conservative from these
+  parts, though a full cold ah648 run was not re-timed end to end.
+- Real captured frames, shipped vs replica in alternating rounds
+  (`TestPerfDetectRealChain`, full-detail paths): 27.5-28.2 vs 25.1-25.2
+  ms/frame - the old 2.3x gap has collapsed to noise, as expected now that
+  both chains are the same formulation.
+- Buffered pump on the cached-analysis CLI path (sweetdevil 648x200@24,
+  ffmpeg wrapper): encoder wall **260.9 -> 198.0 s**, encoder user CPU
+  **383 -> 358 s**. The user-CPU delta and the removed ~5.3M write syscalls
+  are the change's own signature; part of the wall delta is ordinary
+  load variance on this machine. The e2e gate's own sweetdevil render
+  (fresh caches end to end) ran 5555 frames in 182.8 s.
+
+Proposals 3-6 stay in the parking lot above, unchanged, awaiting owner
+decisions.
 
 ## Reproduce
 
