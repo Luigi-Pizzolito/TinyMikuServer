@@ -359,10 +359,16 @@ func runSourceRender(ctx context.Context, o sourceRenderOpts) error {
 		encArgs = append(encArgs, "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1")
 	}
 	enc := exec.CommandContext(runCtx, ffmpegPath, encArgs...)
-	encIn, err := enc.StdinPipe()
+	encPipe, err := enc.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("holocropper: encoder stdin pipe: %w", err)
 	}
+	// The crop writer hits the pipe once per crop row - ~950 syscalls per
+	// output frame on a variable-crop render. The buffered layer feeds the
+	// encoder the IDENTICAL byte stream in fewer, larger writes (pipe-write
+	// boundaries carry no meaning for a PPM stream); profiling measured the
+	// unbuffered cost at ~4-6 s per full render (PROFILING.md §4).
+	encIn := bufio.NewWriterSize(encPipe, 4<<20)
 	encErr, err := enc.StderrPipe()
 	if err != nil {
 		return fmt.Errorf("holocropper: encoder stderr pipe: %w", err)
@@ -534,7 +540,16 @@ func runSourceRender(ctx context.Context, o sourceRenderOpts) error {
 	// intentional kill whose exit code must not surface as a pass failure);
 	// otherwise it is drained to its natural EOF so a clean exit 0 is
 	// reported.
-	encIn.Close()
+	// EOF on stdin lets a healthy encoder finish: the buffer's tail frames
+	// must reach the pipe before the close, so flush first. A flush failure
+	// is the same broken pipe the unbuffered pump would have caught at its
+	// next write - the encoder already died - so it surfaces as pumpErr.
+	if pumpErr == nil {
+		if err := encIn.Flush(); err != nil {
+			pumpErr = err
+		}
+	}
+	encPipe.Close()
 	earlyDecKill := pumpErr == nil && rawErr == nil && decoded < o.srcFrames
 	if earlyDecKill {
 		decCancel()
